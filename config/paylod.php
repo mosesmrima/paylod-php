@@ -40,9 +40,20 @@ return [
     |--------------------------------------------------------------------------
     | HTTP tuning
     |--------------------------------------------------------------------------
+    |
+    | RAW, NEVER PRE-CAST. These were `(int) env(...)`, which silently defeated
+    | the provider's lexical checks one layer above: `PAYLOD_TIMEOUT_MS=1.5`
+    | became a well-formed `1` before PaylodServiceProvider::assertWholeNumber()
+    | ever saw it, so the value an operator asked for was neither honoured nor
+    | rejected - it was quietly replaced with a different one. For a timeout that
+    | matters a great deal: `(int) 0.5` is `0`, and `0` DISABLES cURL's timeout,
+    | so a hung request never returns and a wait() never settles.
+    |
+    | The provider inspects these in the form the operator wrote them and refuses
+    | anything that is not a whole number, naming the config key and the env var.
     */
-    'timeout_ms' => (int) env('PAYLOD_TIMEOUT_MS', 30000),
-    'max_retries' => (int) env('PAYLOD_MAX_RETRIES', 2),
+    'timeout_ms' => env('PAYLOD_TIMEOUT_MS', 30000),
+    'max_retries' => env('PAYLOD_MAX_RETRIES', 2),
 
     /*
     |--------------------------------------------------------------------------

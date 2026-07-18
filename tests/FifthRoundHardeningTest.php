@@ -326,6 +326,76 @@ final class FifthRoundHardeningTest extends TestCase
     }
 
     /**
+     * The HEADERS are bounded too, in aggregate.
+     *
+     * The body ceiling closed only half the route. libcurl caps each individual header at 100 KiB
+     * and hands them over one at a time, which looks like a bound but limits nothing about HOW MANY
+     * arrive - and every one was accumulated forever. A peer streaming distinct header names
+     * exhausted memory by exactly the path the body ceiling exists to close, with the same
+     * consequence: it happens after the collect was dispatched.
+     */
+    public function testTheResponseHeadersHaveAnAggregateCeiling(): void
+    {
+        $byteCeiling = \Paylod\Http\CurlHttpClient::MAX_HEADER_BYTES;
+        $countCeiling = \Paylod\Http\CurlHttpClient::MAX_HEADER_COUNT;
+
+        $this->assertGreaterThan(0, $byteCeiling);
+        $this->assertLessThanOrEqual(1024 * 1024, $byteCeiling, 'not a bound on memory exhaustion');
+        $this->assertGreaterThan(0, $countCeiling);
+        $this->assertLessThanOrEqual(2000, $countCeiling);
+
+        $accept = new \ReflectionMethod(\Paylod\Http\CurlHttpClient::class, 'acceptHeader');
+
+        // Normal traffic passes through and is stored.
+        $headers = [];
+        $bytes = 0;
+        $args = [&$headers, &$bytes, "Content-Type: application/json\r\n"];
+        $this->assertTrue($accept->invokeArgs(null, $args));
+        $this->assertSame('application/json', $headers['content-type']);
+
+        // THE COUNT CEILING. Many small, DISTINCT headers cost as much as one enormous one, so a
+        // byte ceiling alone would not have closed this.
+        $headers = [];
+        $bytes = 0;
+        for ($i = 0; $i < $countCeiling; $i++) {
+            $args = [&$headers, &$bytes, "x-pad-{$i}: v\r\n"];
+            $this->assertTrue($accept->invokeArgs(null, $args), "header {$i} should be accepted");
+        }
+        $args = [&$headers, &$bytes, "x-one-too-many: v\r\n"];
+        $this->assertFalse($accept->invokeArgs(null, $args), 'the header count must be bounded');
+        $this->assertArrayNotHasKey('x-one-too-many', $headers);
+
+        // A REPEATED name overwrites rather than grows, so it is not charged against the count.
+        $headers = [];
+        $bytes = 0;
+        for ($i = 0; $i < $countCeiling + 50; $i++) {
+            $args = [&$headers, &$bytes, "x-same: v{$i}\r\n"];
+            $this->assertTrue($accept->invokeArgs(null, $args));
+        }
+        $this->assertCount(1, $headers);
+
+        // THE AGGREGATE BYTE CEILING, which that repetition eventually trips.
+        $headers = [];
+        $bytes = $byteCeiling - 4;
+        $args = [&$headers, &$bytes, "x-big: " . str_repeat('z', 64) . "\r\n"];
+        $this->assertFalse($accept->invokeArgs(null, $args), 'the aggregate header size must be bounded');
+        $this->assertSame([], $headers, 'nothing beyond the ceiling may be stored');
+    }
+
+    /** A header overflow is the SAME keyed, indeterminate error a body overflow is - never retried. */
+    public function testAnOversizedHeaderSetIsIndeterminateAndNotRetryable(): void
+    {
+        $error = (new \ReflectionMethod(\Paylod\Http\CurlHttpClient::class, 'overflowError'))
+            ->invoke(null, 'response headers larger than the ceiling');
+
+        $this->assertInstanceOf(PaylodApiError::class, $error);
+        $this->assertNotInstanceOf(\Paylod\Exceptions\PaylodConnectionError::class, $error);
+        $this->assertTrue($error->indeterminate);
+        $this->assertStringContainsString('response headers', $error->getMessage());
+        $this->assertStringContainsString('INDETERMINATE', $error->getMessage());
+    }
+
+    /**
      * The abort raises a KEYED, INDETERMINATE PaylodApiError, never a PaylodConnectionError: the
      * client RETRIES connection errors, and re-POSTing a charge because the response was too big
      * is precisely the double-charge this SDK exists to prevent.
