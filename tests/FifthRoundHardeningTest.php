@@ -297,16 +297,51 @@ final class FifthRoundHardeningTest extends TestCase
             'a ceiling this large is not a bound on memory exhaustion'
         );
 
-        // The abort path is an INDETERMINATE PaylodApiError, never a PaylodConnectionError: the
-        // client RETRIES connection errors, and re-POSTing a charge because the response was too
-        // big is precisely the double-charge this SDK exists to prevent.
-        $source = file_get_contents(__DIR__ . '/../src/Http/CurlHttpClient.php');
-        $this->assertStringContainsString('CURLOPT_WRITEFUNCTION', $source, 'the buffer must be bounded as bytes arrive');
-        $this->assertMatchesRegularExpression(
-            '/if \(\$overflowed\) \{\s*throw new PaylodApiError\(/',
-            $source,
-            'an oversized response must raise an indeterminate API error, not a retryable connection error'
+        $accept = new \ReflectionMethod(\Paylod\Http\CurlHttpClient::class, 'acceptChunk');
+        $buffer = '';
+        $bytes = 0;
+
+        // Normal traffic passes through untouched.
+        $args = [&$buffer, &$bytes, 'hello'];
+        $this->assertSame(5, $accept->invokeArgs(null, $args));
+        $this->assertSame('hello', $buffer);
+        $this->assertSame(5, $bytes);
+
+        // A chunk that would cross the ceiling is REFUSED ENTIRELY - 0 accepted bytes, which is
+        // cURL's "abort now" signal - and nothing beyond the ceiling is ever allocated. Partial
+        // acceptance is deliberately not an option: a truncated JSON payment record either fails
+        // to parse or, far worse, parses into a different record than the server sent.
+        $bytes = $ceiling - 1;
+        $before = $buffer;
+        $args = [&$buffer, &$bytes, str_repeat('x', 64)];
+        $this->assertSame(0, $accept->invokeArgs(null, $args), 'an oversized chunk must abort the transfer');
+        $this->assertSame($before, $buffer, 'nothing beyond the ceiling may be buffered');
+        $this->assertSame($ceiling - 1, $bytes);
+
+        // Exactly at the ceiling is still accepted - this is a bound, not an off-by-one.
+        $buffer = '';
+        $bytes = 0;
+        $args = [&$buffer, &$bytes, str_repeat('y', 16)];
+        $this->assertSame(16, $accept->invokeArgs(null, $args));
+    }
+
+    /**
+     * The abort raises a KEYED, INDETERMINATE PaylodApiError, never a PaylodConnectionError: the
+     * client RETRIES connection errors, and re-POSTing a charge because the response was too big
+     * is precisely the double-charge this SDK exists to prevent.
+     */
+    public function testAnOversizedResponseIsIndeterminateAndNotRetryable(): void
+    {
+        $error = (new \ReflectionMethod(\Paylod\Http\CurlHttpClient::class, 'overflowError'))->invoke(null);
+
+        $this->assertInstanceOf(PaylodApiError::class, $error);
+        $this->assertNotInstanceOf(
+            \Paylod\Exceptions\PaylodConnectionError::class,
+            $error,
+            'a connection error would be RETRIED, and a retried charge is a second charge'
         );
+        $this->assertTrue($error->indeterminate, 'the request was sent, so the charge state is unknown');
+        $this->assertStringContainsString('INDETERMINATE', $error->getMessage());
     }
 
     // == Laravel config is validated in the form the operator wrote it ==========================

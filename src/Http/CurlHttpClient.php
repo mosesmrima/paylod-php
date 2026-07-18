@@ -76,17 +76,12 @@ final class CurlHttpClient implements HttpClient
             CURLOPT_HTTPHEADER => $headerLines,
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_WRITEFUNCTION => function ($curl, string $chunk) use (&$buffer, &$bytes, &$overflowed): int {
-                $len = strlen($chunk);
-                if ($bytes + $len > self::MAX_RESPONSE_BYTES) {
+                $accepted = self::acceptChunk($buffer, $bytes, $chunk);
+                if ($accepted !== strlen($chunk)) {
                     $overflowed = true;
-
-                    // A short return is cURL's documented "abort now" signal.
-                    return 0;
                 }
-                $buffer .= $chunk;
-                $bytes += $len;
 
-                return $len;
+                return $accepted;
             },
             CURLOPT_TIMEOUT_MS => $timeoutMs,
             CURLOPT_CONNECTTIMEOUT_MS => $timeoutMs,
@@ -121,17 +116,7 @@ final class CurlHttpClient implements HttpClient
         // INDETERMINATE PaylodApiError instead: not a connection error, therefore not retried, and
         // collect() attaches the effective idempotency key to it on the way out.
         if ($overflowed) {
-            throw new PaylodApiError(
-                'paylod returned a response larger than the ' . self::MAX_RESPONSE_BYTES
-                . '-byte ceiling and the transfer was aborted. The request WAS sent, so the charge '
-                . 'state is INDETERMINATE - the STK prompt may already be on the phone. Read the '
-                . 'payment with the attached idempotencyKey before starting any new attempt; do NOT '
-                . 'mint a fresh key (that risks a second charge).',
-                0,
-                null,
-                null,
-                true,
-            );
+            throw self::overflowError();
         }
 
         if ($raw === false) {
@@ -156,6 +141,51 @@ final class CurlHttpClient implements HttpClient
             'effectiveUrl' => is_string($effectiveUrl) && $effectiveUrl !== '' ? $effectiveUrl : null,
             'redirectCount' => is_int($redirectCount) ? $redirectCount : null,
         ];
+    }
+
+    /**
+     * THE CEILING ITSELF, as a pure function of the buffer so far and one arriving chunk.
+     *
+     * Split out of the write callback so it can be driven directly by a test - a ceiling that is
+     * only reachable by standing up a server that streams gigabytes is a ceiling nobody verifies.
+     *
+     * @return int the number of bytes accepted. Anything less than `strlen($chunk)` is cURL's
+     *   documented "abort the transfer now" signal, and here it is always 0: partial acceptance
+     *   would hand the caller a TRUNCATED body, which is worse than no body at all, because a
+     *   truncated JSON payment record either fails to parse or - far worse - parses into a
+     *   different record than the one the server sent.
+     */
+    private static function acceptChunk(string &$buffer, int &$bytes, string $chunk): int
+    {
+        $len = strlen($chunk);
+        if ($bytes + $len > self::MAX_RESPONSE_BYTES) {
+            return 0;
+        }
+        $buffer .= $chunk;
+        $bytes += $len;
+
+        return $len;
+    }
+
+    /**
+     * The overflow error. Deliberately a KEYED, INDETERMINATE `PaylodApiError` and NOT a
+     * `PaylodConnectionError`: the client RETRIES connection errors, and re-POSTing a charge
+     * because the response was too big is precisely the double-charge this SDK exists to prevent.
+     * `collect()` attaches the effective idempotency key to it on the way out.
+     */
+    private static function overflowError(): PaylodApiError
+    {
+        return new PaylodApiError(
+            'paylod returned a response larger than the ' . self::MAX_RESPONSE_BYTES
+            . '-byte ceiling and the transfer was aborted. The request WAS sent, so the charge '
+            . 'state is INDETERMINATE - the STK prompt may already be on the phone. Read the '
+            . 'payment with the attached idempotencyKey before starting any new attempt; do NOT '
+            . 'mint a fresh key (that risks a second charge).',
+            0,
+            null,
+            null,
+            true,
+        );
     }
 
     /** Scrub the bearer token (and its bare key) out of a message before it is thrown/logged. */

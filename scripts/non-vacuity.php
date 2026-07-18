@@ -122,8 +122,8 @@ $CASES = [
         'edits' => [
             [
                 'src/Semantics.php',
-                "                self::EVIDENCE_SUCCESS => \$of(\n                    self::VERDICT_INDETERMINATE,\n                    'status says pending while the evidence says the payment succeeded - a pending '\n                    . 'record must never be reported as paid'\n                ),",
-                "                self::EVIDENCE_SUCCESS => \$of(self::VERDICT_PAID, 'REVERTED'),",
+                "            'pending|success' => \$contradiction(\n                'status says pending while the evidence says the payment succeeded - a pending '\n                . 'record must never be reported as paid'\n            ),",
+                "            'pending|success' => [self::VERDICT_PAID, 'REVERTED'],",
             ],
         ],
     ],
@@ -146,8 +146,8 @@ $CASES = [
         'edits' => [
             [
                 'src/Semantics.php',
-                "                self::EVIDENCE_NONE => \$of(\n                    self::VERDICT_INDETERMINATE,\n                    'status claims success but the record carries neither a receipt nor a result '\n                    . 'code, so there is no evidence the payment actually settled'\n                ),",
-                "                self::EVIDENCE_NONE => \$of(self::VERDICT_PAID, 'REVERTED'),",
+                "            'success|none' => \$contradiction(\n                'status claims success but the record carries neither a receipt nor a result '\n                . 'code, so there is no evidence the payment actually settled'\n            ),",
+                "            'success|none' => [self::VERDICT_PAID, 'REVERTED'],",
             ],
         ],
     ],
@@ -191,6 +191,186 @@ $CASES = [
                 'src/Paylod.php',
                 '            // A NON-PAYLOD throwable',
                 "            throw \$e;\n            // A NON-PAYLOD throwable",
+            ],
+        ],
+    ],
+
+    // == FIFTH ROUND - the remaining money-correctness defects ================================
+    [
+        'id' => 'F-zero',
+        'what' => 'success evidence is matched by loose numeric coercion again ("0e999", "+0", "00" become PAID)',
+        'test' => 'testAFakeZeroCanNeverProduceAPaidVerdict',
+        'edits' => [
+            [
+                'src/DarajaCatalog.php',
+                "        if (\$resultCode === 0 || \$raw === '0') {",
+                "        if (\$raw !== '' && is_numeric(\$raw) && \$raw + 0 == 0) {",
+            ],
+        ],
+    ],
+    [
+        'id' => 'F-zero-terminal',
+        'what' => 'a non-canonical numeric code is treated as terminal again',
+        'test' => 'testNonCanonicalNonZeroCodesAreNotTerminalEither',
+        'edits' => [
+            [
+                'src/DarajaCatalog.php',
+                "        if (preg_match('/^[1-9][0-9]*\$/', \$raw) === 1) {",
+                "        if (\$raw !== '' && is_numeric(\$raw)) {",
+            ],
+        ],
+    ],
+    [
+        'id' => 'F-table-default',
+        'what' => 'the judge table maps failed/cancelled + in-flight evidence to in_flight rather than INDETERMINATE',
+        'test' => 'testAContradictoryTerminalClaimIsIndeterminateNotInFlight',
+        'edits' => [
+            [
+                'src/Semantics.php',
+                "            'failed|in_flight' => \$contradiction(",
+                "            'failed|in_flight' => [self::VERDICT_IN_FLIGHT, 'REVERTED'], 'failed|in_flight_dead' => \$contradiction(",
+            ],
+        ],
+    ],
+    [
+        'id' => 'F-claim-closed',
+        'what' => 'an unrecognised status is no longer normalised into the closed claim alphabet',
+        'test' => 'testAnUnknownClaimIsIndeterminateAndNeverFallsThroughToAPermissiveDefault',
+        'edits' => [
+            [
+                'src/Semantics.php',
+                "            default => self::CLAIM_UNKNOWN,\n        };",
+                "            default => self::CLAIM_SUCCESS,\n        };",
+            ],
+        ],
+    ],
+    [
+        'id' => 'F-idem-required',
+        'what' => 'collect() silently generates an idempotency key again instead of requiring one',
+        'test' => 'testCollectRefusesToChargeWithoutACallerPersistedIdempotencyKey',
+        'edits' => [
+            [
+                'src/Paylod.php',
+                "        if ((\$params['unsafeGeneratedIdempotencyKey'] ?? false) !== true) {",
+                '        if (false) {',
+            ],
+        ],
+    ],
+    [
+        'id' => 'F-bind',
+        'what' => 'a post-ack error keeps an unrelated pre-existing key / payment id (attach, not overwrite)',
+        'test' => 'testAPostAckFailureCarriesTheAcknowledgedPaymentsOwnContextNotAStaleOne',
+        'edits' => [
+            [
+                'src/Exceptions/PaylodException.php',
+                "        \$this->idempotencyKey = \$idempotencyKey;\n        \$this->paymentId = \$paymentId !== '' ? \$paymentId : null;",
+                "        \$this->attachIdempotencyKey(\$idempotencyKey);\n        \$this->attachPaymentId(\$paymentId);",
+            ],
+        ],
+    ],
+    [
+        'id' => 'F-cause',
+        'what' => 'the secret-bearing original throwable is chained as `previous` again',
+        'test' => 'testTheSecretBearingOriginalIsNeverChainedAsThePreviousException',
+        'edits' => [
+            [
+                'src/Paylod.php',
+                "                \$idempotencyKey,\n                true,\n                self::sanitizedCause(\$e, \$this->redactor()),",
+                "                \$idempotencyKey,\n                true,\n                \$e,",
+            ],
+        ],
+    ],
+    [
+        'id' => 'F-cause-ack',
+        'what' => 'the post-ack wrapper chains the secret-bearing original again',
+        'test' => 'testThePostAckWrapperAlsoDropsTheSecretBearingOriginal',
+        'edits' => [
+            [
+                'src/Paylod.php',
+                "                \$ack['idempotencyKey'],\n                true,\n                self::sanitizedCause(\$e, \$this->redactor()),",
+                "                \$ack['idempotencyKey'],\n                true,\n                \$e,",
+            ],
+        ],
+    ],
+    [
+        'id' => 'F-tolerance',
+        'what' => 'the anti-replay window loses its upper bound (PHP_INT_MAX accepts an ancient webhook)',
+        'test' => 'testAnUnboundedToleranceIsRefusedRatherThanDisablingReplayProtection',
+        'edits' => [
+            [
+                'src/Webhook.php',
+                "        if (\$value > self::MAX_TOLERANCE_SEC) {\n            self::rejectTolerance(\$value);\n        }\n\n        \$seconds = self::requirePositiveInt(\$value, 'toleranceSec');\n        if (\$seconds > self::MAX_TOLERANCE_SEC) {\n            self::rejectTolerance(\$value);\n        }",
+                "        \$seconds = self::requirePositiveInt(\$value, 'toleranceSec');",
+            ],
+        ],
+    ],
+    [
+        'id' => 'F-status-redact',
+        'what' => 'a successful status read returns its fields raw, so an echoed credential escapes',
+        'test' => 'testAnEchoedCredentialCannotEscapeThroughASuccessfulStatusRead',
+        'edits' => [
+            [
+                'src/Paylod.php',
+                "            'resultDesc' => \$this->redact(\$p['resultDesc'] ?? null),",
+                "            'resultDesc' => \$p['resultDesc'] ?? null,",
+            ],
+        ],
+    ],
+    [
+        'id' => 'F-monotonic',
+        'what' => 'wait deadlines go back to the wall clock, where an NTP step moves every deadline',
+        'test' => 'testWaitDeadlinesUseAMonotonicClockNotTheWallClock',
+        'edits' => [
+            [
+                'src/Paylod.php',
+                '        return intdiv(hrtime(true), 1_000_000);',
+                '        return (int) (microtime(true) * 1000);',
+            ],
+        ],
+    ],
+    [
+        'id' => 'F-buffer',
+        'what' => 'the response buffer loses its byte ceiling',
+        'test' => 'testTheResponseBufferHasADocumentedByteCeiling',
+        'edits' => [
+            [
+                'src/Http/CurlHttpClient.php',
+                '        if ($bytes + $len > self::MAX_RESPONSE_BYTES) {',
+                '        if (false) {',
+            ],
+        ],
+    ],
+    [
+        'id' => 'F-laravel-cast',
+        'what' => 'Laravel casts timeout_ms before validating it, so 1.5 silently becomes 1',
+        'test' => 'testLaravelRefusesAFractionalTimeoutInsteadOfSilentlyTruncatingIt',
+        'edits' => [
+            [
+                'src/Laravel/PaylodServiceProvider.php',
+                "                'timeoutMs' => self::assertWholeNumber(\$config['timeout_ms'] ?? 30000, 'paylod.timeout_ms', 'PAYLOD_TIMEOUT_MS'),",
+                "                'timeoutMs' => (int) (\$config['timeout_ms'] ?? 30000),",
+            ],
+        ],
+    ],
+    [
+        'id' => 'F-simulator',
+        'what' => 'the simulator drops a present-but-null field from the fingerprinted body again',
+        'test' => 'testTheSimulatorNeitherDropsNorForwardsAnUnvalidatedField',
+        'edits' => [
+            [
+                'src/Simulator.php',
+                "        if (array_key_exists('description', \$params)) {\n            \$body['description'] = self::requireString(\$params['description'], 'description');\n        }",
+                "        if (isset(\$params['description'])) {\n            \$body['description'] = \$params['description'];\n        }",
+            ],
+            [
+                'src/Simulator.php',
+                "        if (array_key_exists('accountReference', \$params)) {\n            // The backend calls this field `accountRef`; the SDK calls it `accountReference`.\n            \$body['accountRef'] = self::requireString(\$params['accountReference'], 'accountReference');\n        }",
+                "        if (isset(\$params['accountReference'])) {\n            \$body['accountRef'] = \$params['accountReference'];\n        }",
+            ],
+            [
+                'src/Simulator.php',
+                "            if (!is_array(\$metadata)) {",
+                '            if (false) {',
             ],
         ],
     ],

@@ -208,6 +208,36 @@ final class SemanticsTest extends TestCase
     }
 
     /**
+     * The changed cell, on its own, so a mutation of it is caught by a test that is not a data
+     * provider (and so is selectable by the non-vacuity harness).
+     *
+     * A `failed` or `cancelled` row carrying a still-in-flight result code contradicts itself. The
+     * SDK does not get to pick a winner: never FAILED (that tells a merchant it is safe to charge
+     * again while the prompt is live on the handset) and no longer IN_FLIGHT either (that asserts a
+     * state the record does not establish). It renders as `pending` regardless, so wait() keeps
+     * polling and the webhook settles it.
+     */
+    public function testAContradictoryTerminalClaimIsIndeterminateNotInFlight(): void
+    {
+        foreach (['failed', 'cancelled'] as $claim) {
+            foreach ([4999, '4999', '500.001.1001'] as $code) {
+                $j = Semantics::judge(self::payment(['status' => $claim, 'resultCode' => $code]));
+                self::assertSame(
+                    Semantics::EVIDENCE_IN_FLIGHT,
+                    $j->evidence,
+                    "wrong witness for {$claim} + " . var_export($code, true)
+                );
+                self::assertSame(
+                    Semantics::VERDICT_INDETERMINATE,
+                    $j->verdict,
+                    "{$claim} + an in-flight code must be indeterminate, not a guess about which "
+                    . 'contradicting field to believe'
+                );
+            }
+        }
+    }
+
+    /**
      * The claim alphabet is CLOSED: anything outside it - an unknown word, an empty string, a
      * non-string, a missing key - normalises to `unknown` and gets the unknown rows. There is no
      * default arm in the verdict table for it to fall into.
