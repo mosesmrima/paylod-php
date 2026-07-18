@@ -65,27 +65,197 @@ final class Webhook
         int|float $toleranceSec = self::DEFAULT_TOLERANCE_SEC,
         int|float|null $nowSec = null,
     ): array {
-        $event = self::verifySignature($payload, $signature, $secret, $toleranceSec, $nowSec);
+        $event = self::parseSignedEnvelope($payload, $signature, $secret, $toleranceSec, $nowSec);
         self::assertEventIsCoherent($event);
+
+        // THE DERIVED FIELDS ARE RE-DERIVED, NEVER FORWARDED.
+        return self::withAuthoritativeDerivedFields($event);
+    }
+
+    /**
+     * The DERIVED fields of a payment event, recomputed locally from {@see DarajaCatalog} and
+     * {@see PaymentOutcome}, overwriting whatever the body carried.
+     *
+     * -- Why verification was not enough -----------------------------------------------------------
+     * verify() used to return the event UNCHANGED once the signature and the semantic checks passed.
+     * Those checks look at `status`, `mpesaReceipt` and `resultCode`; they say nothing at all about
+     * `data.decoded`, `data.retryable`, `data.customerMessage` or `data.category`, which are not
+     * evidence but CONCLUSIONS - and they were being taken verbatim from the body.
+     *
+     * So a `payment.failed` carrying result code 17 (a terminal M-Pesa system error) plus a forged
+     * `decoded.retryable = true` passed every check and then told the caller it was safe to charge
+     * again. The handler reads the field the SDK handed it; nothing downstream re-derives it. That is
+     * a double-charge generator reachable through a body that is, by every check we had, valid.
+     *
+     * A signature proves ORIGIN. It does not make a conclusion true, and a compromised or merely
+     * buggy signer produces correctly-signed conclusions. The rule is therefore simple and total:
+     * the SDK trusts the EVIDENCE fields (which the semantic model then judges) and recomputes every
+     * CONCLUSION from its own offline catalog. Root level and nested alike, because a handler reading
+     * `$event['retryable']` is in exactly as much danger as one reading `$event['data']['retryable']`.
+     *
+     * An ABSENT `decoded` block is synthesized rather than left out: absence is not safer than a
+     * forgery. A handler that does `$event['data']['decoded']['retryable'] ?? true` on a missing
+     * block reaches the same double-charge, and one that assumes the key exists fatals instead.
+     *
+     * @param array<string,mixed> $event
+     * @return array<string,mixed> a NEW event; the input is not mutated
+     */
+    private static function withAuthoritativeDerivedFields(array $event): array
+    {
+        /** @var array<string,mixed> $data */
+        $data = $event['data'];
+        $type = (string) $event['type'];
+
+        // A non-payment event carries no payment claim, so there is nothing to derive FROM - and a
+        // derived-looking field on it is therefore unverifiable by construction. Strip rather than
+        // forward: an unknown event type is for forward compatibility, and a future field must not
+        // be able to smuggle a retryability claim through a version that cannot check it.
+        if (!isset(self::PAYMENT_EVENT_STATUS[$type])) {
+            return self::stripDerived($event);
+        }
+
+        $outcome = PaymentOutcome::fromPayment([
+            'id' => $data['paymentId'] ?? '',
+            'status' => $data['status'] ?? null,
+            'mpesaReceipt' => $data['mpesaReceipt'] ?? null,
+            'resultCode' => $data['resultCode'] ?? null,
+            'resultDesc' => $data['resultDesc'] ?? null,
+        ]);
+
+        // Synthesized when the record carries no result code, so `decoded` is ALWAYS a complete,
+        // locally-derived block.
+        $decoded = $outcome->detail ?? self::synthesizeDecoded($outcome);
+
+        $event = self::stripDerived($event);
+        /** @var array<string,mixed> $data */
+        $data = $event['data'];
+
+        $data['decoded'] = $decoded;
+        $data['retryable'] = $outcome->retryable;
+        $data['customerMessage'] = $outcome->message;
+        $data['category'] = $decoded['category'];
+        $event['data'] = $data;
+
+        return $event;
+    }
+
+    /** The derived keys, at both levels. Names are shared with the sibling SDKs. */
+    private const DERIVED_KEYS = ['decoded', 'retryable', 'customerMessage', 'category'];
+
+    /**
+     * Remove every derived field from the root AND from `data`, so nothing server-supplied survives
+     * into the value a handler reads.
+     *
+     * @param array<string,mixed> $event
+     * @return array<string,mixed>
+     */
+    private static function stripDerived(array $event): array
+    {
+        foreach (self::DERIVED_KEYS as $key) {
+            unset($event[$key]);
+        }
+        if (isset($event['data']) && is_array($event['data'])) {
+            $data = $event['data'];
+            foreach (self::DERIVED_KEYS as $key) {
+                unset($data[$key]);
+            }
+            $event['data'] = $data;
+        }
 
         return $event;
     }
 
     /**
-     * Verify ONLY the signature and the envelope, and return the decoded event WITHOUT the semantic
-     * checks {@see verify()} applies.
+     * A decoded block for a record that carries no result code. It exists so `decoded` is never
+     * absent; it is deliberately NON-RETRYABLE in every branch, because a record with no code proves
+     * nothing about whether money moved.
      *
-     * This exists for exactly one reason: the cross-repo GOLDEN VECTOR pins the SIGNING SCHEME, and
-     * its body is a minimal signing fixture rather than a representative event. Verifying it must
-     * not require editing literals that three repositories agree on byte-for-byte. Use verify() for
-     * anything that will reach a handler - a signature proves a body came FROM paylod, and nothing
-     * whatsoever about whether the body is coherent.
+     * @return array{code:string,title:string,cause:string,fix:string,category:string,retryable:bool,customerMessage:string}
+     */
+    private static function synthesizeDecoded(PaymentOutcome $outcome): array
+    {
+        if ($outcome->paid) {
+            return [
+                'code' => '0',
+                'title' => 'Payment received',
+                'cause' => 'The payment settled successfully.',
+                'fix' => 'No action needed.',
+                'category' => 'success',
+                'retryable' => false,
+                'customerMessage' => $outcome->message,
+            ];
+        }
+
+        return [
+            'code' => 'unknown',
+            'title' => 'Payment not settled',
+            'cause' => 'The event carried no M-Pesa result code, so there is no catalog entry to '
+                . 'decode and nothing that establishes what happened to the payment.',
+            'fix' => 'Read the payment with GET /status/:id before charging again - without a result '
+                . 'code we cannot prove no money moved.',
+            'category' => 'unknown',
+            'retryable' => false,
+            'customerMessage' => $outcome->message,
+        ];
+    }
+
+    /**
+     * SIGNATURE ONLY - and the result is explicitly NOT an event you may act on.
+     *
+     * -- Why this no longer returns an event -------------------------------------------------------
+     * It used to return the decoded event, exactly like {@see verify()}, differing only in that it
+     * skipped every semantic check. Two functions with the same return shape, one of which is safe
+     * and one of which is not, is a trap rather than an API: the mistake is invisible at the call
+     * site, and the one it invites - `$e = Webhook::verifySignature(...); if ($e['data']['status']
+     * === 'success') fulfil();` - fulfils an order on an evidence-free `payment.success` that
+     * verify() would have refused outright.
+     *
+     * So the shapes are now different on purpose. This returns a wrapper whose keys say what it is:
+     * `signatureValid` (the only thing actually established), `actionable` (always false), and
+     * `unverifiedEvent` - a name a reviewer cannot read as approval. There is no path from this
+     * value to a fulfilment decision that does not go through renaming it first.
+     *
+     * It exists for ONE reason: the cross-repo GOLDEN VECTOR pins the SIGNING SCHEME, and its body
+     * is a minimal signing fixture rather than a representative event, so verifying it must not
+     * require editing literals that several repositories agree on byte-for-byte. Use verify() for
+     * anything that will reach a handler.
+     *
+     * @internal pins the signing scheme; not part of the supported event-handling surface.
+     *
+     * @return array{signatureValid:bool,actionable:bool,unverifiedEvent:array<string,mixed>}
+     *
+     * @throws PaylodSignatureVerificationError
+     */
+    public static function verifySignature(
+        string|\Stringable $payload,
+        ?string $signature,
+        #[\SensitiveParameter] string $secret,
+        int|float $toleranceSec = self::DEFAULT_TOLERANCE_SEC,
+        int|float|null $nowSec = null,
+    ): array {
+        return [
+            'signatureValid' => true,
+            'actionable' => false,
+            'unverifiedEvent' => self::parseSignedEnvelope(
+                $payload,
+                $signature,
+                $secret,
+                $toleranceSec,
+                $nowSec,
+            ),
+        ];
+    }
+
+    /**
+     * Verify the signature and the envelope, and return the decoded event WITHOUT the semantic
+     * checks {@see verify()} applies. PRIVATE: an event that has passed only this is not something
+     * any caller outside this class should be able to get hold of.
      *
      * @return array<string,mixed>
      *
      * @throws PaylodSignatureVerificationError
      */
-    public static function verifySignature(
+    private static function parseSignedEnvelope(
         string|\Stringable $payload,
         ?string $signature,
         #[\SensitiveParameter] string $secret,
@@ -311,10 +481,16 @@ final class Webhook
     }
 
     /**
-     * The signature-only boolean form, matching {@see verifySignature()}. Prefer {@see isValid()}:
-     * this one answers "did paylod send these bytes", not "is this event something I may act on".
+     * The signature-only boolean form. Answers "did paylod send these bytes" and NOTHING else - in
+     * particular it does NOT answer "may I act on this event", which is what a `true` from a
+     * function named like this reads as at a call site.
+     *
+     * A bare `true` here approved an evidence-free `payment.success`, so the name now carries its
+     * own warning and the doc says what it omits. Use {@see isValid()} to decide anything.
+     *
+     * @internal pins the signing scheme; not part of the supported event-handling surface.
      */
-    public static function isValidSignature(
+    public static function isValidSignatureOnlyNotActionable(
         string|\Stringable $payload,
         ?string $signature,
         #[\SensitiveParameter] string $secret,
@@ -322,7 +498,7 @@ final class Webhook
         int|float|null $nowSec = null,
     ): bool {
         try {
-            self::verifySignature($payload, $signature, $secret, $toleranceSec, $nowSec);
+            self::parseSignedEnvelope($payload, $signature, $secret, $toleranceSec, $nowSec);
             return true;
         } catch (PaylodSignatureVerificationError) {
             return false;

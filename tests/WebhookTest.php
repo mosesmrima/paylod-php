@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Paylod\Tests;
 
+use Paylod\DarajaCatalog;
 use Paylod\Exceptions\PaylodSignatureVerificationError;
 use Paylod\Paylod;
 use Paylod\Tests\Support\MockHttpClient;
@@ -88,11 +89,16 @@ final class WebhookTest extends TestCase
         // representative event, so it is verified at the SIGNATURE layer - verify() additionally
         // enforces the event schema and the semantic model, which are covered by their own tests
         // instead of by editing these cross-repo-pinned literals.
-        $event = Webhook::verifySignature($goldenBody, $goldenHeader, $goldenSecret, 300, $goldenT);
-        $this->assertSame('pay_golden', $event['data']['paymentId']);
+        $result = Webhook::verifySignature($goldenBody, $goldenHeader, $goldenSecret, 300, $goldenT);
+        $this->assertTrue($result['signatureValid']);
+        // The signature layer establishes ORIGIN ONLY, and the result says so in its own keys.
+        $this->assertFalse($result['actionable']);
+        $this->assertSame('pay_golden', $result['unverifiedEvent']['data']['paymentId']);
 
         // The boolean convenience form agrees.
-        $this->assertTrue(Webhook::isValidSignature($goldenBody, $goldenHeader, $goldenSecret, 300, $goldenT));
+        $this->assertTrue(
+            Webhook::isValidSignatureOnlyNotActionable($goldenBody, $goldenHeader, $goldenSecret, 300, $goldenT)
+        );
     }
 
     public function testAcceptsValidSignatureAndReturnsEvent(): void
@@ -348,23 +354,122 @@ final class WebhookTest extends TestCase
         $this->assertSame('pay_123', $event['data']['paymentId']);
     }
 
-    public function testFailedEventDecodedMatchesOfflineCatalog(): void
+    /**
+     * The decoded block a handler reads must come from the LOCAL catalog.
+     *
+     * This test used to build `data.decoded` from the very same catalog it then asserted against, so
+     * it passed whether the verifier re-derived the block or forwarded it untouched - it could not
+     * tell the two apart, which is precisely the defect it was supposed to guard. It now supplies
+     * DELIBERATELY FALSE derived fields and requires them to be overwritten.
+     */
+    public function testFailedEventDecodedIsReDerivedAndNeverTakenFromTheBody(): void
     {
-        $paylod = $this->client();
         $failed = self::event();
         $failed['type'] = 'payment.failed';
         $failed['data']['status'] = 'failed';
         $failed['data']['mpesaReceipt'] = null;
         $failed['data']['resultCode'] = 1037;
         $failed['data']['resultDesc'] = 'DS timeout';
-        $failed['data']['decoded'] = $paylod->decodeError(1037);
+        // THE FORGERY. Server-supplied conclusions, all of them wrong, at both levels.
+        $failed['data']['decoded'] = [
+            'code' => '1037',
+            'title' => 'Totally fine',
+            'cause' => 'nothing happened',
+            'fix' => 'charge again immediately',
+            'category' => 'customer',
+            'retryable' => true,
+            'customerMessage' => 'Please pay again.',
+        ];
+        $failed['data']['retryable'] = true;
+        $failed['data']['customerMessage'] = 'Please pay again.';
+        $failed['data']['category'] = 'customer';
+        $failed['retryable'] = true;
+        $failed['decoded'] = ['retryable' => true];
 
         $raw = json_encode($failed);
         $event = Webhook::verify($raw, Webhook::sign($raw, self::SECRET, self::now()), self::SECRET, 300, self::now());
+
+        // The catalog's real text for 1037, not the body's.
         $this->assertSame(
             'The M-Pesa prompt expired before it was answered. Check your phone is on, then try again '
             . 'and enter your PIN when it appears.',
             $event['data']['decoded']['customerMessage']
         );
+        $this->assertNotSame('Totally fine', $event['data']['decoded']['title']);
+        $this->assertSame($event['data']['decoded']['customerMessage'], $event['data']['customerMessage']);
+        $this->assertSame($event['data']['decoded']['category'], $event['data']['category']);
+
+        // And the ROOT-level forgeries are gone - a handler reading either level is safe.
+        $this->assertArrayNotHasKey('retryable', $event);
+        $this->assertArrayNotHasKey('decoded', $event);
+    }
+
+    /**
+     * THE DOUBLE-CHARGE CASE. A signed `payment.failed` with a terminal, NON-retryable code and a
+     * forged `retryable = true` must never reach the handler saying it is safe to charge again.
+     */
+    public function testAForgedRetryableOnATerminalFailureIsOverwritten(): void
+    {
+        $failed = self::event();
+        $failed['type'] = 'payment.failed';
+        $failed['data']['status'] = 'failed';
+        $failed['data']['mpesaReceipt'] = null;
+        $failed['data']['resultCode'] = 17; // an M-Pesa system error - NOT safe to charge again
+        $failed['data']['resultDesc'] = 'Rule limited';
+        $failed['data']['decoded'] = ['retryable' => true, 'category' => 'customer'];
+        $failed['data']['retryable'] = true;
+
+        $raw = json_encode($failed);
+        $event = Webhook::verify($raw, Webhook::sign($raw, self::SECRET, self::now()), self::SECRET, 300, self::now());
+
+        $this->assertFalse($event['data']['retryable'], 'a forged retryable survived verification');
+        $this->assertFalse($event['data']['decoded']['retryable']);
+        $this->assertSame(DarajaCatalog::decode(17)['retryable'], $event['data']['decoded']['retryable']);
+    }
+
+    /**
+     * An ABSENT decoded block is SYNTHESIZED, never left missing: a handler doing
+     * `$decoded['retryable'] ?? true` on a missing block reaches the same double-charge a forged
+     * `true` does.
+     */
+    public function testAMissingDecodedBlockIsSynthesizedAndNonRetryable(): void
+    {
+        $failed = self::event();
+        $failed['type'] = 'payment.failed';
+        $failed['data']['status'] = 'failed';
+        $failed['data']['mpesaReceipt'] = null;
+        $failed['data']['resultCode'] = null;
+        $failed['data']['resultDesc'] = null;
+        unset($failed['data']['decoded']);
+
+        $raw = json_encode($failed);
+        $event = Webhook::verify($raw, Webhook::sign($raw, self::SECRET, self::now()), self::SECRET, 300, self::now());
+
+        $this->assertArrayHasKey('decoded', $event['data']);
+        $this->assertFalse($event['data']['decoded']['retryable']);
+        $this->assertFalse($event['data']['retryable']);
+        $this->assertIsString($event['data']['decoded']['customerMessage']);
+    }
+
+    /**
+     * A derived field on an UNKNOWN event type is unverifiable by construction, so it is stripped
+     * rather than forwarded - a future field must not smuggle a retryability claim through a version
+     * that cannot check it.
+     */
+    public function testDerivedFieldsAreStrippedFromUnknownEventTypes(): void
+    {
+        $other = ['type' => 'payout.settled', 'created' => self::now(), 'data' => [
+            'payoutId' => 'po_1',
+            'retryable' => true,
+            'decoded' => ['retryable' => true],
+        ]];
+
+        $raw = json_encode($other);
+        $event = Webhook::verify($raw, Webhook::sign($raw, self::SECRET, self::now()), self::SECRET, 300, self::now());
+
+        $this->assertArrayNotHasKey('retryable', $event['data']);
+        $this->assertArrayNotHasKey('decoded', $event['data']);
+        // The non-derived payload is untouched.
+        $this->assertSame('po_1', $event['data']['payoutId']);
     }
 }
