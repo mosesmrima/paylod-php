@@ -1,0 +1,68 @@
+{
+    "name": "paylod/paylod",
+    "description": "Official PHP client for the paylod API - M-Pesa (Safaricom Daraja) STK Push, status polling, signed webhooks and offline error decoding, with first-class Laravel support.",
+    "keywords": [
+        "paylod",
+        "mpesa",
+        "m-pesa",
+        "daraja",
+        "safaricom",
+        "payments",
+        "kenya",
+        "stk-push",
+        "laravel"
+    ],
+    "homepage": "https://paylod.dev/docs/sdk",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "paylod / Moses Mrima",
+            "homepage": "https://paylod.dev"
+        }
+    ],
+    "support": {
+        "issues": "https://github.com/mosesmrima/paylod-php/issues",
+        "source": "https://github.com/mosesmrima/paylod-php"
+    },
+    "require": {
+        "php": "^8.1",
+        "ext-curl": "*",
+        "ext-json": "*",
+        "ext-hash": "*"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^10.5",
+        "illuminate/support": "^10.0|^11.0|^12.0",
+        "illuminate/config": "^10.0|^11.0|^12.0",
+        "illuminate/container": "^10.0|^11.0|^12.0",
+        "vlucas/phpdotenv": "^5.6"
+    },
+    "autoload": {
+        "psr-4": {
+            "Paylod\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Paylod\\Tests\\": "tests/"
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "Paylod\\Laravel\\PaylodServiceProvider"
+            ],
+            "aliases": {
+                "Paylod": "Paylod\\Laravel\\Facades\\Paylod"
+            }
+        }
+    },
+    "config": {
+        "sort-packages": true
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true,
+    "scripts": {
+        "test": "phpunit"
+    }
+}
