@@ -179,7 +179,7 @@ final class Validate
         #[\SensitiveParameter] ?callable $redact = null,
         ?string $expectedId = null,
     ): void {
-        $problem = self::paymentProblem($parsed, $expectedId);
+        $problem = self::paymentProblem($parsed, $expectedId, $redact);
         if ($problem === null) {
             return;
         }
@@ -233,11 +233,33 @@ final class Validate
         return null;
     }
 
-    /** @param array<string,mixed> $parsed */
-    private static function paymentProblem(#[\SensitiveParameter] array $parsed, ?string $expectedId = null): ?string
-    {
+    /**
+     * @param array<string,mixed> $parsed
+     * @param ?callable(mixed):mixed $redact
+     */
+    private static function paymentProblem(
+        #[\SensitiveParameter] array $parsed,
+        ?string $expectedId = null,
+        #[\SensitiveParameter] ?callable $redact = null,
+    ): ?string {
         if (!self::isNonBlankString($parsed['id'] ?? null)) {
             return 'no usable payment id';
+        }
+
+        // THE SAME IDENTIFIER GRAMMAR THE ACKNOWLEDGEMENT ENFORCES, on the status-read path.
+        //
+        // It was applied to `paymentId` / `checkoutRequestId` on the 202 and to nothing at all on
+        // the 200 that a status read, a wait() poll and a simulator settle all go through - so the
+        // credential check existed on the surface a caller hits ONCE per payment and was missing
+        // from the one they hit on every poll. A gateway echoing the Authorization header into `id`
+        // therefore still reached PaymentOutcome::$paymentId, which is the value applications log on
+        // every charge and store in a payments table in plaintext.
+        //
+        // A violation is INDETERMINATE for the same reason it is on the ack: we asked about a real
+        // payment and got back something that is not an answer, so we now know nothing about it.
+        $idProblem = self::identifierProblem('id', (string) $parsed['id'], $redact);
+        if ($idProblem !== null) {
+            return $idProblem;
         }
 
         // L1 BINDING. Checked before anything else about the record's CONTENTS, because if this
