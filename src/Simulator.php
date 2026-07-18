@@ -194,7 +194,7 @@ final class Simulator
             // available, so the check was run against a hardcoded 200 and the ack could not be
             // rejected on it. A simulator that tolerates an acknowledgement production would reject
             // teaches the wrong thing about the shape of a real response.
-            'validate' => static function (array $parsed, int $status) use ($idempotencyKey, $redact): void {
+            'validate' => static function (#[\SensitiveParameter] array $parsed, int $status) use ($idempotencyKey, $redact): void {
                 Validate::collectAck($parsed, $status, $idempotencyKey, $redact);
             },
         ]);
@@ -236,7 +236,7 @@ final class Simulator
             // one status() runs, ID BINDING (law L1) INCLUDED. This surface previously validated
             // against a hardcoded 200 and did not bind at all, so a body describing a DIFFERENT
             // payment was classified on its merits and returned as this payment's outcome.
-            'validate' => static function (array $parsed, int $status) use ($paymentId, $redact): void {
+            'validate' => static function (#[\SensitiveParameter] array $parsed, int $status) use ($paymentId, $redact): void {
                 Validate::paymentBody(self::normalizeSettleAck($parsed), $status, $redact, $paymentId);
             },
         ]);

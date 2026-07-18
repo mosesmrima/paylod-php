@@ -110,16 +110,27 @@ final class Validate
      * keyed indeterminate error, never as a "successful" ack the caller will treat as a new payment
      * and retry under a fresh key.
      *
+     * -- Why $parsed and $redact are #[\SensitiveParameter] -------------------------------------
+     * `$parsed` is a RAW RESPONSE BODY - bytes from the network, attacker-influenced, and the exact
+     * thing a misconfigured gateway echoes an Authorization header into. The message and the
+     * attached body are both scrubbed, but that was never the whole exposure: PHP records call
+     * ARGUMENTS in every stack trace when zend.exception_ignore_args=0 (the development default),
+     * and the argument recorded here is the body BEFORE redaction. So a reflected bearer token was
+     * scrubbed out of everything a reader looks at and left sitting verbatim in getTrace().
+     *
+     * `$redact` is marked too: it is a closure BOUND TO THE CLIENT, so a trace that renders its
+     * bound scope reaches the credential through it.
+     *
      * @param array<string,mixed> $parsed
      * @param ?callable(mixed):mixed $redact applied to the body before it is attached to the error
      */
     public static function collectAck(
-        array $parsed,
+        #[\SensitiveParameter] array $parsed,
         int $status,
         ?string $idempotencyKey = null,
-        ?callable $redact = null,
+        #[\SensitiveParameter] ?callable $redact = null,
     ): void {
-        $problem = self::ackProblem($parsed, $status);
+        $problem = self::ackProblem($parsed, $status, $redact);
         if ($problem === null) {
             return;
         }
@@ -163,9 +174,9 @@ final class Validate
      * @param ?string $expectedId the id that was REQUESTED. The body must agree with it.
      */
     public static function paymentBody(
-        array $parsed,
+        #[\SensitiveParameter] array $parsed,
         int $status,
-        ?callable $redact = null,
+        #[\SensitiveParameter] ?callable $redact = null,
         ?string $expectedId = null,
     ): void {
         $problem = self::paymentProblem($parsed, $expectedId);
@@ -184,9 +195,15 @@ final class Validate
         );
     }
 
-    /** @param array<string,mixed> $parsed */
-    private static function ackProblem(array $parsed, int $httpStatus): ?string
-    {
+    /**
+     * @param array<string,mixed> $parsed
+     * @param ?callable(mixed):mixed $redact
+     */
+    private static function ackProblem(
+        #[\SensitiveParameter] array $parsed,
+        int $httpStatus,
+        #[\SensitiveParameter] ?callable $redact = null,
+    ): ?string {
         // THE HTTP STATUS IS PART OF THE CONTRACT, and it is checked FIRST - before any field - so a
         // well-shaped body served by something that is not the collect endpoint cannot pass.
         if ($httpStatus !== self::ACK_HTTP_STATUS) {
@@ -199,6 +216,14 @@ final class Validate
         if (!self::isNonBlankString($parsed['checkoutRequestId'] ?? null)) {
             return 'no usable checkoutRequestId';
         }
+        // THE IDENTIFIERS ARE SHAPE-CHECKED, not merely non-blank. Both are returned to the caller
+        // and both land in ordinary, commonly-logged output.
+        foreach (['paymentId', 'checkoutRequestId'] as $field) {
+            $problem = self::identifierProblem($field, (string) $parsed[$field], $redact);
+            if ($problem !== null) {
+                return $problem;
+            }
+        }
         $status = $parsed['status'] ?? null;
         if ($status !== self::ACK_STATUS) {
             return 'status was ' . json_encode($status) . ', expected the literal "'
@@ -209,7 +234,7 @@ final class Validate
     }
 
     /** @param array<string,mixed> $parsed */
-    private static function paymentProblem(array $parsed, ?string $expectedId = null): ?string
+    private static function paymentProblem(#[\SensitiveParameter] array $parsed, ?string $expectedId = null): ?string
     {
         if (!self::isNonBlankString($parsed['id'] ?? null)) {
             return 'no usable payment id';
@@ -259,5 +284,60 @@ final class Validate
     private static function isNonBlankString(mixed $value): bool
     {
         return is_string($value) && trim($value) !== '';
+    }
+
+    /**
+     * The identifier grammar. Bounded length, a closed character set, and NOT credential-shaped.
+     *
+     * -- Why an id needs a grammar ------------------------------------------------------------
+     * `paymentId` and `checkoutRequestId` were required to be non-blank strings and nothing more,
+     * so a 202 was a valid-looking acknowledgement no matter WHAT those fields contained. A server
+     * that echoes the Authorization header into either of them - the same misconfigured gateway or
+     * debug-echo endpoint the body redaction already exists to defend against - therefore handed the
+     * bearer key back through the SUCCESS path, where nothing redacts it. And these two fields are
+     * about the worst possible carriers: an id is the value applications log on every charge, put in
+     * support tickets, and store in a payments table in plaintext.
+     *
+     * Redaction on the error path does not help here, because this is not an error path. The answer
+     * is to refuse the shape: a real paylod id is a short, opaque token, and a bearer credential is
+     * not one.
+     *
+     * A violation is INDETERMINATE rather than a plain rejection: the 202 means the STK push was
+     * dispatched, so a charge may well be live. The caller must re-read it under the same key, never
+     * mint a new one.
+     */
+    private const MAX_IDENTIFIER_BYTES = 128;
+
+    /** Opaque token: alphanumeric, with the separators paylod ids actually use. No spaces, no colons-into-URLs. */
+    private const IDENTIFIER_RE = '/^[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}\z/';
+
+    /** @param ?callable(mixed):mixed $redact */
+    private static function identifierProblem(
+        string $field,
+        string $value,
+        #[\SensitiveParameter] ?callable $redact = null,
+    ): ?string {
+        if (strlen($value) > self::MAX_IDENTIFIER_BYTES) {
+            return "{$field} is " . strlen($value) . ' bytes long, which is not an identifier - a '
+                . 'paylod id is a short opaque token, and an oversized value in this field is either '
+                . 'a different kind of data or something reflected back at us';
+        }
+        if (preg_match(self::IDENTIFIER_RE, $value) !== 1) {
+            return "{$field} is not a well-formed identifier (expected an opaque token of letters, "
+                . 'digits, underscore, dot or hyphen)';
+        }
+
+        // THE CREDENTIAL CHECK, expressed through the redactor the client already carries. Redact
+        // replaces the exact secrets this process holds AND anything credential-shaped
+        // (mp_live_/mp_test_/whsec_), so a value that CHANGES under redaction is, by that same
+        // definition, a secret or a credential-shaped token. Reusing it means this check can never
+        // drift from what the SDK considers a secret elsewhere.
+        if ($redact !== null && $redact($value) !== $value) {
+            return "{$field} contains a credential-shaped value or this client's own API key - a "
+                . 'server echoing your bearer token into an identifier field would put it straight '
+                . 'into your payment logs';
+        }
+
+        return null;
     }
 }

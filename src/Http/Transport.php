@@ -7,6 +7,7 @@ namespace Paylod\Http;
 use Closure;
 use Paylod\Exceptions\PaylodConfigError;
 use Paylod\Exceptions\PaylodCredentialCompromiseError;
+use Paylod\Support\Redact;
 
 /**
  * THE CREDENTIALED TRANSPORT.
@@ -278,13 +279,25 @@ final class Transport
      * ORIGIN rule and nothing else - it must never wave through ftp://, ws:// or file://.
      */
     public static function assertSecureBaseUrl(
-        string $baseUrl,
+        #[\SensitiveParameter] string $baseUrl,
         #[\SensitiveParameter] string $apiKey,
         bool $allowInsecure,
     ): void {
+        // THE BASE URL IS A SECRET-BEARING STRING, and every message below interpolates it.
+        //
+        // It was neither marked sensitive nor redacted, so a userinfo section - the very thing the
+        // first check exists to reject - put its contents into the exception message AND into the
+        // stack trace: `https://mp_live_realkey@paylod.dev/...` was refused with the live key quoted
+        // verbatim in the text a caller logs. The check was right and the diagnostic leaked the
+        // credential it caught.
+        //
+        // So a REDACTED rendering is computed once, up front, and used in every message. The
+        // original is still what gets PARSED - redaction must not change what is being validated,
+        // only what is said about it.
+        $shown = Redact::text($baseUrl, [$apiKey]);
         $parts = parse_url($baseUrl);
         if ($parts === false || !isset($parts['scheme']) || !isset($parts['host']) || $parts['host'] === '') {
-            throw new PaylodConfigError("baseUrl is not a valid absolute URL: \"{$baseUrl}\".");
+            throw new PaylodConfigError("baseUrl is not a valid absolute URL: \"{$shown}\".");
         }
 
         $scheme = strtolower((string) $parts['scheme']);
@@ -296,7 +309,7 @@ final class Transport
         // reads as the real origin while resolving to the attacker's.
         if (isset($parts['user']) || isset($parts['pass'])) {
             throw new PaylodConfigError(
-                "baseUrl must not contain credentials (got \"{$baseUrl}\"). A userinfo section makes the "
+                "baseUrl must not contain credentials (got \"{$shown}\"). A userinfo section makes the "
                 . 'URL read like the paylod origin while pointing somewhere else entirely.'
             );
         }
@@ -304,7 +317,7 @@ final class Transport
         // relocated into the middle of the request line.
         if (isset($parts['query']) || isset($parts['fragment'])) {
             throw new PaylodConfigError(
-                "baseUrl must not contain a query string or fragment (got \"{$baseUrl}\")."
+                "baseUrl must not contain a query string or fragment (got \"{$shown}\")."
             );
         }
 
@@ -317,7 +330,7 @@ final class Transport
         // key to whatever the transport made of them.
         if ($scheme !== 'https' && !($scheme === 'http' && $isLoopbackHost && $allowInsecure && !$isLive)) {
             throw new PaylodConfigError(
-                "baseUrl must use https:// (got scheme \"{$scheme}\" in \"{$baseUrl}\"). Plaintext HTTP "
+                "baseUrl must use https:// (got scheme \"{$scheme}\" in \"{$shown}\"). Plaintext HTTP "
                 . 'would transmit your API key in the clear, and any other scheme (ftp, ws, file, '
                 . 'data...) is not something this SDK will ever speak. Loopback HTTP is allowed ONLY '
                 . "with ['allowInsecureBaseUrl' => true] and NEVER with an mp_live_ key."
@@ -330,7 +343,7 @@ final class Transport
                 return;
             }
             throw new PaylodConfigError(
-                "baseUrl points at loopback (\"{$baseUrl}\"). That is allowed ONLY with "
+                "baseUrl points at loopback (\"{$shown}\"). That is allowed ONLY with "
                 . "['allowInsecureBaseUrl' => true] and NEVER with an mp_live_ key."
             );
         }
@@ -339,7 +352,7 @@ final class Transport
         // classic SSRF pivot (169.254.169.254 and friends).
         if (filter_var($host, FILTER_VALIDATE_IP) !== false) {
             throw new PaylodConfigError(
-                "baseUrl must name the paylod host, not a raw IP address (got \"{$baseUrl}\")."
+                "baseUrl must name the paylod host, not a raw IP address (got \"{$shown}\")."
             );
         }
 
@@ -353,7 +366,7 @@ final class Transport
 
         if ($port !== null && (int) $port !== 443) {
             throw new PaylodConfigError(
-                "baseUrl must use the default https port (got port {$port} in \"{$baseUrl}\")."
+                "baseUrl must use the default https port (got port {$port} in \"{$shown}\")."
             );
         }
     }

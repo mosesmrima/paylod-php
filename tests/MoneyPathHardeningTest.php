@@ -311,10 +311,19 @@ final class MoneyPathHardeningTest extends TestCase
      * Stack traces are where secrets actually leak in the field: PHP records call arguments in every
      * trace when zend.exception_ignore_args=0 (the development default), so a constructor argument
      * that is not #[\SensitiveParameter] ends up in the error log of any uncaught exception.
+     *
+     * -- Why this probe now asserts its own machinery ---------------------------------------------
+     * It used to ignore whether the temp file was actually written and whether the subprocess ran.
+     * A failed write left PHP printing "Could not open input file", which is non-empty and contains
+     * none of the leak markers - so the probe PASSED without ever executing the code under test. A
+     * test whose failure mode is a silent pass is worse than no test. The file, the exit status and
+     * the presence of a real trace are all asserted before any leak assertion is trusted.
      */
     public function testSecretsAreScrubbedFromStackTracesWithExceptionArgsEnabled(): void
     {
         $autoload = dirname(__DIR__) . '/vendor/autoload.php';
+        $this->assertFileExists($autoload, 'the probe cannot run without a composer autoloader');
+
         $script = <<<PHP
         require '{$autoload}';
         try {
@@ -331,23 +340,201 @@ final class MoneyPathHardeningTest extends TestCase
         } catch (Throwable \$e) {
             echo \$e->getTraceAsString(), "\n";
         }
-        PHP;
-        $file = sys_get_temp_dir() . '/paylod_trace_probe_' . getmypid() . '.php';
-        file_put_contents($file, "<?php\n" . $script);
+        // The RESPONSE-BODY path: a server reflecting the bearer token into an error body used to
+        // leave it verbatim in the validator's recorded call arguments, even though the message and
+        // the attached body were both redacted.
         try {
+            \$client = new class implements Paylod\Http\HttpClient {
+                public function send(string \$m, string \$u, array \$h, ?string \$b, int \$t): array
+                {
+                    return [
+                        'status' => 202,
+                        'headers' => [],
+                        'body' => json_encode(['paymentId' => 'mp_test_LEAKA', 'status' => 'pending']),
+                        'effectiveUrl' => null,
+                        'redirectCount' => 0,
+                    ];
+                }
+            };
+            \$p2 = new Paylod\Paylod('mp_test_LEAKA', ['httpClient' => \$client, 'allowCustomHttpClient' => true]);
+            \$p2->collect(['amount' => 1, 'phone' => '0712345678', 'idempotencyKey' => 'k']);
+        } catch (Throwable \$e) {
+            echo \$e->getTraceAsString(), "\n";
+            // The COMPLETE structured trace, not just the rendered string: getTraceAsString()
+            // abbreviates arguments, so a secret can survive in getTrace()['args'] while the
+            // string form looks clean.
+            echo print_r(\$e->getTrace(), true), "\n";
+        }
+        PHP;
+
+        $file = sys_get_temp_dir() . '/paylod_trace_probe_' . getmypid() . '.php';
+        $written = file_put_contents($file, "<?php\n" . $script);
+
+        try {
+            // THE PROBE'S OWN MACHINERY, asserted before its result is trusted.
+            $this->assertNotFalse($written, 'could not write the probe script');
+            $this->assertFileExists($file);
+            $this->assertGreaterThan(0, (int) $written);
+
             $cmd = escapeshellarg(PHP_BINARY) . ' -d zend.exception_ignore_args=0 -d error_reporting=0 '
                 . escapeshellarg($file) . ' 2>&1';
-            $out = (string) shell_exec($cmd);
+            $out = [];
+            $exitCode = 0;
+            exec($cmd, $out, $exitCode);
+            $out = implode("\n", $out);
         } finally {
             @unlink($file);
         }
 
+        $this->assertSame(0, $exitCode, "the probe subprocess failed:\n{$out}");
+        $this->assertStringNotContainsString('Could not open input file', $out);
+        $this->assertStringNotContainsString('Fatal error', $out);
         $this->assertNotSame('', trim($out), 'the probe produced no trace at all');
+
+        // It really ran the code under test: a genuine trace names this SDK's own frames.
+        $this->assertStringContainsString('Paylod', $out, 'the output is not a paylod stack trace');
+        $this->assertMatchesRegularExpression('/#\d+ /', $out, 'the output contains no stack frames');
+        $this->assertStringContainsString('collect', $out, 'the collect() probe frame is missing');
+
         // Short secrets on purpose: PHP truncates string arguments in a trace at 15 characters, so a
         // long fixture would "pass" merely by being cut off rather than by being marked sensitive.
         $this->assertStringNotContainsString('LEAKA', $out);
         $this->assertStringNotContainsString('LEAKB', $out);
         $this->assertStringNotContainsString('LEAKC', $out);
+    }
+
+    /**
+     * The baseUrl VALIDATION ERRORS must not quote the credential they just caught.
+     *
+     * `https://mp_live_realkey@paylod.dev/...` is refused for carrying userinfo - correctly - but
+     * the message interpolated the URL verbatim, so the diagnostic printed the live key into the
+     * caller's log. A check that leaks the secret it detects is not a protection.
+     */
+    public function testBaseUrlValidationErrorsDoNotQuoteTheCredential(): void
+    {
+        $cases = [
+            'userinfo carrying the key' => 'https://mp_test_supersecretkey@evil.example/v1',
+            'userinfo carrying a live key' => 'https://mp_live_anotherkey@evil.example/v1',
+            'key in a query string' => 'https://paylod.dev/v1?token=mp_test_supersecretkey',
+        ];
+
+        foreach ($cases as $label => $url) {
+            try {
+                new Paylod('mp_test_supersecretkey', ['baseUrl' => $url]);
+                $this->fail("expected {$label} to be refused");
+            } catch (PaylodConfigError $e) {
+                $this->assertStringNotContainsString('supersecretkey', $e->getMessage(), $label);
+                $this->assertStringNotContainsString('mp_live_anotherkey', $e->getMessage(), $label);
+                $this->assertStringContainsString('[redacted]', $e->getMessage(), $label);
+            }
+        }
+    }
+
+    /** And the same string must not survive in the structured trace either. */
+    public function testBaseUrlIsNotLeftInTheStackTrace(): void
+    {
+        try {
+            new Paylod('mp_test_supersecretkey', ['baseUrl' => 'https://mp_test_supersecretkey@evil.example/v1']);
+            $this->fail('expected a config error');
+        } catch (PaylodConfigError $e) {
+            $dump = print_r($e->getTrace(), true);
+            $this->assertStringNotContainsString('supersecretkey', $dump);
+        }
+    }
+
+    // -- 3b. Identifier shape on the acknowledgement path --------------------------
+
+    /**
+     * A 202 whose identifiers carry the bearer token is NOT a usable acknowledgement. Both fields
+     * are returned to the caller and land in ordinary logs, where nothing redacts them - so the
+     * shape is refused, and refused as INDETERMINATE, because the STK push was dispatched.
+     *
+     * @dataProvider credentialShapedAcks
+     */
+    public function testAnAckWhoseIdentifiersCarryTheApiKeyIsRefusedAsIndeterminate(array $ack): void
+    {
+        [$paylod] = $this->client([['status' => 202, 'json' => $ack]], [], 'mp_test_supersecretkey');
+
+        try {
+            $paylod->collect(['amount' => 100, 'phone' => '0712345678', 'idempotencyKey' => 'k']);
+            $this->fail('expected a keyed indeterminate error');
+        } catch (PaylodApiError $e) {
+            $this->assertTrue($e->indeterminate);
+            $this->assertSame('k', $e->idempotencyKey);
+            $this->assertStringNotContainsString('supersecretkey', $e->getMessage());
+            $this->assertStringNotContainsString('supersecretkey', (string) json_encode($e->body));
+        }
+    }
+
+    /** @return array<string,array{0:array<string,mixed>}> */
+    public static function credentialShapedAcks(): array
+    {
+        return [
+            'key echoed into paymentId' => [[
+                'paymentId' => 'mp_test_supersecretkey',
+                'status' => 'pending',
+                'checkoutRequestId' => 'ws_CO_0001',
+            ]],
+            'key echoed into checkoutRequestId' => [[
+                'paymentId' => 'pay_123',
+                'status' => 'pending',
+                'checkoutRequestId' => 'mp_test_supersecretkey',
+            ]],
+            // Credential-SHAPED, but not this client's key: another tenant's live key reflected back.
+            'foreign live key in paymentId' => [[
+                'paymentId' => 'mp_live_someoneelseskey',
+                'status' => 'pending',
+                'checkoutRequestId' => 'ws_CO_0001',
+            ]],
+            'bearer header echoed' => [[
+                'paymentId' => 'Bearer mp_test_supersecretkey',
+                'status' => 'pending',
+                'checkoutRequestId' => 'ws_CO_0001',
+            ]],
+        ];
+    }
+
+    /** Malformed identifier shapes are refused too - an id is a short opaque token, nothing else. */
+    public function testAnAckWithAMalformedIdentifierIsRefused(): void
+    {
+        $bad = [
+            'oversized' => str_repeat('a', 129),
+            'with spaces' => 'pay 123',
+            'with newline' => "pay_123\n",
+            'url' => 'https://evil.example/pay_123',
+            'leading separator' => '-pay_123',
+        ];
+
+        foreach ($bad as $label => $id) {
+            [$paylod] = $this->client([['status' => 202, 'json' => [
+                'paymentId' => $id,
+                'status' => 'pending',
+                'checkoutRequestId' => 'ws_CO_0001',
+            ]]]);
+
+            try {
+                $paylod->collect(['amount' => 100, 'phone' => '0712345678', 'idempotencyKey' => 'k']);
+                $this->fail("expected {$label} to be refused");
+            } catch (PaylodApiError $e) {
+                $this->assertTrue($e->indeterminate, $label);
+                $this->assertSame('k', $e->idempotencyKey, $label);
+            }
+        }
+    }
+
+    /** And a perfectly ordinary ack still works - the grammar must not reject real identifiers. */
+    public function testOrdinaryIdentifiersStillPass(): void
+    {
+        foreach (['pay_123', 'ws_CO_00012345', 'pay-123.v2', 'A1'] as $id) {
+            [$paylod] = $this->client([['status' => 202, 'json' => [
+                'paymentId' => $id,
+                'status' => 'pending',
+                'checkoutRequestId' => 'ws_CO_0001',
+            ]]]);
+
+            $ack = $paylod->collect(['amount' => 100, 'phone' => '0712345678', 'idempotencyKey' => 'k']);
+            $this->assertSame($id, $ack['paymentId']);
+        }
     }
 
     // -- 4. Timeouts must be whole, representable milliseconds ---------------------

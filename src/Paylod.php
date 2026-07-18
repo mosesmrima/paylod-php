@@ -454,7 +454,11 @@ final class Paylod
             // checked - a blank checkoutRequestId or a missing/mistyped status is just as unusable as
             // a missing paymentId, and returning any of them as "success" hands the caller a shape it
             // will treat as a new payment and retry under a fresh key.
-            $ack = $this->request('POST', '/collect', $body, $idempotencyKey, null, function (array $parsed, int $status) use ($idempotencyKey): void {
+            // The closure's OWN parameter is #[\SensitiveParameter] too. Marking it on
+            // Validate::collectAck() is not enough: the closure is a separate frame in the trace,
+            // invoked with the raw body as ITS argument, so an unmarked parameter here left a
+            // reflected bearer token sitting verbatim in getTrace() one frame below the redacted one.
+            $ack = $this->request('POST', '/collect', $body, $idempotencyKey, null, function (#[\SensitiveParameter] array $parsed, int $status) use ($idempotencyKey): void {
                 Validate::collectAck($parsed, $status, $idempotencyKey, $this->redactor());
             });
 
@@ -505,7 +509,7 @@ final class Paylod
             throw new PaylodInvalidRequestError('paymentId is required.');
         }
 
-        $p = $this->request('GET', '/status/' . rawurlencode($paymentId), null, null, $deadlineMs, function (array $parsed, int $status) use ($paymentId): void {
+        $p = $this->request('GET', '/status/' . rawurlencode($paymentId), null, null, $deadlineMs, function (#[\SensitiveParameter] array $parsed, int $status) use ($paymentId): void {
             // The FULL payment schema, and - law L1 - the BINDING check: the body must describe the
             // payment that was ASKED ABOUT. A response that answers a different question is not a
             // malformed response, it is a WRONG one, and no field-level shape check can find it.
