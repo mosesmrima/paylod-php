@@ -48,7 +48,11 @@ namespace Paylod;
  *                   ONE kind, never a receipt outright.
  *   L3 CONSISTENCY  A claim that contradicts its evidence is INDETERMINATE - never a failure, and
  *                   in particular never a RETRYABLE failure. We cannot prove money did not move, so
- *                   we must not invite a second charge.
+ *                   we must not invite a second charge. EVERY contradiction lands here, including a
+ *                   `failed`/`cancelled` claim carrying an in-flight code: earlier rounds resolved
+ *                   that one to `in_flight`, which is a guess about which of two contradicting
+ *                   fields to believe. INDETERMINATE renders as `pending` just the same, so the
+ *                   merchant-visible behaviour is identical - we simply stop claiming to know.
  *   L4 RECEIPT      A receipt is proof money moved. Its presence forces the verdict to `paid` or
  *                   `indeterminate` - never `failed`, never `in_flight`.
  *
@@ -82,6 +86,60 @@ final class Semantics
     public const VERDICT_IN_FLIGHT = 'in_flight';
     /** We cannot prove what happened. Never paid, never retryable. Let the webhook settle it. */
     public const VERDICT_INDETERMINATE = 'indeterminate';
+
+    // -- The CLAIM alphabet: the `status` strings, normalised to a CLOSED set ------------------
+
+    public const CLAIM_SUCCESS = 'success';
+    public const CLAIM_PENDING = 'pending';
+    public const CLAIM_FAILED = 'failed';
+    public const CLAIM_CANCELLED = 'cancelled';
+    /** Anything else - a missing status, a non-string, a word we do not know. */
+    public const CLAIM_UNKNOWN = 'unknown';
+
+    /** The claim alphabet, in table order. Exported so tests can walk the FULL cross-product. */
+    public const CLAIMS = [
+        self::CLAIM_SUCCESS,
+        self::CLAIM_PENDING,
+        self::CLAIM_FAILED,
+        self::CLAIM_CANCELLED,
+        self::CLAIM_UNKNOWN,
+    ];
+
+    /** The evidence alphabet, in table order. Exported for the same reason. */
+    public const EVIDENCE_KINDS = [
+        self::EVIDENCE_SUCCESS,
+        self::EVIDENCE_NONE,
+        self::EVIDENCE_FAILURE,
+        self::EVIDENCE_IN_FLIGHT,
+        self::EVIDENCE_CONFLICT,
+    ];
+
+    /**
+     * Normalise the raw `status` field into the CLOSED claim alphabet.
+     *
+     * This is the ONLY place a permissive mapping is allowed, and it is total by construction: an
+     * unrecognised or non-string status becomes {@see CLAIM_UNKNOWN}, an ordinary member of the
+     * alphabet with its own five rows in the table. The verdict table below therefore has no
+     * default arm at all - a missing cell is an `\UnhandledMatchError`, not a silent guess.
+     *
+     * @param array<string,mixed> $payment
+     * @return self::CLAIM_*
+     */
+    public static function claimFor(array $payment): string
+    {
+        $raw = $payment['status'] ?? null;
+        if (!is_string($raw)) {
+            return self::CLAIM_UNKNOWN;
+        }
+
+        return match ($raw) {
+            self::CLAIM_SUCCESS => self::CLAIM_SUCCESS,
+            self::CLAIM_PENDING => self::CLAIM_PENDING,
+            self::CLAIM_FAILED => self::CLAIM_FAILED,
+            self::CLAIM_CANCELLED => self::CLAIM_CANCELLED,
+            default => self::CLAIM_UNKNOWN,
+        };
+    }
 
     /** A receipt counts only if it is a non-blank string. `""` and `"   "` prove nothing. */
     public static function hasReceipt(array $payment): bool
@@ -147,10 +205,13 @@ final class Semantics
     /**
      * Stage 2 - the claim and the evidence resolved together.
      *
-     * This table is TOTAL: every (claim, evidence) pair has exactly one row, and the pairs are
-     * ENUMERATED rather than derived, so there is no default branch to fall through to. The
-     * defaults are exactly where the old logic went wrong, so there are none. An unrecognised claim
-     * or evidence kind resolves to `indeterminate` - the safe answer is always "we do not know".
+     * This table is TOTAL AND EXHAUSTIVE, and it says so structurally: the claim is first
+     * normalised into a five-member closed alphabet by {@see claimFor()}, the evidence is already a
+     * five-member closed alphabet, and the resolution below is a single `match` over the 25
+     * `claim|evidence` pairs WITH NO DEFAULT ARM. A cell that goes missing is an
+     * `\UnhandledMatchError` at the point of the omission - it cannot be absorbed by a fallthrough,
+     * which is exactly where every previous round of this bug lived. `SemanticsTest` walks the same
+     * cross-product, so a missing cell fails a test rather than reaching a caller.
      *
      * Reading the table, the rules are:
      *   - Success evidence beside a non-success claim is never paid and never failed - the two
@@ -159,108 +220,130 @@ final class Semantics
      *   - A failure claim is believed on failure evidence or on silence: proving a payment did NOT
      *     happen is not something we require evidence for, because the safe action (do not ship, do
      *     not capture) is the same either way.
-     *   - In-flight evidence outranks a terminal `failed` claim: a `failed` row carrying 4999 means
-     *     the prompt is STILL LIVE and the customer is mid-PIN. Reporting that as a failure is the
-     *     revenue-losing bug this codebase already shipped twice.
+     *   - EVERY OTHER CONTRADICTION IS INDETERMINATE. In particular `failed`/`cancelled` beside
+     *     in-flight evidence is INDETERMINATE, not in-flight: a record that claims to be terminal
+     *     while its code says the prompt is live is a record we cannot read, and asserting the
+     *     more specific `in_flight` from it is a guess. The practical behaviour a merchant sees is
+     *     unchanged - {@see PaymentOutcome} renders indeterminate as `pending`, so wait() keeps
+     *     polling and the webhook settles it - but the SDK no longer CLAIMS to know which of the
+     *     two contradicting fields was right.
      *
      * `cancelled` is a claim the API may report and Node's status union does not carry; it is
-     * enumerated here EXPLICITLY, on its own rows, rather than being folded into a default.
+     * enumerated here EXPLICITLY, on its own rows.
      *
      * @param array<string,mixed> $payment
      */
     public static function judge(array $payment): Judgement
     {
         $evidence = self::evidenceFor($payment);
+        $claim = self::claimFor($payment);
         $rawClaim = $payment['status'] ?? null;
         $claimed = is_string($rawClaim) ? $rawClaim : '';
 
-        $of = static fn (string $verdict, string $reason): Judgement
-            => new Judgement($verdict, $evidence, $claimed, $reason);
+        [$verdict, $reason] = self::cell($claim, $evidence);
 
-        // L3/L4: the two witnesses disagree with each other. Nothing else matters.
-        if ($evidence === self::EVIDENCE_CONFLICT) {
-            return $of(
-                self::VERDICT_INDETERMINATE,
-                'the record carries an M-Pesa receipt alongside a result code that is not a success '
-                . '- the receipt proves money moved and the code denies it, so neither can be trusted'
-            );
-        }
+        return new Judgement($verdict, $evidence, $claimed, $reason);
+    }
 
-        return match ($claimed) {
-            'success' => match ($evidence) {
-                self::EVIDENCE_SUCCESS => $of(
-                    self::VERDICT_PAID,
-                    'status is success and it is backed by a receipt or result code 0'
-                ),
-                // L2. This is the "a stubbed endpoint / truncated row / cached proxy envelope can
-                // write six characters of JSON" case. A claim with nothing behind it is not money.
-                self::EVIDENCE_NONE => $of(
-                    self::VERDICT_INDETERMINATE,
-                    'status claims success but the record carries neither a receipt nor a result '
-                    . 'code, so there is no evidence the payment actually settled'
-                ),
-                self::EVIDENCE_FAILURE => $of(
-                    self::VERDICT_INDETERMINATE,
-                    'status claims success but the result code is a terminal failure'
-                ),
-                self::EVIDENCE_IN_FLIGHT => $of(
-                    self::VERDICT_INDETERMINATE,
-                    'status claims success but the result code says the payment is still in flight'
-                ),
-                default => $of(self::VERDICT_INDETERMINATE, self::unrecognised($claimed, $evidence)),
-            },
+    /**
+     * THE TABLE. 5 claims x 5 evidence kinds = 25 rows, no default arm.
+     *
+     * @param self::CLAIM_* $claim
+     * @param self::EVIDENCE_* $evidence
+     * @return array{0:string,1:string}
+     */
+    private static function cell(string $claim, string $evidence): array
+    {
+        $conflict = [
+            self::VERDICT_INDETERMINATE,
+            'the record carries an M-Pesa receipt alongside a result code that is not a success '
+            . '- the receipt proves money moved and the code denies it, so neither can be trusted',
+        ];
+        $contradiction = static fn (string $detail): array => [self::VERDICT_INDETERMINATE, $detail];
 
-            'pending' => match ($evidence) {
-                // THE named hole. ['status' => 'pending', 'resultCode' => 0] used to come back paid,
-                // with a null receipt. A record that simultaneously says "not finished" and
-                // "succeeded" is not a success we may act on - it is a record mid-write, or one we
-                // are misreading.
-                self::EVIDENCE_SUCCESS => $of(
-                    self::VERDICT_INDETERMINATE,
-                    'status says pending while the evidence says the payment succeeded - a pending '
-                    . 'record must never be reported as paid'
-                ),
-                self::EVIDENCE_FAILURE => $of(
-                    self::VERDICT_INDETERMINATE,
-                    'status says pending while the result code is a terminal failure'
-                ),
-                self::EVIDENCE_NONE, self::EVIDENCE_IN_FLIGHT => $of(
-                    self::VERDICT_IN_FLIGHT,
-                    'the payment is still on the handset'
-                ),
-                default => $of(self::VERDICT_INDETERMINATE, self::unrecognised($claimed, $evidence)),
-            },
+        return match ($claim . '|' . $evidence) {
+            // -- claim = success -------------------------------------------------------------
+            'success|success' => [
+                self::VERDICT_PAID,
+                'status is success and it is backed by a receipt or result code 0',
+            ],
+            // L2. This is the "a stubbed endpoint / truncated row / cached proxy envelope can
+            // write six characters of JSON" case. A claim with nothing behind it is not money.
+            'success|none' => $contradiction(
+                'status claims success but the record carries neither a receipt nor a result '
+                . 'code, so there is no evidence the payment actually settled'
+            ),
+            'success|failure' => $contradiction(
+                'status claims success but the result code is a terminal failure'
+            ),
+            'success|in_flight' => $contradiction(
+                'status claims success but the result code says the payment is still in flight'
+            ),
+            'success|conflict' => $conflict,
 
-            // `cancelled` is a terminal failure claim by another name: the customer chose it. It is
-            // enumerated on its own rows so adding it was a deliberate act, not a fallthrough.
-            'failed', 'cancelled' => match ($evidence) {
-                // L4. Includes the receipt-on-a-failed-row case that used to be rendered as
-                // `cancelled, retryable: true` - an explicit invitation to charge twice.
-                self::EVIDENCE_SUCCESS => $of(
-                    self::VERDICT_INDETERMINATE,
-                    'status claims failed but the evidence proves the payment succeeded - refusing '
-                    . 'to report a payment that carries proof of settlement as a failure'
-                ),
-                self::EVIDENCE_IN_FLIGHT => $of(
-                    self::VERDICT_IN_FLIGHT,
-                    'status says failed but the result code means the prompt is still live and the '
-                    . 'customer has not entered their PIN yet'
-                ),
-                self::EVIDENCE_NONE, self::EVIDENCE_FAILURE => $of(
-                    self::VERDICT_FAILED,
-                    'the payment failed terminally'
-                ),
-                default => $of(self::VERDICT_INDETERMINATE, self::unrecognised($claimed, $evidence)),
-            },
+            // -- claim = pending -------------------------------------------------------------
+            // THE named hole. ['status' => 'pending', 'resultCode' => 0] used to come back paid,
+            // with a null receipt. A record that simultaneously says "not finished" and
+            // "succeeded" is not a success we may act on - it is a record mid-write, or one we
+            // are misreading.
+            'pending|success' => $contradiction(
+                'status says pending while the evidence says the payment succeeded - a pending '
+                . 'record must never be reported as paid'
+            ),
+            'pending|none' => [self::VERDICT_IN_FLIGHT, 'the payment is still on the handset'],
+            'pending|failure' => $contradiction(
+                'status says pending while the result code is a terminal failure'
+            ),
+            'pending|in_flight' => [self::VERDICT_IN_FLIGHT, 'the payment is still on the handset'],
+            'pending|conflict' => $conflict,
 
-            // A status string outside the known set. The shape validators reject these before they
-            // reach here; this row is the structural backstop, and it says "we do not know".
-            default => $of(self::VERDICT_INDETERMINATE, self::unrecognised($claimed, $evidence)),
+            // -- claim = failed --------------------------------------------------------------
+            // L4. Includes the receipt-on-a-failed-row case that used to be rendered as
+            // `cancelled, retryable: true` - an explicit invitation to charge twice.
+            'failed|success' => $contradiction(
+                'status claims failed but the evidence proves the payment succeeded - refusing '
+                . 'to report a payment that carries proof of settlement as a failure'
+            ),
+            'failed|none' => [self::VERDICT_FAILED, 'the payment failed terminally'],
+            'failed|failure' => [self::VERDICT_FAILED, 'the payment failed terminally'],
+            // L3. The claim is terminal and the code says the prompt is live. We do not get to
+            // pick a winner: never failed (that would invite a retry against a live prompt) and
+            // never in_flight either (that would assert a state the record does not establish).
+            'failed|in_flight' => $contradiction(
+                'status claims failed while the result code says the prompt is still live - the '
+                . 'record contradicts itself, so neither the failure nor the in-flight reading '
+                . 'can be trusted'
+            ),
+            'failed|conflict' => $conflict,
+
+            // -- claim = cancelled (a terminal failure claim by another name) ------------------
+            'cancelled|success' => $contradiction(
+                'status claims cancelled but the evidence proves the payment succeeded - refusing '
+                . 'to report a payment that carries proof of settlement as a cancellation'
+            ),
+            'cancelled|none' => [self::VERDICT_FAILED, 'the payment failed terminally'],
+            'cancelled|failure' => [self::VERDICT_FAILED, 'the payment failed terminally'],
+            'cancelled|in_flight' => $contradiction(
+                'status claims cancelled while the result code says the prompt is still live - the '
+                . 'record contradicts itself, so neither reading can be trusted'
+            ),
+            'cancelled|conflict' => $conflict,
+
+            // -- claim = unknown --------------------------------------------------------------
+            // A status outside the known set, or no status at all. The shape validators reject
+            // these before they reach here; these five rows are the structural backstop, and each
+            // one says "we do not know". They are ROWS, not a default: adding a sixth claim to the
+            // alphabet without adding its five rows is a hard error, not a silent guess.
+            'unknown|success' => $contradiction(self::unrecognised($evidence)),
+            'unknown|none' => $contradiction(self::unrecognised($evidence)),
+            'unknown|failure' => $contradiction(self::unrecognised($evidence)),
+            'unknown|in_flight' => $contradiction(self::unrecognised($evidence)),
+            'unknown|conflict' => $contradiction(self::unrecognised($evidence)),
         };
     }
 
-    private static function unrecognised(string $claimed, string $evidence): string
+    private static function unrecognised(string $evidence): string
     {
-        return "unrecognised payment state (status \"{$claimed}\", evidence {$evidence})";
+        return "unrecognised payment status (evidence {$evidence}), so the record cannot be judged";
     }
 }

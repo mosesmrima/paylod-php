@@ -108,17 +108,40 @@ final class DarajaCatalog
             return 'pending';
         }
 
-        if ($raw !== '' && is_numeric($raw)) {
-            $n = $raw + 0;
-            if ($n === 0 || $n === 0.0) {
-                return 'success';
-            }
+        // SUCCESS IS MATCHED EXACTLY, NEVER NUMERICALLY.
+        //
+        // This branch decides whether money moved, so it is the single most dangerous coercion in
+        // the SDK. It used to read `is_numeric($raw) && $raw + 0 === 0` - and PHP's numeric string
+        // grammar is far wider than the schema's. Every one of "0e999", "+0", "00", "0.0", "0x0"
+        // (as a float-parsed form), " 0 " and "-0" is `is_numeric` and coerces to zero, so a
+        // malformed, truncated or hostile record carrying any of them was classified `success`,
+        // became EVIDENCE_SUCCESS, and a `status: "success"` row alongside it became PAID. A
+        // merchant ships goods on that.
+        //
+        // The schema defines exactly one zero: the JSON number `0`, which Daraja may also send as
+        // the string "0". Those, and nothing else. The test is IDENTITY against the integer 0, or
+        // exact string equality with "0" after trimming - never `==`, never `is_numeric`, never
+        // arithmetic. Note that this also excludes the float negative zero: `-0.0 === 0.0` is TRUE
+        // in PHP, so a float comparison would have let `-0.0` through, while its string form "-0"
+        // does not match. (A plain `0.0` still succeeds, because it stringifies to "0".)
+        if ($resultCode === 0 || $raw === '0') {
+            return 'success';
+        }
+
+        // A TERMINAL code must also be canonically shaped: a non-zero unsigned integer with no
+        // leading zero, no sign, no exponent, no decimal point. Anything else that merely LOOKS
+        // numeric ("0e999", "+1", "01", "1.0", "-1") is a representation the schema does not
+        // define, so we do not know what it means - and "we do not know" is never a terminal
+        // failure, because a terminal failure is what tells a merchant it is safe to charge again.
+        if (preg_match('/^[1-9][0-9]*$/', $raw) === 1) {
             // A known-numeric, non-zero code is terminal - UNLESS the description says otherwise
             // (guards against a new "still processing" code we haven't catalogued yet).
             return preg_match(self::PENDING_DESC_RE, $desc) === 1 ? 'pending' : 'failed';
         }
 
-        // Blank / non-numeric / unknown -> never force-fail on ambiguity.
+        // Blank / non-canonical / unknown -> never force-fail on ambiguity, and never call it
+        // success either. `pending` is the conservative cell: it becomes EVIDENCE_IN_FLIGHT, which
+        // is never PAID under any claim and never a retryable failure under any claim.
         return 'pending';
     }
 

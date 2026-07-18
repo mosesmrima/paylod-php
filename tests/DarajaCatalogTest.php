@@ -176,4 +176,104 @@ final class DarajaCatalogTest extends TestCase
         $this->assertNotSame('pending', $unknown['category']);
         $this->assertFalse($unknown['retryable']);
     }
+
+    // -- STRICT ZERO EVIDENCE -------------------------------------------------------------------
+
+    /**
+     * The only representations of "money moved" the schema defines: the JSON number 0, and the
+     * string "0" Daraja sometimes sends instead.
+     *
+     * @return array<string,array{0:mixed}>
+     */
+    public static function schemaZeroProvider(): array
+    {
+        return ['int zero' => [0], 'float zero' => [0.0], 'string zero' => ['0'], 'padded string zero' => ['  0  ']];
+    }
+
+    /** @dataProvider schemaZeroProvider */
+    public function testOnlyTheSchemaApprovedZeroRepresentationsAreSuccess(mixed $code): void
+    {
+        $this->assertSame('success', DarajaCatalog::classifyStkResult($code));
+    }
+
+    /**
+     * Every one of these is `is_numeric()` and loosely equal to zero in PHP, and the old classifier
+     * therefore called each of them `success`. A malformed, truncated or hostile record carrying
+     * any of them became PAID and a merchant shipped goods on it. None of them is a representation
+     * the schema defines, so none of them may prove a payment settled.
+     *
+     * @return array<string,array{0:mixed}>
+     */
+    public static function fakeZeroProvider(): array
+    {
+        return [
+            'exponent zero' => ['0e999'],
+            'exponent zero uppercase' => ['0E5'],
+            'signed zero' => ['+0'],
+            'negative zero' => ['-0'],
+            'negative float zero' => ['-0.0'],
+            'leading zero' => ['00'],
+            'decimal zero' => ['0.0'],
+            'decimal zero long' => ['0.00000'],
+            'hex-ish zero' => ['0x0'],
+            'float negative zero' => [-0.0],
+        ];
+    }
+
+    /** @dataProvider fakeZeroProvider */
+    public function testNoOtherZeroLikeRepresentationIsEverSuccess(mixed $code): void
+    {
+        $this->assertNotSame(
+            'success',
+            DarajaCatalog::classifyStkResult($code),
+            'a non-schema zero representation was accepted as evidence money moved'
+        );
+    }
+
+    /**
+     * And the conservative half of the rule: a representation we do not recognise is classified
+     * `pending`, never `failed`. A `failed` classification is what tells a merchant it is safe to
+     * charge again, and we have no basis for saying that about a record we cannot read.
+     *
+     * @dataProvider fakeZeroProvider
+     */
+    public function testAnUnrecognisedRepresentationIsPendingNotTerminal(mixed $code): void
+    {
+        $this->assertSame('pending', DarajaCatalog::classifyStkResult($code));
+    }
+
+    /** Non-canonical NON-zero numerics are equally unreadable, and equally not terminal. */
+    public function testNonCanonicalNonZeroCodesAreNotTerminalEither(): void
+    {
+        foreach (['+1032', '01032', '1032.0', '1.032e3', ' -1032'] as $code) {
+            $this->assertSame('pending', DarajaCatalog::classifyStkResult($code), "code {$code}");
+        }
+        // The canonical form still classifies exactly as it always did.
+        $this->assertSame('failed', DarajaCatalog::classifyStkResult('1032'));
+        $this->assertSame('failed', DarajaCatalog::classifyStkResult(1032));
+    }
+
+    /**
+     * The whole point, end to end: a fake zero must never reach a PAID verdict through the semantic
+     * model, under ANY claim - which is the path by which it would have become real money.
+     */
+    public function testAFakeZeroCanNeverProduceAPaidVerdict(): void
+    {
+        foreach (self::fakeZeroProvider() as $name => [$code]) {
+            foreach (['success', 'pending', 'failed', 'cancelled'] as $claim) {
+                $j = \Paylod\Semantics::judge([
+                    'id' => 'pay_1',
+                    'status' => $claim,
+                    'mpesaReceipt' => null,
+                    'resultCode' => $code,
+                    'resultDesc' => null,
+                ]);
+                $this->assertNotSame(
+                    \Paylod\Semantics::VERDICT_PAID,
+                    $j->verdict,
+                    "{$name} under claim {$claim} was judged PAID"
+                );
+            }
+        }
+    }
 }

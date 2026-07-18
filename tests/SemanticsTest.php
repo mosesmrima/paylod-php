@@ -84,63 +84,148 @@ final class SemanticsTest extends TestCase
     // -- Stage 2: the TOTAL table --------------------------------------------------------------
 
     /**
-     * The judge table is TOTAL over (claim, evidence). Every cell is pinned here, so a change to
-     * any one of them is a deliberate edit to this table and not an accident in a default branch.
+     * THE PINNED VERDICT TABLE, keyed `claim|evidence`.
      *
-     * @return array<string,array{0:string,1:array<string,mixed>,2:string}>
+     * Every one of the 25 cells of `Semantics::CLAIMS x Semantics::EVIDENCE_KINDS` appears here
+     * exactly once. It is NOT a hand-written list of interesting cases: the provider below walks
+     * the full cross-product and looks each pair up in this map, so an omission anywhere - here or
+     * in the implementation - is a hard failure rather than a cell that quietly falls through to a
+     * permissive default. That is the whole point: the defect class this file exists to prevent has
+     * always taken the shape of an unenumerated pair resolved by a default branch.
+     *
+     * @return array<string,string>
+     */
+    private const EXPECTED = [
+        // claim = success
+        'success|success' => Semantics::VERDICT_PAID,
+        'success|none' => Semantics::VERDICT_INDETERMINATE,
+        'success|failure' => Semantics::VERDICT_INDETERMINATE,
+        'success|in_flight' => Semantics::VERDICT_INDETERMINATE,
+        'success|conflict' => Semantics::VERDICT_INDETERMINATE,
+
+        // claim = pending
+        'pending|success' => Semantics::VERDICT_INDETERMINATE,
+        'pending|none' => Semantics::VERDICT_IN_FLIGHT,
+        'pending|failure' => Semantics::VERDICT_INDETERMINATE,
+        'pending|in_flight' => Semantics::VERDICT_IN_FLIGHT,
+        'pending|conflict' => Semantics::VERDICT_INDETERMINATE,
+
+        // claim = failed. Note `failed|in_flight`: the claim is terminal, the code says the prompt
+        // is live, and the SDK refuses to pick a winner. Never failed (that invites a retry against
+        // a live prompt) and no longer in_flight either (that asserts a state the record does not
+        // establish). Indeterminate still renders as `pending`, so wait() keeps polling.
+        'failed|success' => Semantics::VERDICT_INDETERMINATE,
+        'failed|none' => Semantics::VERDICT_FAILED,
+        'failed|failure' => Semantics::VERDICT_FAILED,
+        'failed|in_flight' => Semantics::VERDICT_INDETERMINATE,
+        'failed|conflict' => Semantics::VERDICT_INDETERMINATE,
+
+        // claim = cancelled (enumerated explicitly, never a default)
+        'cancelled|success' => Semantics::VERDICT_INDETERMINATE,
+        'cancelled|none' => Semantics::VERDICT_FAILED,
+        'cancelled|failure' => Semantics::VERDICT_FAILED,
+        'cancelled|in_flight' => Semantics::VERDICT_INDETERMINATE,
+        'cancelled|conflict' => Semantics::VERDICT_INDETERMINATE,
+
+        // claim = unknown - a status outside the closed set. Five rows, not one default.
+        'unknown|success' => Semantics::VERDICT_INDETERMINATE,
+        'unknown|none' => Semantics::VERDICT_INDETERMINATE,
+        'unknown|failure' => Semantics::VERDICT_INDETERMINATE,
+        'unknown|in_flight' => Semantics::VERDICT_INDETERMINATE,
+        'unknown|conflict' => Semantics::VERDICT_INDETERMINATE,
+    ];
+
+    /**
+     * A record whose EVIDENCE classifies as the requested kind. These are the witnesses; the claim
+     * is supplied separately by the provider.
+     *
+     * @return array<string,mixed>
+     */
+    private static function fieldsFor(string $evidence): array
+    {
+        return match ($evidence) {
+            Semantics::EVIDENCE_SUCCESS => ['resultCode' => 0],
+            Semantics::EVIDENCE_NONE => [],
+            Semantics::EVIDENCE_FAILURE => ['resultCode' => 1032],
+            Semantics::EVIDENCE_IN_FLIGHT => ['resultCode' => 4999],
+            Semantics::EVIDENCE_CONFLICT => ['mpesaReceipt' => 'SFF6XYZ123', 'resultCode' => 1032],
+        };
+    }
+
+    /** The `status` string that normalises to a given claim. */
+    private static function statusFor(string $claim): string
+    {
+        // `unknown` is reached through a status the SDK does not know, not through a magic word.
+        return $claim === Semantics::CLAIM_UNKNOWN ? 'settled' : $claim;
+    }
+
+    /**
+     * The FULL cross-product, generated - never hand-listed.
+     *
+     * @return array<string,array{0:string,1:string,2:string}>
      */
     public static function tableProvider(): array
     {
-        $receipt = 'SFF6XYZ123';
+        $cases = [];
+        foreach (Semantics::CLAIMS as $claim) {
+            foreach (Semantics::EVIDENCE_KINDS as $evidence) {
+                $cases["{$claim} + {$evidence} evidence"] = [$claim, $evidence, "{$claim}|{$evidence}"];
+            }
+        }
 
-        return [
-            // claim = success
-            'success + success evidence (receipt)' => ['success', ['mpesaReceipt' => $receipt], Semantics::VERDICT_PAID],
-            'success + success evidence (code 0)' => ['success', ['resultCode' => 0], Semantics::VERDICT_PAID],
-            'success + no evidence' => ['success', [], Semantics::VERDICT_INDETERMINATE],
-            'success + failure evidence' => ['success', ['resultCode' => 1032], Semantics::VERDICT_INDETERMINATE],
-            'success + in-flight evidence' => ['success', ['resultCode' => 4999], Semantics::VERDICT_INDETERMINATE],
-            'success + conflict' => ['success', ['mpesaReceipt' => $receipt, 'resultCode' => 1032], Semantics::VERDICT_INDETERMINATE],
-
-            // claim = pending
-            'pending + success evidence' => ['pending', ['resultCode' => 0], Semantics::VERDICT_INDETERMINATE],
-            'pending + receipt' => ['pending', ['mpesaReceipt' => $receipt], Semantics::VERDICT_INDETERMINATE],
-            'pending + no evidence' => ['pending', [], Semantics::VERDICT_IN_FLIGHT],
-            'pending + in-flight evidence' => ['pending', ['resultCode' => 4999], Semantics::VERDICT_IN_FLIGHT],
-            'pending + failure evidence' => ['pending', ['resultCode' => 1032], Semantics::VERDICT_INDETERMINATE],
-            'pending + conflict' => ['pending', ['mpesaReceipt' => $receipt, 'resultCode' => 1032], Semantics::VERDICT_INDETERMINATE],
-
-            // claim = failed
-            'failed + success evidence' => ['failed', ['resultCode' => 0], Semantics::VERDICT_INDETERMINATE],
-            'failed + receipt' => ['failed', ['mpesaReceipt' => $receipt], Semantics::VERDICT_INDETERMINATE],
-            'failed + no evidence' => ['failed', [], Semantics::VERDICT_FAILED],
-            'failed + failure evidence' => ['failed', ['resultCode' => 1032], Semantics::VERDICT_FAILED],
-            'failed + in-flight evidence' => ['failed', ['resultCode' => 4999], Semantics::VERDICT_IN_FLIGHT],
-            'failed + conflict' => ['failed', ['mpesaReceipt' => $receipt, 'resultCode' => 1032], Semantics::VERDICT_INDETERMINATE],
-
-            // claim = cancelled (enumerated explicitly, never a default)
-            'cancelled + failure evidence' => ['cancelled', ['resultCode' => 1032], Semantics::VERDICT_FAILED],
-            'cancelled + no evidence' => ['cancelled', [], Semantics::VERDICT_FAILED],
-            'cancelled + receipt' => ['cancelled', ['mpesaReceipt' => $receipt], Semantics::VERDICT_INDETERMINATE],
-            'cancelled + in-flight evidence' => ['cancelled', ['resultCode' => 4999], Semantics::VERDICT_IN_FLIGHT],
-            'cancelled + success evidence' => ['cancelled', ['resultCode' => 0], Semantics::VERDICT_INDETERMINATE],
-            'cancelled + conflict' => ['cancelled', ['mpesaReceipt' => $receipt, 'resultCode' => 1032], Semantics::VERDICT_INDETERMINATE],
-        ];
+        return $cases;
     }
 
     /**
      * @dataProvider tableProvider
-     * @param array<string,mixed> $fields
      */
-    public function testTheJudgeTableIsTotalAndPinned(string $claim, array $fields, string $expected): void
+    public function testTheJudgeTableIsTotalAndPinned(string $claim, string $evidence, string $key): void
     {
-        self::assertSame($expected, self::verdict($fields + ['status' => $claim]));
+        // A pair with no pinned expectation is a HOLE in this test, and must fail loudly rather
+        // than be skipped - a missing cell is precisely the bug being guarded against.
+        self::assertArrayHasKey($key, self::EXPECTED, "no pinned verdict for the pair {$key}");
+
+        $payment = self::payment(self::fieldsFor($evidence) + ['status' => self::statusFor($claim)]);
+        $judgement = Semantics::judge($payment);
+
+        // The witness really does produce the evidence kind this row is about, so the row is
+        // testing the cell it claims to test.
+        self::assertSame($evidence, $judgement->evidence, "wrong evidence witness for {$key}");
+        self::assertSame(self::EXPECTED[$key], $judgement->verdict, "wrong verdict for {$key}");
     }
 
-    public function testAnUnknownClaimIsIndeterminateAndNeverFalsThroughToAPermissiveDefault(): void
+    /** The cross-product is COMPLETE: 5 claims x 5 evidence kinds, no more and no fewer. */
+    public function testTheTableCoversEveryClaimTimesEveryEvidenceKind(): void
     {
-        self::assertSame(Semantics::VERDICT_INDETERMINATE, self::verdict(['status' => 'settled', 'resultCode' => 0]));
-        self::assertSame(Semantics::VERDICT_INDETERMINATE, self::verdict(['status' => '']));
+        $expectedPairs = count(Semantics::CLAIMS) * count(Semantics::EVIDENCE_KINDS);
+        self::assertSame(25, $expectedPairs, 'the alphabets changed - the table must change with them');
+        self::assertCount($expectedPairs, self::EXPECTED);
+        self::assertCount($expectedPairs, self::tableProvider());
+        self::assertSame(array_keys(self::EXPECTED), array_keys(array_flip(array_map(
+            static fn (array $c): string => $c[2],
+            array_values(self::tableProvider()),
+        ))), 'the generated pairs and the pinned pairs are not the same set');
+    }
+
+    /**
+     * The claim alphabet is CLOSED: anything outside it - an unknown word, an empty string, a
+     * non-string, a missing key - normalises to `unknown` and gets the unknown rows. There is no
+     * default arm in the verdict table for it to fall into.
+     */
+    public function testAnUnknownClaimIsIndeterminateAndNeverFallsThroughToAPermissiveDefault(): void
+    {
+        foreach (['settled', '', 'SUCCESS', 'paid', 'complete'] as $status) {
+            self::assertSame(
+                Semantics::CLAIM_UNKNOWN,
+                Semantics::claimFor(['status' => $status]),
+                "status {$status} should not be a recognised claim"
+            );
+            self::assertSame(Semantics::VERDICT_INDETERMINATE, self::verdict(['status' => $status, 'resultCode' => 0]));
+        }
+        foreach ([null, 0, 1, [], true] as $status) {
+            self::assertSame(Semantics::CLAIM_UNKNOWN, Semantics::claimFor(['status' => $status]));
+        }
+        self::assertSame(Semantics::CLAIM_UNKNOWN, Semantics::claimFor([]));
     }
 
     // -- The LAWS ------------------------------------------------------------------------------
@@ -151,8 +236,8 @@ final class SemanticsTest extends TestCase
      */
     public function testLawL2PaidAlwaysHasSuccessEvidence(): void
     {
-        foreach (self::tableProvider() as $name => [$claim, $fields, $_expected]) {
-            $j = Semantics::judge(self::payment($fields + ['status' => $claim]));
+        foreach (self::tableProvider() as $name => [$claim, $evidence, $_key]) {
+            $j = Semantics::judge(self::payment(self::fieldsFor($evidence) + ["status" => self::statusFor($claim)]));
             if ($j->verdict === Semantics::VERDICT_PAID) {
                 self::assertSame(Semantics::EVIDENCE_SUCCESS, $j->evidence, "L2 violated by: {$name}");
             }
@@ -172,8 +257,8 @@ final class SemanticsTest extends TestCase
     /** L3: a contradiction is INDETERMINATE - never a failure, and never a retryable one. */
     public function testLawL3AContradictionIsIndeterminateAndNeverAFailure(): void
     {
-        foreach (self::tableProvider() as $name => [$claim, $fields, $_expected]) {
-            $j = Semantics::judge(self::payment($fields + ['status' => $claim]));
+        foreach (self::tableProvider() as $name => [$claim, $evidence, $_key]) {
+            $j = Semantics::judge(self::payment(self::fieldsFor($evidence) + ["status" => self::statusFor($claim)]));
             if ($j->evidence === Semantics::EVIDENCE_CONFLICT) {
                 self::assertSame(Semantics::VERDICT_INDETERMINATE, $j->verdict, "L3 violated by: {$name}");
             }
