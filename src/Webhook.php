@@ -49,6 +49,37 @@ final class Webhook
     public const MAX_TOLERANCE_SEC = 3600;
 
     /**
+     * THE PRE-AUTHENTICATION BYTE CEILING on a webhook body. 1 MiB.
+     *
+     * -- Why this is not "the framework's problem" ---------------------------------------------
+     * Every other bounded surface in this SDK bounds a RESPONSE - bytes that arrived because we
+     * asked for them, from an origin we pinned, over a connection we opened. This one is different
+     * in the only way that matters: it is an INBOUND, INTERNET-FACING, UNAUTHENTICATED endpoint.
+     * Anyone who learns the URL can POST to it, and the work below happens BEFORE anything has
+     * established that they are paylod:
+     *
+     *   1. `(string) $payload` materialises a Stringable in full;
+     *   2. `hash_hmac()` walks every byte;
+     *   3. `json_decode()` builds a PHP value graph out of it.
+     *
+     * A signature check is not admission control - it cannot be, because you have to have the bytes
+     * before you can hash them. So a 500 MB body is 500 MB of memory and CPU spent to conclude "not
+     * from paylod", repeatable for free, and the endpoint falls over while the signature verifier
+     * reports that it is working perfectly.
+     *
+     * The framework-integrated path may well have its own limit (`post_max_size`, an nginx
+     * `client_max_body_size`). This is the MANUAL surface: `Webhook::verify($request->getContent(),
+     * ...)` called from a bare PSR-7 handler, a queue worker replaying a stored body, a Lambda, a
+     * long-running Swoole/RoadRunner process - none of which necessarily has any of those. A bound
+     * that only exists when someone else configured it is not a bound this SDK provides.
+     *
+     * 1 MiB is roughly a thousand times the largest real paylod event. It is checked FIRST, before
+     * the tolerance, the secret, the header parse and the HMAC, so the expensive work is never
+     * reached by an oversized body.
+     */
+    public const MAX_BODY_BYTES = 1048576;
+
+    /**
      * Verify a paylod webhook and return the typed event as an associative array.
      *
      * Throws {@see PaylodSignatureVerificationError} on any failure - never returns a half-trusted
@@ -263,6 +294,20 @@ final class Webhook
         int|float|null $nowSec = null,
     ): array {
         $raw = (string) $payload;
+
+        // THE CEILING, FIRST. Before the tolerance, before the secret, before the header parse and
+        // above all before the HMAC and the JSON parser - the three things an attacker would be
+        // paying us to run. See MAX_BODY_BYTES.
+        $bytes = strlen($raw);
+        if ($bytes > self::MAX_BODY_BYTES) {
+            throw new PaylodSignatureVerificationError(
+                'invalid_payload',
+                "Webhook body is {$bytes} bytes, which exceeds the " . self::MAX_BODY_BYTES
+                . '-byte limit. This endpoint is unauthenticated by nature - the signature can only '
+                . 'be checked AFTER the bytes are in memory - so an oversized body is refused before '
+                . 'it is hashed or parsed. A real paylod event is a few hundred bytes.'
+            );
+        }
 
         // Freshness is NOT optional. A zero/negative/NaN tolerance disables replay protection, and
         // there is no caller - test or otherwise - who needs that: a pinned fixture verifies fine
