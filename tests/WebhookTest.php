@@ -84,11 +84,15 @@ final class WebhookTest extends TestCase
         // And the verifier accepts its own signer's golden output. The fixture pins the clock via
         // $nowSec while keeping a NORMAL positive window - the sanctioned way to verify an ancient
         // fixture. Replay protection is never switched off, not even here.
-        $event = Webhook::verify($goldenBody, $goldenHeader, $goldenSecret, 300, $goldenT);
+        // The vector pins the SIGNING SCHEME. Its body is a minimal signing fixture rather than a
+        // representative event, so it is verified at the SIGNATURE layer - verify() additionally
+        // enforces the event schema and the semantic model, which are covered by their own tests
+        // instead of by editing these cross-repo-pinned literals.
+        $event = Webhook::verifySignature($goldenBody, $goldenHeader, $goldenSecret, 300, $goldenT);
         $this->assertSame('pay_golden', $event['data']['paymentId']);
 
         // The boolean convenience form agrees.
-        $this->assertTrue(Webhook::isValid($goldenBody, $goldenHeader, $goldenSecret, 300, $goldenT));
+        $this->assertTrue(Webhook::isValidSignature($goldenBody, $goldenHeader, $goldenSecret, 300, $goldenT));
     }
 
     public function testAcceptsValidSignatureAndReturnsEvent(): void

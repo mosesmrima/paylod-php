@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Paylod;
 
 use Paylod\Exceptions\PaylodSignatureVerificationError;
+use Paylod\Support\Validate;
 
 /**
  * Webhook signature verification.
@@ -40,6 +41,33 @@ final class Webhook
      * @throws PaylodSignatureVerificationError
      */
     public static function verify(
+        string|\Stringable $payload,
+        ?string $signature,
+        #[\SensitiveParameter] string $secret,
+        int|float $toleranceSec = self::DEFAULT_TOLERANCE_SEC,
+        int|float|null $nowSec = null,
+    ): array {
+        $event = self::verifySignature($payload, $signature, $secret, $toleranceSec, $nowSec);
+        self::assertEventIsCoherent($event);
+
+        return $event;
+    }
+
+    /**
+     * Verify ONLY the signature and the envelope, and return the decoded event WITHOUT the semantic
+     * checks {@see verify()} applies.
+     *
+     * This exists for exactly one reason: the cross-repo GOLDEN VECTOR pins the SIGNING SCHEME, and
+     * its body is a minimal signing fixture rather than a representative event. Verifying it must
+     * not require editing literals that three repositories agree on byte-for-byte. Use verify() for
+     * anything that will reach a handler - a signature proves a body came FROM paylod, and nothing
+     * whatsoever about whether the body is coherent.
+     *
+     * @return array<string,mixed>
+     *
+     * @throws PaylodSignatureVerificationError
+     */
+    public static function verifySignature(
         string|\Stringable $payload,
         ?string $signature,
         #[\SensitiveParameter] string $secret,
@@ -124,6 +152,114 @@ final class Webhook
     }
 
     /**
+     * The event types this SDK understands. A payment event is the one that triggers fulfilment, so
+     * it is the one that must be proven rather than merely well-formed.
+     */
+    private const PAYMENT_EVENT_STATUS = ['payment.success' => 'success', 'payment.failed' => 'failed'];
+
+    /**
+     * Validate a PAYMENT event beyond the envelope.
+     *
+     * -- Why a valid signature is not enough --------------------------------------------------
+     * The previous version checked that `type` was a string and `data` was an array, and stopped
+     * there. Everything else - `data.status`, `data.mpesaReceipt`, `data.resultCode` - was whatever
+     * arrived, and a handler written the natural way (`if ($e['data']['status'] === 'success')`)
+     * would fulfil an order on a field nothing had checked.
+     *
+     * A valid signature does NOT make that safe. It proves the body came FROM paylod; it says
+     * nothing about whether the body is COHERENT. A bug upstream, a partially-written row, a schema
+     * change, or a compromised signing key all produce correctly-signed nonsense, and the handler is
+     * the last place that can refuse it.
+     *
+     * Three layers, matching the status-read path exactly:
+     *   1. SHAPE       - every field present is the type the docs promise.
+     *   2. CONSISTENCY - `type` and `data.status` must agree. A `payment.success` carrying
+     *                    `status: "failed"` is not an event we can act on either way.
+     *   3. EVIDENCE    - the event runs through the SAME {@see Semantics::judge()} a status read
+     *                    does. Reusing the model rather than re-deriving the rule here is the whole
+     *                    point of having one: the webhook path and the polling path cannot drift
+     *                    into disagreeing about what proves a payment.
+     *
+     * @param array<string,mixed> $event
+     *
+     * @throws PaylodSignatureVerificationError
+     */
+    private static function assertEventIsCoherent(array $event): void
+    {
+        $type = (string) $event['type'];
+        $expectedStatus = self::PAYMENT_EVENT_STATUS[$type] ?? null;
+        if ($expectedStatus === null) {
+            // An unknown event type is forward-compatible: it is not a payment event, so there is no
+            // payment claim to prove. Handlers are expected to ignore types they do not know.
+            return;
+        }
+
+        /** @var array<string,mixed> $d */
+        $d = $event['data'];
+
+        // 1. SHAPE.
+        if (!isset($d['paymentId']) || !is_string($d['paymentId']) || trim($d['paymentId']) === '') {
+            self::invalidPayload('data.paymentId is missing or empty.');
+        }
+        if (!isset($d['status']) || !is_string($d['status'])
+            || !in_array($d['status'], Validate::PAYMENT_STATUSES, true)) {
+            self::invalidPayload(
+                'data.status is missing or not one of ' . implode('/', Validate::PAYMENT_STATUSES) . '.'
+            );
+        }
+        $receipt = $d['mpesaReceipt'] ?? null;
+        if ($receipt !== null && !is_string($receipt)) {
+            self::invalidPayload('data.mpesaReceipt is present but not a string.');
+        }
+        $code = $d['resultCode'] ?? null;
+        if ($code !== null && !is_int($code) && !is_float($code) && !is_string($code)) {
+            self::invalidPayload('data.resultCode is present but is neither a number nor a string.');
+        }
+        $desc = $d['resultDesc'] ?? null;
+        if ($desc !== null && !is_string($desc)) {
+            self::invalidPayload('data.resultDesc is present but not a string.');
+        }
+
+        // 2. CONSISTENCY. The event type and the record's own status must say the same thing.
+        if ($d['status'] !== $expectedStatus) {
+            self::invalidPayload(
+                "type is \"{$type}\" but data.status is \"{$d['status']}\" - the event contradicts "
+                . 'itself, so neither field can be trusted.'
+            );
+        }
+
+        // 3. EVIDENCE, via the one semantic model.
+        $judgement = Semantics::judge([
+            'id' => $d['paymentId'],
+            'status' => $d['status'],
+            'mpesaReceipt' => $receipt,
+            'resultCode' => $code,
+            'resultDesc' => $desc,
+        ]);
+
+        if ($type === 'payment.success' && $judgement->verdict !== Semantics::VERDICT_PAID) {
+            self::invalidPayload(
+                'The event announces a successful payment but the record does not prove one ('
+                . $judgement->reason . '). Refusing to hand your handler an unevidenced success - '
+                . 'that is how an order gets fulfilled for a payment that never settled.'
+            );
+        }
+        if ($type === 'payment.failed' && $judgement->verdict !== Semantics::VERDICT_FAILED) {
+            self::invalidPayload(
+                'The event announces a failed payment but the record does not support that ('
+                . $judgement->reason . '). In particular a failure notice carrying a receipt, or one '
+                . 'carrying a still-in-flight result code, must not be delivered as a settled failure.'
+            );
+        }
+    }
+
+    /** @throws PaylodSignatureVerificationError */
+    private static function invalidPayload(string $detail): never
+    {
+        throw new PaylodSignatureVerificationError('invalid_payload', $detail);
+    }
+
+    /**
      * Verify and return true/false. This is the boolean convenience form matching the documented
      * `verifyWebhook($rawBody, $signatureHeader, $secret)` surface; use {@see verify()} when you
      * want the decoded event (and a typed error explaining *why* it failed).
@@ -137,6 +273,25 @@ final class Webhook
     ): bool {
         try {
             self::verify($payload, $signature, $secret, $toleranceSec, $nowSec);
+            return true;
+        } catch (PaylodSignatureVerificationError) {
+            return false;
+        }
+    }
+
+    /**
+     * The signature-only boolean form, matching {@see verifySignature()}. Prefer {@see isValid()}:
+     * this one answers "did paylod send these bytes", not "is this event something I may act on".
+     */
+    public static function isValidSignature(
+        string|\Stringable $payload,
+        ?string $signature,
+        #[\SensitiveParameter] string $secret,
+        int|float $toleranceSec = self::DEFAULT_TOLERANCE_SEC,
+        int|float|null $nowSec = null,
+    ): bool {
+        try {
+            self::verifySignature($payload, $signature, $secret, $toleranceSec, $nowSec);
             return true;
         } catch (PaylodSignatureVerificationError) {
             return false;
