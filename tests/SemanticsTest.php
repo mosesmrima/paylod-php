@@ -115,14 +115,18 @@ final class SemanticsTest extends TestCase
         // a live prompt) and no longer in_flight either (that asserts a state the record does not
         // establish). Indeterminate still renders as `pending`, so wait() keeps polling.
         'failed|success' => Semantics::VERDICT_INDETERMINATE,
-        'failed|none' => Semantics::VERDICT_FAILED,
+        // L2'. A failure claim with NO evidence is a claim, not a proof. It used to be believed
+        // outright, which is what let an evidence-free `payment.failed` webhook be delivered as a
+        // settled failure.
+        'failed|none' => Semantics::VERDICT_INDETERMINATE,
         'failed|failure' => Semantics::VERDICT_FAILED,
         'failed|in_flight' => Semantics::VERDICT_INDETERMINATE,
         'failed|conflict' => Semantics::VERDICT_INDETERMINATE,
 
         // claim = cancelled (enumerated explicitly, never a default)
         'cancelled|success' => Semantics::VERDICT_INDETERMINATE,
-        'cancelled|none' => Semantics::VERDICT_FAILED,
+        // L2' again - `cancelled` is a terminal failure claim by another name.
+        'cancelled|none' => Semantics::VERDICT_INDETERMINATE,
         'cancelled|failure' => Semantics::VERDICT_FAILED,
         'cancelled|in_flight' => Semantics::VERDICT_INDETERMINATE,
         'cancelled|conflict' => Semantics::VERDICT_INDETERMINATE,

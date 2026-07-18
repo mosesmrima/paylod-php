@@ -434,15 +434,19 @@ final class WebhookTest extends TestCase
      */
     public function testAMissingDecodedBlockIsSynthesizedAndNonRetryable(): void
     {
-        $failed = self::event();
-        $failed['type'] = 'payment.failed';
-        $failed['data']['status'] = 'failed';
-        $failed['data']['mpesaReceipt'] = null;
-        $failed['data']['resultCode'] = null;
-        $failed['data']['resultDesc'] = null;
-        unset($failed['data']['decoded']);
+        // A settlement whose RECEIPT is the evidence and which carries no result code - the one
+        // real shape that reaches synthesizeDecoded() through verify(). (An evidence-free
+        // `payment.failed` no longer gets this far at all: law L2' makes it INDETERMINATE, and the
+        // coherence check refuses it. That is asserted separately.)
+        $paidNoCode = self::event();
+        $paidNoCode['type'] = 'payment.success';
+        $paidNoCode['data']['status'] = 'success';
+        $paidNoCode['data']['mpesaReceipt'] = 'SFF6XYZ123';
+        $paidNoCode['data']['resultCode'] = null;
+        $paidNoCode['data']['resultDesc'] = null;
+        unset($paidNoCode['data']['decoded']);
 
-        $raw = json_encode($failed);
+        $raw = json_encode($paidNoCode);
         $event = Webhook::verify($raw, Webhook::sign($raw, self::SECRET, self::now()), self::SECRET, 300, self::now());
 
         $this->assertArrayHasKey('decoded', $event['data']);

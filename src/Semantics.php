@@ -41,6 +41,11 @@ namespace Paylod;
  *                   It is a hard error, enforced at the transport boundary in
  *                   {@see \Paylod\Support\Validate::paymentBody()} - a wrong-payment body must not
  *                   even reach this file.
+ *   L2' EVIDENCE    A TERMINAL VERDICT REQUIRES EVIDENCE, IN BOTH DIRECTIONS. `failed` requires
+ *                   failure evidence exactly as `paid` requires success evidence. An evidence-free
+ *                   `status: "failed"` is a claim, not a proof, so it is INDETERMINATE - and a
+ *                   `payment.failed` webhook carrying no receipt and no result code is refused
+ *                   rather than delivered to a handler as a settled failure.
  *   L2 EVIDENCE     `paid` requires SUCCESS evidence. A bare `status: "success"` with no receipt
  *                   and no result code proves nothing and is never paid. The converse is NOT
  *                   required: success WITHOUT a receipt is legitimate, because receipts attach
@@ -217,9 +222,8 @@ final class Semantics
      *   - Success evidence beside a non-success claim is never paid and never failed - the two
      *     signals contradict, so it is indeterminate (L3 + L4).
      *   - A success claim needs evidence to be believed (L2).
-     *   - A failure claim is believed on failure evidence or on silence: proving a payment did NOT
-     *     happen is not something we require evidence for, because the safe action (do not ship, do
-     *     not capture) is the same either way.
+     *   - A FAILURE claim needs evidence too (L2'). Silence is not proof of failure any more than it
+     *     is proof of success: an evidence-free `failed` / `cancelled` is INDETERMINATE.
      *   - EVERY OTHER CONTRADICTION IS INDETERMINATE. In particular `failed`/`cancelled` beside
      *     in-flight evidence is INDETERMINATE, not in-flight: a record that claims to be terminal
      *     while its code says the prompt is live is a record we cannot read, and asserting the
@@ -304,7 +308,23 @@ final class Semantics
                 'status claims failed but the evidence proves the payment succeeded - refusing '
                 . 'to report a payment that carries proof of settlement as a failure'
             ),
-            'failed|none' => [self::VERDICT_FAILED, 'the payment failed terminally'],
+            // L2', THE CONVERSE OF L2. A failure claim with NOTHING behind it is a claim, and a
+            // claim is not evidence - the same rule that refuses an evidence-free `success` has to
+            // refuse an evidence-free `failure`, or the model believes one bare assertion and not
+            // the other for no reason a caller could state. The asymmetry argument that used to sit
+            // here ("the safe action is the same either way") is false in two places that matter:
+            //   - a `payment.failed` webhook carrying no receipt and no result code was DELIVERED as
+            //     a settled failure, so a handler cancelled the order on a body that established
+            //     nothing about whether money moved;
+            //   - a status read of the same shape rendered `status: "failed"`, which merchants treat
+            //     as terminal and re-charge from.
+            // A record that proves nothing is INDETERMINATE. It renders as `pending`, so wait()
+            // keeps polling and the webhook settles it - and it is never retryable.
+            'failed|none' => $contradiction(
+                'status claims failed but the record carries neither a receipt nor a result code, so '
+                . 'there is no evidence the payment actually failed - a bare claim is not proof, and '
+                . 'we cannot establish that no money moved'
+            ),
             'failed|failure' => [self::VERDICT_FAILED, 'the payment failed terminally'],
             // L3. The claim is terminal and the code says the prompt is live. We do not get to
             // pick a winner: never failed (that would invite a retry against a live prompt) and
@@ -321,7 +341,12 @@ final class Semantics
                 'status claims cancelled but the evidence proves the payment succeeded - refusing '
                 . 'to report a payment that carries proof of settlement as a cancellation'
             ),
-            'cancelled|none' => [self::VERDICT_FAILED, 'the payment failed terminally'],
+            // Same rule as `failed|none`: `cancelled` is a terminal failure claim by another name,
+            // and a claim with no evidence behind it establishes nothing either way.
+            'cancelled|none' => $contradiction(
+                'status claims cancelled but the record carries neither a receipt nor a result code, '
+                . 'so there is no evidence the payment actually failed - a bare claim is not proof'
+            ),
             'cancelled|failure' => [self::VERDICT_FAILED, 'the payment failed terminally'],
             'cancelled|in_flight' => $contradiction(
                 'status claims cancelled while the result code says the prompt is still live - the '
