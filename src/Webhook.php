@@ -6,6 +6,7 @@ namespace Paylod;
 
 use Paylod\Exceptions\PaylodSignatureVerificationError;
 use Paylod\Support\JsonLexeme;
+use Paylod\Support\Redact;
 use Paylod\Support\Validate;
 
 /**
@@ -394,7 +395,29 @@ final class Webhook
             );
         }
 
-        return $event;
+        // THE DECODED EVENT IS SCRUBBED BEFORE IT LEAVES THIS METHOD.
+        //
+        // Every string in this array is SERVER-CONTROLLED and every one of them is about to become
+        // a public value: verify() returns it to the handler, verifySignature() returns it as
+        // `unverifiedEvent`, and PaymentOutcome is built from a slice of it. `resultDesc` is the
+        // gateway's own free text, `accountRef` is echoed back from the request, and the identifier
+        // fields are whatever the sender chose to put there.
+        //
+        // The status path already scrubs (the client redacts its own responses, and PaymentOutcome
+        // rebuilds its fields from an allowlist). This path did not, so the SAME misconfiguration -
+        // a gateway reflecting the Authorization header into a description field - leaked a live
+        // `mp_live_` key through the webhook while being caught on the status read. One surface
+        // holding the line is not the line being held.
+        //
+        // Scrubbed HERE, after the HMAC and the raw-lexeme check (both of which must see the bytes
+        // exactly as signed) and before any caller can reach the value. The shape layer only - this
+        // is a static method with no process secrets - which is precisely the layer that catches a
+        // reflected bearer token. Result codes are integers and are untouched, so nothing the
+        // semantic model reads as EVIDENCE can be altered by this.
+        /** @var array<string,mixed> $scrubbed */
+        $scrubbed = Redact::apply($event, []);
+
+        return $scrubbed;
     }
 
     /**
