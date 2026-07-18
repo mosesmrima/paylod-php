@@ -114,17 +114,22 @@ final class PaymentOutcome
         // THE WHOLE DECISION, IN ONE CALL.
         $verdict = Semantics::judge($payment)->verdict;
 
+        // EVERY exposed field is reconstructed from an allowlist and scrubbed - see safePayment().
+        $safePayment = self::safePayment($payment);
+        $paymentId = (string) self::scrub($paymentId);
+        $code = $code === null ? null : (string) self::scrub($code);
+
         if ($verdict === Semantics::VERDICT_PAID) {
             return new self(
                 status: 'succeeded',
-                message: $detail['customerMessage'] ?? 'Payment received - thank you!',
+                message: (string) self::scrub($detail['customerMessage'] ?? 'Payment received - thank you!'),
                 retryable: false, // it worked - charging again would be a second charge
                 paid: true,
                 paymentId: $paymentId,
-                receipt: is_string($mpesaReceipt) ? $mpesaReceipt : null,
+                receipt: is_string($mpesaReceipt) ? (string) self::scrub($mpesaReceipt) : null,
                 code: $code,
-                detail: $detail,
-                payment: $payment,
+                detail: self::nonRetryableDetail($detail),
+                payment: $safePayment,
             );
         }
 
@@ -140,8 +145,8 @@ final class PaymentOutcome
                 paymentId: $paymentId,
                 receipt: null,
                 code: $code,
-                detail: $detail,
-                payment: $payment,
+                detail: self::nonRetryableDetail($detail),
+                payment: $safePayment,
             );
         }
 
@@ -151,31 +156,134 @@ final class PaymentOutcome
                 // `detail` is only useful here if it is genuinely a pending code (4999 /
                 // 500.001.1001); anything else that classified as pending has no useful message.
                 message: ($detail !== null && $detail['category'] === 'pending')
-                    ? $detail['customerMessage']
+                    ? (string) self::scrub($detail['customerMessage'])
                     : self::WAITING,
                 retryable: false, // THE double-charge guard. A live prompt is never safe to re-charge.
                 paid: false,
                 paymentId: $paymentId,
                 receipt: null,
                 code: $code,
-                detail: $detail,
-                payment: $payment,
+                detail: self::nonRetryableDetail($detail),
+                payment: $safePayment,
             );
         }
 
         // Terminal failure. Cancellation gets its own word: the customer chose this, it is not an
         // error, and a UI usually wants to say so more gently.
+        $retryable = $detail['retryable'] ?? false;
+
         return new self(
             status: $code === self::CANCELLED_CODE ? 'cancelled' : 'failed',
-            message: $detail['customerMessage'] ?? 'The payment didn\'t go through. Please try again.',
-            retryable: $detail['retryable'] ?? false,
+            message: (string) self::scrub($detail['customerMessage'] ?? 'The payment didn\'t go through. Please try again.'),
+            retryable: $retryable,
             paid: false,
             paymentId: $paymentId,
             receipt: null,
             code: $code,
-            detail: $detail,
-            payment: $payment,
+            // The terminal branch is the ONE place the nested flag may be true, and it is exactly
+            // as true as the top-level one - they are the same value, not two independent readings.
+            detail: $retryable ? self::scrubDetail($detail) : self::nonRetryableDetail($detail),
+            payment: $safePayment,
         );
+    }
+
+    /**
+     * THE NESTED `retryable` CANNOT OUTRANK THE TOP-LEVEL ONE.
+     *
+     * `retryable` means SAFE TO CHARGE AGAIN, and this object exposes that answer TWICE - once as
+     * `$outcome->retryable` and once as `$outcome->detail['retryable']`. The second one was the raw
+     * catalog flag for the code, wired straight through, so the two disagreed on precisely the
+     * bodies that matter most:
+     *
+     *   ['status' => 'failed', 'mpesaReceipt' => 'SFF6XYZ123', 'resultCode' => 1032]
+     *
+     * judges INDETERMINATE (a receipt beside a cancellation code), so the top-level flag was
+     * correctly false - while `detail['retryable']` was the 1032 catalog entry's `true`. A handler
+     * that reads the decoded block (a natural thing to do: it is where the title, cause and fix
+     * live) was still being told it was safe to charge a customer who holds an M-Pesa receipt.
+     *
+     * A guarantee that only holds at one of the two places it is published is not a guarantee. So
+     * every non-retryable verdict forces the nested flag to false as well. The catalog is not
+     * being overruled about what the CODE means - the verdict has already established that this
+     * RECORD does not license a second charge, and no field of this object may say otherwise.
+     *
+     * @param array{code:string,title:string,cause:string,fix:string,category:string,retryable:bool,customerMessage:string}|null $detail
+     * @return array{code:string,title:string,cause:string,fix:string,category:string,retryable:bool,customerMessage:string}|null
+     */
+    private static function nonRetryableDetail(?array $detail): ?array
+    {
+        if ($detail === null) {
+            return null;
+        }
+        $detail = self::scrubDetail($detail);
+        $detail['retryable'] = false;
+
+        return $detail;
+    }
+
+    /**
+     * The decoded block, with credential-shaped tokens scrubbed out of its free-text fields.
+     *
+     * `cause` is the raw `resultDesc` for an uncatalogued code, and `code` is the sender's own
+     * lexeme - both are SERVER-CONTROLLED strings that land in a public property.
+     *
+     * @param array{code:string,title:string,cause:string,fix:string,category:string,retryable:bool,customerMessage:string} $detail
+     * @return array{code:string,title:string,cause:string,fix:string,category:string,retryable:bool,customerMessage:string}
+     */
+    private static function scrubDetail(array $detail): array
+    {
+        foreach (['code', 'title', 'cause', 'fix', 'category', 'customerMessage'] as $field) {
+            $detail[$field] = self::scrub($detail[$field]);
+        }
+
+        return $detail;
+    }
+
+    /**
+     * THE RAW RECORD IS REBUILT FROM AN ALLOWLIST, NEVER FORWARDED.
+     *
+     * `$payment` used to be the parsed body itself, stored verbatim on a PUBLIC readonly property.
+     * Two consequences, both reachable through an ordinary `var_dump($outcome)`, `print_r()`,
+     * `json_encode($outcome->toArray())` or `var_export()` - i.e. through the things people do while
+     * debugging a payment, in exactly the logs a payment record ends up in:
+     *
+     *   1. EXTRA KEYS SURVIVED. Whatever else the body carried - a `debug` block echoing the request
+     *      headers, an `_raw` field, a vendor extension - was published unread.
+     *   2. CREDENTIAL-SHAPED VALUES SURVIVED. A gateway that reflects the Authorization header into
+     *      `resultDesc` (the same misconfiguration the error-path redaction already exists for) put a
+     *      live `mp_live_...` key into this object. The client redacts on its own status path, but
+     *      this method is PUBLIC and the webhook path calls it with body-supplied data, so relying on
+     *      a caller having redacted first is relying on the caller.
+     *
+     * So the record is reconstructed field by field, from the five keys the schema defines, and every
+     * string in it is scrubbed. Nothing the server invented can reach a public property by default.
+     *
+     * @param array<string,mixed> $payment
+     * @return array<string,mixed>
+     */
+    private static function safePayment(array $payment): array
+    {
+        return [
+            'id' => self::scrub($payment['id'] ?? null),
+            'status' => self::scrub($payment['status'] ?? null),
+            'mpesaReceipt' => self::scrub($payment['mpesaReceipt'] ?? null),
+            'resultCode' => self::scrub($payment['resultCode'] ?? null),
+            'resultDesc' => self::scrub($payment['resultDesc'] ?? null),
+        ];
+    }
+
+    /**
+     * Credential-shape scrubbing, with no process secrets supplied.
+     *
+     * {@see Redact} already knows what a paylod credential looks like (`mp_live_` / `mp_test_` /
+     * `whsec_` + key characters). Reusing it here - rather than writing a second, narrower rule -
+     * is what stops this check from drifting away from what the SDK considers a secret elsewhere.
+     * This method is static and credential-free by design, so the EXACT-secret layer is not
+     * available; the shape layer is, and it is the one that catches a reflected bearer token.
+     */
+    private static function scrub(mixed $value): mixed
+    {
+        return \Paylod\Support\Redact::apply($value, []);
     }
 
     /**
