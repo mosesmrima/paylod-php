@@ -112,7 +112,8 @@ Throws `Paylod\Exceptions\PaylodConfigError` immediately if there is no key anyw
 | `timeoutMs` | `int` | `30000` (must be 1-600000 ms; `0` would disable the timeout entirely) |
 | `maxRetries` | `int` | `2` (transient failures only: network, transient 5xx, 429; not 501/505/511) |
 | `simulate` | `bool` | `false` (sandbox simulator; requires a `mp_test_` key) |
-| `transport` | `Paylod\Http\Transport` | `CurlTransport` (inject for tests/proxies) |
+| `httpClient` | `Paylod\Http\HttpClient` | `CurlHttpClient`. **Test-only.** Requires `allowCustomHttpClient => true` and is refused for `mp_live_` keys - a custom client receives your `Authorization` header on every request |
+| `allowCustomHttpClient` | `bool` | `false` (the explicit opt-in that `httpClient` requires) |
 
 ### `collect(array $params): array`
 
@@ -296,25 +297,40 @@ $paylod->collectAndWait(['amount' => $amount, 'phone' => $phone, 'idempotencyKey
 
 ## Testing your integration
 
-The SDK ships with an injectable transport, so you can test collection flows with no network:
+The SDK dispatches through its OWN transport, which holds the API key: you pass a method, a path
+and a body, and never see the credential or build a header. For tests you can replace the low-level
+byte mover underneath it - but only deliberately, and only with a sandbox key:
 
 ```php
 use Paylod\Paylod;
-use Paylod\Http\Transport;
+use Paylod\Http\HttpClient;
 
-$fake = new class implements Transport {
+$fake = new class implements HttpClient {
     public function send(string $method, string $url, array $headers, ?string $body, int $timeoutMs): array
     {
+        // POST /collect answers 202 Accepted with the literal status "pending". Anything else is
+        // rejected as INDETERMINATE - a 200 here is not a dispatched charge.
         return ['status' => 202, 'headers' => [], 'body' => json_encode([
             'paymentId' => 'pay_test', 'status' => 'pending', 'checkoutRequestId' => 'ws_1',
         ])];
     }
 };
 
-$paylod = new Paylod('mp_test_x', ['transport' => $fake]);
+$paylod = new Paylod('mp_test_x', [
+    'httpClient' => $fake,
+    'allowCustomHttpClient' => true,   // required; refused outright for mp_live_ keys
+]);
 ```
 
-Any PSR-18 client can be wrapped in a `Transport` in a few lines if you prefer to route through your existing HTTP stack.
+**Why the opt-in.** Your API key is a bearer credential: whoever receives it can move money. A
+custom client gets it on every request and decides for itself whether to follow a redirect - so a
+cross-origin `302` it follows would replay your key to another host before the SDK could object.
+That is why this is a gated test seam rather than a general extension point, and why it can never
+be combined with an `mp_live_` key. The rule is enforced by the client and again inside the
+transport.
+
+Any PSR-18 client can be wrapped in an `HttpClient` in a few lines if you prefer to route through
+your existing HTTP stack in tests. It must not follow redirects.
 
 ---
 

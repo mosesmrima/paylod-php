@@ -6,6 +6,120 @@ All notable changes to `paylod/paylod` are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-18
+
+**Breaking.** Two ARCHITECTURAL roots are closed here rather than patched. Rounds 1-4 fixed
+findings one at a time and did not converge, because the findings were symptoms: the SDK had no
+model of what a payment record MEANS, and it handed a money-moving credential across a replaceable
+boundary. Both are now closed by construction - the misuse is no longer expressible.
+
+Mirrors `@paylod/node` 0.7.0 law-for-law. The golden webhook vector (`whsec_golden_vector_v1` ->
+`3afe38e4...2c2eb7`) still passes byte-for-byte. Every protection below is verified NON-VACUOUS by
+`scripts/non-vacuity.php`, which reverts it in source and requires the guarding test to fail:
+**18/18 mutations caught.**
+
+### ROOT 1 - the transport owns the credential
+
+- **`Paylod\Http\Transport` is no longer an interface.** It was, and it received the fully-built
+  `Authorization: Bearer ...` header, so every protection after that point was a suggestion: an
+  injected transport could follow a cross-origin 302 itself and hand back an ordinary `200` from
+  another host, with the credential already replayed, and could put the header into its own
+  exception traces. Checking after following is too late.
+
+  `Transport` is now a **final class that owns the API key**. Callers pass a method, a path and a
+  body; they never see the credential, never construct headers, never supply a URL and never choose
+  a redirect mode.
+- **The origin is pinned per dispatch**, recomputed and compared on every single request rather
+  than once at construction.
+- **Redirects are refused three ways**: a `3xx` status, a non-zero cURL redirect count (a client
+  that FOLLOWED one despite being told not to - a detection, since the credential is already
+  burned), and an effective URL off the pinned origin. `CurlHttpClient` sets
+  `CURLOPT_FOLLOWLOCATION => false` and pins TLS peer/host verification.
+- **A custom HTTP client is a GATED TEST SEAM.** The low-level byte mover is now
+  `Paylod\Http\HttpClient`. Supplying one requires an explicit `allowCustomHttpClient => true`
+  and is **refused outright for `mp_live_` keys** - the same posture `allowInsecureBaseUrl` already
+  had. Both rules are enforced at the client AND again inside `Transport`, so the transport holds
+  the line on its own terms and cannot be reopened by a future caller.
+
+### ROOT 2 - the semantic model
+
+`Paylod\Semantics` is new and is now the ONLY place that decides whether a payment is paid. A
+record makes ONE **CLAIM** (`status`) and carries **EVIDENCE** (`mpesaReceipt`, `resultCode`);
+neither substitutes for the other. `evidenceFor()` derives what a record proves without looking at
+what it claims, and `judge()` resolves the two through a **TOTAL table with no default branch** -
+the defaults are exactly where the old per-field logic went wrong.
+
+Four laws, asserted directly in `tests/SemanticsTest.php`:
+
+| | Law | Rule |
+| --- | --- | --- |
+| **L1** | BINDING | A body whose `id` is not the id that was requested is never evaluated at all. |
+| **L2** | EVIDENCE | `paid` requires a receipt **or** result code 0. Success *without* a receipt stays legitimate - receipts attach asynchronously - so a receipt is never required outright. |
+| **L3** | CONSISTENCY | A claim contradicting its evidence is INDETERMINATE - never a failure, and never a *retryable* one. |
+| **L4** | RECEIPT | A receipt present forces `paid` or `indeterminate`. Never `failed`, never `in_flight`. |
+
+**Behaviour that changed** (all three were verified against the previous build):
+
+- `{status: "pending", resultCode: 0}` was **paid**, with a null receipt -> now **indeterminate**.
+- `{status: "failed", mpesaReceipt: "SFF6XYZ123", resultCode: 1032}` was `cancelled` with
+  **`retryable: true`** -> now **indeterminate**. This one told a merchant it was safe to charge
+  again for a payment carrying an M-Pesa confirmation receipt. It is the single worst defect a
+  payments SDK can have.
+- `{status: "pending", mpesaReceipt: ...}` was paid -> now **indeterminate**.
+
+An indeterminate payment renders as `pending`, so `wait()` keeps polling and lets the webhook
+settle it rather than reporting a false success or a false retryable failure.
+
+### Fixed (Critical / High)
+
+- **`PaymentOutcome::fromPayment()` no longer bypasses the rules.** It carried its own copy of the
+  logic - a `contradictory` boolean, a `$classified ?? $rawStatus` fallback chain, and an evidence
+  check nested inside the success branch - and the GAPS BETWEEN those three were the holes above.
+  It now renders `Semantics::judge()` and decides nothing, so law L2 holds inside it by
+  construction regardless of which surface built the array or whether a validator ran first.
+- **Status reads BIND to the requested id (L1).** Nothing previously compared the `id` in the
+  response to the id in the request, so any mechanism returning a different payment's record - a
+  mis-keyed cache, a proxy collapsing concurrent requests, an authorization bug, a crafted response
+  - produced a body the SDK validated happily and classified on its own merits. If that other
+  payment was paid, the caller shipped goods for an order nobody had paid for.
+- **Collect acks require HTTP `202` and the literal `status: "pending"`.** Any 2xx used to pass, so
+  a bare `200` - what a cache, a proxy, a captive portal or a rewritten route produces - read as a
+  successfully dispatched charge.
+- **A non-Paylod throwable no longer escapes `collect()` bare.** It carried neither the idempotency
+  key nor an indeterminate classification, so the caller's natural retry minted a FRESH key and
+  charged the customer twice. It is now wrapped in a keyed, indeterminate `PaylodApiError`.
+- **`var_export()` no longer prints the API key or the webhook secret.** `__debugInfo()` covers
+  `print_r()` and `var_dump()` but `var_export()` ignores it entirely and walks the real
+  properties - and `var_export()` is what config dumpers and cache warmers call. Both secrets now
+  live in closures, which `var_export()` renders as `\Closure::__set_state(array())`. Serialising
+  a client is refused outright for the same reason.
+- **Signed payment webhooks run through the same `judge()`.** Envelope validation was shallow:
+  `data.status`, `data.mpesaReceipt` and `data.resultCode` were whatever arrived, and a handler
+  written the natural way would fulfil an order on a field nothing had checked. A valid signature
+  proves the body came FROM paylod and says nothing about whether it is COHERENT. Payment events
+  now get shape, type/status consistency, and evidence via `Semantics::judge()`.
+- **The simulator runs the validators INSIDE the request.** It validated after the fact against a
+  hardcoded `200`, so it could not enforce the 202 contract; it dispatched `collect()` with no
+  idempotency key when one was omitted, and its settle call carried none at all; and `outcome()`
+  did not bind. All four are fixed - a simulator weaker than the path it stands in for makes every
+  test written against it a lie.
+
+### Breaking changes
+
+- The `transport` option and the `Paylod\Http\Transport` **interface** are removed. `Transport`
+  is now a final, SDK-owned class. For tests, pass
+  `['httpClient' => $client, 'allowCustomHttpClient' => true]` with an `mp_test_` key. Passing
+  `transport` throws a `PaylodConfigError` naming the replacement.
+- `Paylod\Http\CurlTransport` is now `Paylod\Http\CurlHttpClient`, implementing
+  `Paylod\Http\HttpClient`.
+- `Webhook::verify()` / `isValid()` now reject correctly-signed but incoherent payment events.
+  `Webhook::verifySignature()` / `isValidSignature()` expose the signature-only layer.
+- `POST /collect` responses that are not `202` with `status: "pending"` are rejected.
+- `GET /status/:id` responses whose `id` differs from the requested id are rejected.
+- An evidence-free `status: "success"` status body is no longer a thrown validation error; it is an
+  INDETERMINATE outcome (`paid: false`, `retryable: false`, rendered as `pending`), because an
+  indeterminate payment must keep being polled rather than abort `wait()`.
+
 ## [0.4.0] - 2026-07-18
 
 Third-round fixes from a codex re-verification of 0.3.0, which found a **Critical double-charge
