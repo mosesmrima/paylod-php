@@ -239,11 +239,18 @@ final class DarajaCatalog
             return self::failedFallback($code !== '' ? $code : 'unknown', $rawDesc);
         }
 
-        // Terminal (api_error / b2c_c2b_result): no STK pending semantics. Pick the entry for this
-        // family (falling back to any non-STK match, then any match), else an indeterminate failure.
+        // Terminal (api_error / b2c_c2b_result): no STK pending semantics, EVER. Pick the entry for
+        // this family, else any OTHER non-STK entry for the same code - and nothing else.
+        //
+        // There is deliberately NO "any match" fallback here. A code can live in several families
+        // (4999 is an STK *pending* entry but is also seen on the api_error surface), and falling
+        // through to the STK entry would decode an explicitly-non-STK error as "payment still in
+        // progress" - the exact 4999 bug this family-awareness exists to kill. When the caller names
+        // a non-STK family and the catalog has no non-STK entry for the code, the honest answer is a
+        // terminal, non-retryable, indeterminate failure.
         $entry = null;
         foreach ($matches as $e) {
-            if (($e['family'] ?? null) === $effectiveFamily) {
+            if (($e['family'] ?? null) === $effectiveFamily && ($e['family'] ?? null) !== 'stk_result') {
                 $entry = $e;
                 break;
             }
@@ -255,9 +262,6 @@ final class DarajaCatalog
                     break;
                 }
             }
-        }
-        if ($entry === null && $matches !== []) {
-            $entry = $matches[0];
         }
         if ($entry !== null) {
             return self::decodedFrom($code, $entry);

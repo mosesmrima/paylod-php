@@ -106,10 +106,10 @@ Throws `Paylod\Exceptions\PaylodConfigError` immediately if there is no key anyw
 | Option | Type | Default |
 | --- | --- | --- |
 | `apiKey` | `string` | `PAYLOD_API_KEY` env |
-| `baseUrl` | `string` | `PAYLOD_BASE_URL` env, else `https://paylod.dev/functions/v1` (must be `https://`) |
-| `allowInsecureBaseUrl` | `bool` | `false` (test-only: permit `http://` loopback `baseUrl`; never with an `mp_live_` key) |
+| `baseUrl` | `string` | `PAYLOD_BASE_URL` env, else `https://paylod.dev/functions/v1`. Origin-allowlisted: only `https://paylod.dev` / `https://api.paylod.dev`, no userinfo, no non-443 port, no query/fragment, no raw IPs |
+| `allowInsecureBaseUrl` | `bool` | `false` (test-only: permit a loopback `baseUrl`; never with an `mp_live_` key) |
 | `webhookSecret` | `string` | `PAYLOD_WEBHOOK_SECRET` env |
-| `timeoutMs` | `int` | `30000` |
+| `timeoutMs` | `int` | `30000` (must be 1-600000 ms; `0` would disable the timeout entirely) |
 | `maxRetries` | `int` | `2` (transient failures only: network, transient 5xx, 429; not 501/505/511) |
 | `simulate` | `bool` | `false` (sandbox simulator; requires a `mp_test_` key) |
 | `transport` | `Paylod\Http\Transport` | `CurlTransport` (inject for tests/proxies) |

@@ -94,8 +94,10 @@ final class Paylod
         self::assertSecureBaseUrl($this->baseUrl, $this->apiKey, ($options['allowInsecureBaseUrl'] ?? false) === true);
 
         $this->webhookSecret = $options['webhookSecret'] ?? (getenv('PAYLOD_WEBHOOK_SECRET') ?: null);
-        $this->timeoutMs = (int) ($options['timeoutMs'] ?? self::DEFAULT_TIMEOUT_MS);
-        $this->maxRetries = (int) ($options['maxRetries'] ?? self::DEFAULT_MAX_RETRIES);
+        // A zero/negative timeout would DISABLE cURL's timeout - reject it rather than ship a client
+        // that can hang forever.
+        $this->timeoutMs = self::assertPositiveTimeoutMs($options['timeoutMs'] ?? self::DEFAULT_TIMEOUT_MS, 'timeoutMs');
+        $this->maxRetries = max(0, (int) ($options['maxRetries'] ?? self::DEFAULT_MAX_RETRIES));
         $this->transport = $options['transport'] ?? new CurlTransport();
 
         // Simulator mode is a TEST posture, so it is fenced off from production at CONSTRUCTION time.
@@ -416,7 +418,11 @@ final class Paylod
      */
     public function wait(string $paymentId, array $options = []): PaymentOutcome
     {
-        $timeoutMs = (int) ($options['timeoutMs'] ?? self::DEFAULT_WAIT_TIMEOUT_MS);
+        // Same rule as the client timeout: a non-positive wait budget would mean "wait forever".
+        $timeoutMs = self::assertPositiveTimeoutMs(
+            $options['timeoutMs'] ?? self::DEFAULT_WAIT_TIMEOUT_MS,
+            'wait() timeoutMs'
+        );
         $onPoll = $options['onPoll'] ?? null;
         $startedAt = self::nowMs();
         $deadline = $startedAt + $timeoutMs;
@@ -481,7 +487,7 @@ final class Paylod
         string $rawBody,
         ?string $signatureHeader,
         ?string $secret = null,
-        int $toleranceSec = Webhook::DEFAULT_TOLERANCE_SEC,
+        int|float $toleranceSec = Webhook::DEFAULT_TOLERANCE_SEC,
     ): bool {
         return Webhook::isValid($rawBody, $signatureHeader, $secret ?? $this->webhookSecret ?? '', $toleranceSec);
     }
@@ -496,7 +502,7 @@ final class Paylod
         string $rawBody,
         ?string $signatureHeader,
         ?string $secret = null,
-        int $toleranceSec = Webhook::DEFAULT_TOLERANCE_SEC,
+        int|float $toleranceSec = Webhook::DEFAULT_TOLERANCE_SEC,
     ): array {
         return Webhook::verify($rawBody, $signatureHeader, $secret ?? $this->webhookSecret ?? '', $toleranceSec);
     }
@@ -520,35 +526,126 @@ final class Paylod
     }
 
     /**
-     * Enforce a secure origin for baseUrl. HTTPS is required so the API key is never sent in the
-     * clear and a hostile redirect target can't be substituted. Loopback HTTP is permitted ONLY
-     * behind an explicit test-only opt-in, and NEVER with a live (mp_live_) key.
+     * The ONLY origins a live bearer key may be sent to. HTTPS alone is not enough: any
+     * attacker-controlled https:// host would happily accept the Authorization header and replay it.
+     *
+     * @var list<string>
+     */
+    private const ALLOWED_HOSTS = ['paylod.dev', 'api.paylod.dev'];
+
+    /** Hosts that may be used with the explicit, test-only insecure opt-in. */
+    private const LOOPBACK_HOSTS = ['localhost', '127.0.0.1', '::1', '[::1]'];
+
+    /**
+     * Enforce a secure, ALLOWLISTED origin for baseUrl before the API key can leave the process.
+     *
+     * HTTPS is necessary but nowhere near sufficient - a bearer key posted to https://evil.example is
+     * just as stolen as one posted over plaintext. So the host itself must be the canonical paylod
+     * production origin. We additionally reject anything that smuggles a different effective target
+     * past a naive eyeball check: userinfo (https://paylod.dev@evil.example), a missing host, a
+     * non-default port, a query string or fragment, and private / loopback / link-local IPs.
+     *
+     * Loopback is permitted ONLY behind the explicit test-only opt-in, and NEVER with a live
+     * (mp_live_) key.
      */
     private static function assertSecureBaseUrl(string $baseUrl, string $apiKey, bool $allowInsecure): void
     {
         $parts = parse_url($baseUrl);
-        if ($parts === false || !isset($parts['scheme'])) {
-            throw new PaylodConfigError("baseUrl is not a valid URL: \"{$baseUrl}\".");
+        if ($parts === false || !isset($parts['scheme']) || !isset($parts['host']) || $parts['host'] === '') {
+            throw new PaylodConfigError("baseUrl is not a valid absolute URL: \"{$baseUrl}\".");
         }
 
         $scheme = strtolower((string) $parts['scheme']);
-        if ($scheme === 'https') {
-            return;
-        }
-
-        $host = strtolower((string) ($parts['host'] ?? ''));
-        $isLoopback = in_array($host, ['localhost', '127.0.0.1', '::1', '[::1]'], true);
+        $host = strtolower(trim((string) $parts['host'], '[]'));
+        $port = $parts['port'] ?? null;
         $isLive = str_starts_with($apiKey, 'mp_live_');
 
-        if ($scheme === 'http' && $isLoopback && $allowInsecure && !$isLive) {
-            return;
+        // Credentials in the URL are never legitimate here, and `https://paylod.dev@evil.example`
+        // reads as the real origin while resolving to the attacker's.
+        if (isset($parts['user']) || isset($parts['pass'])) {
+            throw new PaylodConfigError(
+                "baseUrl must not contain credentials (got \"{$baseUrl}\"). A userinfo section makes the "
+                . 'URL read like the paylod origin while pointing somewhere else entirely.'
+            );
+        }
+        // The base URL is a prefix we concatenate paths onto - a query or fragment would be silently
+        // relocated into the middle of the request line.
+        if (isset($parts['query']) || isset($parts['fragment'])) {
+            throw new PaylodConfigError(
+                "baseUrl must not contain a query string or fragment (got \"{$baseUrl}\")."
+            );
         }
 
-        throw new PaylodConfigError(
-            "baseUrl must use https:// (got \"{$baseUrl}\"). Plaintext HTTP would transmit your API key "
-            . 'in the clear and opens you to SSRF / redirection. Loopback HTTP (localhost, 127.0.0.1) is '
-            . "allowed ONLY with ['allowInsecureBaseUrl' => true] and NEVER with an mp_live_ key."
-        );
+        $isLoopbackHost = in_array($host, ['localhost', '127.0.0.1', '::1'], true)
+            || in_array($host, self::LOOPBACK_HOSTS, true);
+
+        // The sanctioned test escape hatch: an explicit opt-in, a loopback host, and never a live key.
+        if ($isLoopbackHost) {
+            if ($allowInsecure && !$isLive && ($scheme === 'http' || $scheme === 'https')) {
+                return;
+            }
+            throw new PaylodConfigError(
+                "baseUrl points at loopback (\"{$baseUrl}\"). That is allowed ONLY with "
+                . "['allowInsecureBaseUrl' => true] and NEVER with an mp_live_ key."
+            );
+        }
+
+        if ($scheme !== 'https') {
+            throw new PaylodConfigError(
+                "baseUrl must use https:// (got \"{$baseUrl}\"). Plaintext HTTP would transmit your API "
+                . 'key in the clear and opens you to SSRF / redirection.'
+            );
+        }
+
+        // A bare IP literal is never the paylod origin, and private / link-local ranges are the classic
+        // SSRF pivot (169.254.169.254 and friends).
+        if (filter_var($host, FILTER_VALIDATE_IP) !== false) {
+            throw new PaylodConfigError(
+                "baseUrl must name the paylod host, not a raw IP address (got \"{$baseUrl}\")."
+            );
+        }
+
+        if (!in_array($host, self::ALLOWED_HOSTS, true)) {
+            throw new PaylodConfigError(
+                "baseUrl origin \"{$host}\" is not a paylod origin. Your API key can move money, so it is "
+                . 'only ever sent to ' . implode(' or ', self::ALLOWED_HOSTS) . '. Remove the custom '
+                . 'baseUrl / PAYLOD_BASE_URL override.'
+            );
+        }
+
+        if ($port !== null && (int) $port !== 443) {
+            throw new PaylodConfigError(
+                "baseUrl must use the default https port (got port {$port} in \"{$baseUrl}\")."
+            );
+        }
+    }
+
+    /**
+     * A request timeout must be POSITIVE and bounded. cURL treats CURLOPT_TIMEOUT_MS of 0 as "no
+     * timeout at all", so accepting 0 would turn a hung connection into a request that never returns
+     * and a wait() that never settles - the opposite of what a caller passing timeoutMs wants.
+     */
+    private const MAX_TIMEOUT_MS = 600000;
+
+    private static function assertPositiveTimeoutMs(mixed $value, string $label): int
+    {
+        if (is_bool($value) || (!is_int($value) && !is_float($value) && !(is_string($value) && is_numeric($value)))) {
+            throw new PaylodConfigError("{$label} must be a positive number of milliseconds.");
+        }
+        $ms = (float) $value;
+        if (!is_finite($ms) || $ms <= 0) {
+            throw new PaylodConfigError(
+                "{$label} must be greater than 0 (got " . var_export($value, true) . '). A zero or '
+                . 'negative timeout disables the timeout entirely, so a hung request would never return.'
+            );
+        }
+        if ($ms > self::MAX_TIMEOUT_MS) {
+            throw new PaylodConfigError(
+                "{$label} must be at most " . self::MAX_TIMEOUT_MS . ' ms.'
+            );
+        }
+
+        return (int) $ms;
     }
 
     /**
@@ -565,14 +662,32 @@ final class Paylod
                 . 'double-charge protection.'
             );
         }
-        // Control chars (C0 range + DEL): invalid in HTTP header values and a sign of a bad key.
-        if (preg_match('/[\x00-\x1f\x7f]/', $key) === 1) {
+        // Bound the BYTE length: this goes out as an HTTP header value, and header sizes are bytes.
+        if (strlen($key) > 255) {
+            throw new PaylodInvalidRequestError('idempotencyKey must be 255 bytes or fewer.');
+        }
+        // The Unicode classes below are only meaningful over well-formed UTF-8. Invalid UTF-8 in a
+        // header value is itself a bug, so reject it rather than fall back to a byte-wise check.
+        if (preg_match('//u', $key) !== 1) {
+            throw new PaylodInvalidRequestError('idempotencyKey must be valid UTF-8.');
+        }
+        // The FULL control ranges: C0 (U+0000-U+001F), DEL (U+007F) and C1 (U+0080-U+009F). All are
+        // illegal in an HTTP header value, and a C1 byte pair sneaking through a byte-only C0 check
+        // was how a mangled key used to be accepted silently.
+        if (preg_match('/[\x{0000}-\x{001F}\x{007F}-\x{009F}]/u', $key) === 1) {
             throw new PaylodInvalidRequestError(
-                'idempotencyKey must not contain control characters (tabs, newlines, NULs, etc.).'
+                'idempotencyKey must not contain control characters (tabs, newlines, NULs, and the '
+                . 'C1 range).'
             );
         }
-        if (strlen($key) > 255) {
-            throw new PaylodInvalidRequestError('idempotencyKey must be 255 characters or fewer.');
+        // Unicode-only whitespace: NBSP, ideographic space, the line/paragraph separators and the BOM
+        // all survive trim() (which only strips ASCII), so "\u{00A0}" used to pass as a "real" key
+        // while being invisible - and two visually identical keys would be two different charges.
+        if (preg_match('/[^\P{Z}\x{0020}]|[\x{FEFF}\x{180E}]/u', $key) === 1) {
+            throw new PaylodInvalidRequestError(
+                'idempotencyKey must not contain Unicode-only whitespace (non-breaking space, '
+                . 'ideographic space, BOM, line/paragraph separators). Use plain ASCII.'
+            );
         }
     }
 

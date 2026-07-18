@@ -279,6 +279,125 @@ final class PaylodClientTest extends TestCase
         ]);
     }
 
+    /**
+     * HTTPS is not enough on its own. A live bearer key posted to https://evil.example is just as
+     * stolen as one sent in the clear, so the ORIGIN itself is allowlisted.
+     */
+    public function testConstructorRejectsNonPaylodHttpsOrigins(): void
+    {
+        $bad = [
+            'https://evil.example/v1',                 // arbitrary https host
+            'https://paylod.dev.evil.example/v1',      // suffix-confusion
+            'https://evilpaylod.dev/v1',               // prefix-confusion
+            'https://paylod.dev@evil.example/v1',      // userinfo smuggling the real target
+            'https://user:pw@paylod.dev/v1',           // credentials in the URL
+            'https://paylod.dev:8443/v1',              // unexpected port
+            'https://169.254.169.254/v1',              // link-local metadata endpoint
+            'https://10.0.0.5/v1',                     // private range
+            'https://paylod.dev/v1?x=1',               // query string
+            'https://paylod.dev/v1#f',                 // fragment
+            'not-a-url',                               // no scheme/host
+            '//paylod.dev/v1',                         // scheme-relative
+        ];
+        foreach ($bad as $url) {
+            try {
+                new Paylod('mp_test_x', ['baseUrl' => $url, 'transport' => new MockTransport([])]);
+                $this->fail("expected {$url} to be rejected");
+            } catch (PaylodConfigError $e) {
+                $this->assertNotSame('', $e->getMessage(), $url);
+            }
+        }
+    }
+
+    public function testConstructorAcceptsTheCanonicalPaylodOrigins(): void
+    {
+        foreach ([Paylod::DEFAULT_BASE_URL, 'https://paylod.dev/functions/v1', 'https://api.paylod.dev/v1', 'https://paylod.dev:443/v1'] as $url) {
+            $paylod = new Paylod('mp_live_key', ['baseUrl' => $url, 'transport' => new MockTransport([])]);
+            $this->assertInstanceOf(Paylod::class, $paylod);
+        }
+    }
+
+    public function testConstructorRefusesLoopbackWithALiveKeyOnHttpsToo(): void
+    {
+        // The loopback exception is test-only and NEVER available to a live key, plaintext or not.
+        $this->expectException(PaylodConfigError::class);
+        new Paylod('mp_live_secret', [
+            'baseUrl' => 'https://127.0.0.1:9999/v1',
+            'allowInsecureBaseUrl' => true,
+            'transport' => new MockTransport([]),
+        ]);
+    }
+
+    public function testConstructorRefusesLoopbackWithoutTheExplicitFlag(): void
+    {
+        $this->expectException(PaylodConfigError::class);
+        new Paylod('mp_test_x', ['baseUrl' => 'https://localhost:9999/v1', 'transport' => new MockTransport([])]);
+    }
+
+    // -- Timeout must be positive and bounded ---------------------------------
+
+    /**
+     * cURL treats CURLOPT_TIMEOUT_MS of 0 as "no timeout at all", so a timeoutMs of 0 would turn a
+     * hung connection into a request that never returns.
+     */
+    public function testConstructorRejectsZeroOrNegativeTimeout(): void
+    {
+        foreach ([0, -1, -30000, 0.0] as $bad) {
+            try {
+                new Paylod('mp_test_x', ['timeoutMs' => $bad, 'transport' => new MockTransport([])]);
+                $this->fail('expected timeoutMs ' . var_export($bad, true) . ' to be rejected');
+            } catch (PaylodConfigError $e) {
+                $this->assertMatchesRegularExpression('/greater than 0/', $e->getMessage());
+            }
+        }
+    }
+
+    public function testConstructorRejectsAbsurdlyLargeOrNonNumericTimeout(): void
+    {
+        foreach ([600001, 'soon', true, INF, NAN, []] as $bad) {
+            try {
+                new Paylod('mp_test_x', ['timeoutMs' => $bad, 'transport' => new MockTransport([])]);
+                $this->fail('expected timeoutMs ' . var_export($bad, true) . ' to be rejected');
+            } catch (PaylodConfigError) {
+                $this->addToAssertionCount(1);
+            }
+        }
+    }
+
+    public function testWaitRejectsNonPositiveTimeout(): void
+    {
+        [$paylod] = $this->client([['status' => 200, 'json' => ['id' => 'pay_123', 'status' => 'pending']]]);
+        $this->expectException(PaylodConfigError::class);
+        $paylod->wait('pay_123', ['timeoutMs' => 0]);
+    }
+
+    // -- The operation deadline bounds every in-flight request ----------------
+
+    /**
+     * A 30s per-request timeout must never let a wait(['timeoutMs' => 400]) sit in a single hung
+     * request for 30s: each poll is capped to the time the whole operation has left.
+     */
+    public function testWaitDeadlineCapsEachRequestTimeout(): void
+    {
+        [$paylod, $transport] = $this->client(
+            [['status' => 200, 'json' => ['id' => 'pay_123', 'status' => 'pending']]],
+            ['timeoutMs' => 30000]
+        );
+
+        try {
+            $paylod->wait('pay_123', ['timeoutMs' => 400]);
+            $this->fail('expected a timeout');
+        } catch (PaylodTimeoutError) {
+            $this->addToAssertionCount(1);
+        }
+
+        $this->assertNotSame([], $transport->calls);
+        foreach ($transport->calls as $call) {
+            $this->assertGreaterThan(0, $call['timeoutMs']);
+            $this->assertLessThanOrEqual(400, $call['timeoutMs'], 'per-request timeout must be capped by the wait deadline');
+        }
+    }
+
     // -- Idempotency key validation -------------------------------------------
 
     public function testCollectRejectsBlankIdempotencyKey(): void
@@ -293,6 +412,48 @@ final class PaylodClientTest extends TestCase
         [$paylod] = $this->client([]);
         $this->expectException(PaylodInvalidRequestError::class);
         $paylod->collect(['amount' => 100, 'phone' => '0712345678', 'idempotencyKey' => "bad\nkey"]);
+    }
+
+    /**
+     * The idempotency key is the ONE thing standing between a double-click and a double-charge, so
+     * anything invisible or header-illegal must fail loudly. A C1 control char or a non-breaking
+     * space survives trim() and a byte-only C0 check, so two visually identical keys could become
+     * two different charges.
+     */
+    public function testCollectRejectsC1ControlsAndUnicodeOnlyWhitespaceInIdempotencyKey(): void
+    {
+        $bad = [
+            "key\u{0085}x",   // C1 NEL
+            "key\u{009f}x",   // C1 APC
+            "key\u{007f}x",   // DEL
+            "\u{00a0}",       // non-breaking space only - trim() says "non-empty"
+            "a\u{00a0}b",     // embedded NBSP
+            "a\u{2007}b",     // figure space
+            "a\u{3000}b",     // ideographic space
+            "a\u{feff}b",     // BOM / zero-width no-break space
+            "a\u{2028}b",     // line separator
+            "\u{2029}",       // paragraph separator
+            "bad\xC3(utf8",   // invalid UTF-8
+            str_repeat('k', 256), // over the 255-byte header bound
+        ];
+        foreach ($bad as $key) {
+            [$paylod] = $this->client([]);
+            try {
+                $paylod->collect(['amount' => 100, 'phone' => '0712345678', 'idempotencyKey' => $key]);
+                $this->fail('expected ' . bin2hex($key) . ' to be rejected');
+            } catch (PaylodInvalidRequestError) {
+                $this->addToAssertionCount(1);
+            }
+        }
+    }
+
+    public function testCollectAcceptsAnOrdinaryKeyWithAnAsciiSpace(): void
+    {
+        // A plain ASCII space is legal in an HTTP header value - the rule targets INVISIBLE and
+        // header-illegal characters, not ordinary punctuation.
+        [$paylod] = $this->client([['status' => 202, 'json' => self::ACK]]);
+        $ack = $paylod->collect(['amount' => 100, 'phone' => '0712345678', 'idempotencyKey' => 'order 42-abc_XYZ']);
+        $this->assertSame('order 42-abc_XYZ', $ack['idempotencyKey']);
     }
 
     // -- The effective key is attached to a failure ---------------------------

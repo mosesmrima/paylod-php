@@ -16,7 +16,7 @@ use Paylod\Http\Transport;
  */
 final class MockTransport implements Transport
 {
-    /** @var list<array{url:string,method:string,headers:array<string,string>,body:mixed}> */
+    /** @var list<array{url:string,method:string,headers:array<string,string>,body:mixed,timeoutMs:int}> */
     public array $calls = [];
 
     private int $i = 0;
@@ -39,6 +39,8 @@ final class MockTransport implements Transport
             'method' => $method,
             'headers' => $lowered,
             'body' => $body === null ? null : json_decode($body, true),
+            // Recorded so a test can prove the operation deadline actually caps each in-flight request.
+            'timeoutMs' => $timeoutMs,
         ];
 
         $step = $this->steps[min($this->i, count($this->steps) - 1)] ?? null;

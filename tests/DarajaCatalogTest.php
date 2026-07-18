@@ -141,4 +141,39 @@ final class DarajaCatalogTest extends TestCase
     {
         $this->assertSame('failed', DarajaCatalog::classifyStkResult('500.001.1001', 'Insufficient funds'));
     }
+
+    /**
+     * An EXPLICITLY non-STK family must never fall back to an STK entry. 4999 exists in the catalog
+     * ONLY as an STK `pending` entry, so the old "any match" fallback decoded 4999+api_error as
+     * "payment still in progress" - telling a caller to keep polling an error that will never settle.
+     * With no non-STK entry for the code the honest answer is a terminal, non-retryable failure.
+     */
+    public function testNonStkFamilyNeverFallsBackToAnStkPendingEntry(): void
+    {
+        foreach (['api_error', 'b2c_c2b_result'] as $family) {
+            $d = DarajaCatalog::decode(4999, null, $family);
+            $this->assertNotSame('pending', $d['category'], $family);
+            $this->assertFalse($d['retryable'], $family);
+            $this->assertSame('4999', $d['code'], $family);
+            $this->assertSame('Payment failed', $d['title'], $family);
+        }
+
+        // The STK surface is untouched: there, 4999 really is an in-flight payment.
+        $stk = DarajaCatalog::decode(4999);
+        $this->assertSame('pending', $stk['category']);
+        $this->assertFalse($stk['retryable']);
+    }
+
+    public function testNonStkFamilyPrefersItsOwnEntryOverAnotherNonStkOne(): void
+    {
+        // 500.001.1001 lives on both the STK and api_error surfaces; asking for api_error must pick
+        // the api_error entry, never the STK pending one.
+        $d = DarajaCatalog::decode('500.001.1001', null, 'api_error');
+        $this->assertNotSame('pending', $d['category']);
+
+        // And an unknown code on a non-STK surface is terminal, not pending.
+        $unknown = DarajaCatalog::decode('999999', null, 'api_error');
+        $this->assertNotSame('pending', $unknown['category']);
+        $this->assertFalse($unknown['retryable']);
+    }
 }

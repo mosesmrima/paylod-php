@@ -81,14 +81,14 @@ final class WebhookTest extends TestCase
 
         $this->assertSame($goldenHeader, Webhook::sign($goldenBody, $goldenSecret, $goldenT));
 
-        // And the verifier accepts its own signer's golden output. The fixed vector pins the clock
-        // via $nowSec (the freshness window is deterministic) - the sanctioned way to verify an
-        // ancient fixture with toleranceSec: 0 without disabling replay protection in production.
-        $event = Webhook::verify($goldenBody, $goldenHeader, $goldenSecret, 0, $goldenT);
+        // And the verifier accepts its own signer's golden output. The fixture pins the clock via
+        // $nowSec while keeping a NORMAL positive window - the sanctioned way to verify an ancient
+        // fixture. Replay protection is never switched off, not even here.
+        $event = Webhook::verify($goldenBody, $goldenHeader, $goldenSecret, 300, $goldenT);
         $this->assertSame('pay_golden', $event['data']['paymentId']);
 
         // The boolean convenience form agrees.
-        $this->assertTrue(Webhook::isValid($goldenBody, $goldenHeader, $goldenSecret, 0, $goldenT));
+        $this->assertTrue(Webhook::isValid($goldenBody, $goldenHeader, $goldenSecret, 300, $goldenT));
     }
 
     public function testAcceptsValidSignatureAndReturnsEvent(): void
@@ -195,39 +195,91 @@ final class WebhookTest extends TestCase
         Webhook::verify(self::raw(), $bad, self::SECRET);
     }
 
-    public function testVerifiesAncientFixtureByPinningClock(): void
+    public function testVerifiesAncientFixtureByPinningClockWithAPositiveWindow(): void
     {
-        // toleranceSec: 0 is only permitted with a fixed, injected clock (a pinned test vector).
-        $header = Webhook::sign(self::raw(), self::SECRET, 1); // ancient
-        $event = Webhook::verify(self::raw(), $header, self::SECRET, 0, 1);
+        // The supported way to verify a pinned fixture: keep a normal tolerance, inject the fixture's
+        // own timestamp as the clock. Freshness stays enforced, the result stays deterministic.
+        $header = Webhook::sign(self::raw(), self::SECRET, 1_000_000); // ancient
+        $event = Webhook::verify(self::raw(), $header, self::SECRET, 300, 1_000_000);
         $this->assertSame('pay_123', $event['data']['paymentId']);
-    }
 
-    public function testRefusesNonPositiveToleranceInProductionWithoutFixedClock(): void
-    {
-        // A non-positive tolerance would silently disable replay protection - refuse it loudly unless
-        // a fixed $nowSec is injected. No $nowSec here => insecure_tolerance.
-        $header = Webhook::sign(self::raw(), self::SECRET, self::now());
+        // ...and the pinned clock still enforces the window, it does not bypass it.
         try {
-            Webhook::verify(self::raw(), $header, self::SECRET, 0);
-            $this->fail('expected an insecure_tolerance error');
+            Webhook::verify(self::raw(), $header, self::SECRET, 300, 1_000_000 + 301);
+            $this->fail('expected a stale_timestamp error');
         } catch (PaylodSignatureVerificationError $e) {
-            $this->assertSame('insecure_tolerance', $e->reason);
+            $this->assertSame('stale_timestamp', $e->reason);
         }
     }
 
-    public function testRefusesNegativeToleranceUnlessFixedClockInjected(): void
+    /**
+     * A zero / negative / non-finite tolerance disables replay protection outright. It is refused
+     * UNCONDITIONALLY - injecting a fixed $nowSec no longer buys an exemption, because a pinned
+     * fixture verifies perfectly well with a normal positive window (see the test above).
+     */
+    public function testRefusesNonPositiveToleranceEvenWithAFixedClock(): void
     {
         $header = Webhook::sign(self::raw(), self::SECRET, self::now());
-        try {
-            Webhook::verify(self::raw(), $header, self::SECRET, -5);
-            $this->fail('expected an insecure_tolerance error');
-        } catch (PaylodSignatureVerificationError $e) {
-            $this->assertSame('insecure_tolerance', $e->reason);
+        foreach ([0, -5, 0.0, -0.5] as $bad) {
+            foreach ([null, self::now()] as $now) {
+                try {
+                    Webhook::verify(self::raw(), $header, self::SECRET, $bad, $now);
+                    $this->fail('expected an insecure_tolerance error for tolerance ' . var_export($bad, true));
+                } catch (PaylodSignatureVerificationError $e) {
+                    $this->assertSame('insecure_tolerance', $e->reason);
+                }
+            }
         }
-        // ...but with a pinned clock (a fixed-vector test) it is allowed.
-        $event = Webhook::verify(self::raw(), $header, self::SECRET, -5, self::now());
-        $this->assertSame('pay_123', $event['data']['paymentId']);
+        // The boolean form fails closed rather than reporting a valid signature.
+        $this->assertFalse(Webhook::isValid(self::raw(), $header, self::SECRET, 0, self::now()));
+    }
+
+    public function testRefusesNonFiniteTolerance(): void
+    {
+        // NAN is the dangerous one: `abs($now - $t) > NAN` is FALSE, so every stale signature would
+        // sail through a naive comparison. INF and a fractional window are refused too.
+        $header = Webhook::sign(self::raw(), self::SECRET, self::now());
+        foreach ([NAN, INF, -INF, 300.5] as $bad) {
+            try {
+                Webhook::verify(self::raw(), $header, self::SECRET, $bad, self::now());
+                $this->fail('expected an insecure_tolerance error for ' . var_export($bad, true));
+            } catch (PaylodSignatureVerificationError $e) {
+                $this->assertSame('insecure_tolerance', $e->reason);
+            }
+        }
+    }
+
+    public function testValidatesTheInjectedClock(): void
+    {
+        // An unusable clock (0, negative, NaN) must not be silently accepted either - it would make
+        // the freshness comparison meaningless in exactly the same way.
+        $header = Webhook::sign(self::raw(), self::SECRET, self::now());
+        foreach ([0, -1, NAN, INF] as $bad) {
+            try {
+                Webhook::verify(self::raw(), $header, self::SECRET, 300, $bad);
+                $this->fail('expected an insecure_tolerance error for nowSec ' . var_export($bad, true));
+            } catch (PaylodSignatureVerificationError $e) {
+                $this->assertSame('insecure_tolerance', $e->reason);
+            }
+        }
+    }
+
+    /**
+     * `t` is validated LEXICALLY - decimal digits only. PHP would otherwise coerce "1e3", "+1000" or
+     * " 1000" to a number, so the value we freshness-check could differ from the text that was HMAC'd.
+     */
+    public function testRejectsNonDecimalTimestampForms(): void
+    {
+        $v1 = str_repeat('a', 64);
+        // (Surrounding OWS is legal HTTP and is trimmed by the header parser, so it is not listed.)
+        foreach (['1e3', '+1000', '0x3e8', '1_000', '1.0', '-1000', '0b1', '1e400'] as $bad) {
+            try {
+                Webhook::verify(self::raw(), "t={$bad},v1={$v1}", self::SECRET, 300, self::now());
+                $this->fail("expected a malformed_signature error for t={$bad}");
+            } catch (PaylodSignatureVerificationError $e) {
+                $this->assertSame('malformed_signature', $e->reason, "t={$bad}");
+            }
+        }
     }
 
     public function testRejectsCommaCombinedTwoSignatureHeader(): void

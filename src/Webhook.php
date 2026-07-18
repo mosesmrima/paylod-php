@@ -43,10 +43,17 @@ final class Webhook
         string|\Stringable $payload,
         ?string $signature,
         #[\SensitiveParameter] string $secret,
-        int $toleranceSec = self::DEFAULT_TOLERANCE_SEC,
-        ?int $nowSec = null,
+        int|float $toleranceSec = self::DEFAULT_TOLERANCE_SEC,
+        int|float|null $nowSec = null,
     ): array {
         $raw = (string) $payload;
+
+        // Freshness is NOT optional. A zero/negative/NaN tolerance disables replay protection, and
+        // there is no caller - test or otherwise - who needs that: a pinned fixture verifies fine
+        // with a normal window and an injected $nowSec. Validated FIRST so a misconfigured verifier
+        // can never reach the HMAC comparison and return a "valid" verdict.
+        $tolerance = self::requirePositiveInt($toleranceSec, 'toleranceSec');
+        $now = $nowSec === null ? time() : self::requirePositiveInt($nowSec, 'nowSec');
 
         if ($secret === '') {
             throw new PaylodSignatureVerificationError(
@@ -69,9 +76,12 @@ final class Webhook
             );
         }
 
-        // `t` must ALWAYS be an integer, regardless of tolerance - a non-numeric timestamp is
-        // malformed. (Node validates this before the tolerance branch for the same reason.)
-        if (filter_var($parsed['t'], FILTER_VALIDATE_INT) === false) {
+        // `t` must be a LEXICAL decimal integer - digits only. PHP's numeric coercion would otherwise
+        // happily read "1e3", "+1000", " 1000" or a hex-ish form as a number, letting an attacker
+        // present a timestamp whose textual form (which is what gets HMAC'd) differs from the value
+        // we freshness-check. Digits only means the two can never diverge.
+        if (preg_match('/^[0-9]{1,19}$/', $parsed['t']) !== 1
+            || filter_var($parsed['t'], FILTER_VALIDATE_INT) === false) {
             throw new PaylodSignatureVerificationError(
                 'malformed_signature',
                 'Signature timestamp is not a number.'
@@ -79,26 +89,12 @@ final class Webhook
         }
         $t = (int) $parsed['t'];
 
-        if ($toleranceSec > 0) {
-            $now = $nowSec ?? time();
-            if (abs($now - $t) > $toleranceSec) {
-                throw new PaylodSignatureVerificationError(
-                    'stale_timestamp',
-                    "Signature timestamp is outside the {$toleranceSec}s tolerance (replay?)."
-                );
-            }
-        } elseif ($nowSec === null) {
-            // A non-positive tolerance would DISABLE replay protection. That is only ever acceptable
-            // with a fixed, injected clock (a pinned test vector). In production - no $nowSec - refuse
-            // it loudly rather than silently accept replays of any age.
+        if (abs($now - $t) > $tolerance) {
             throw new PaylodSignatureVerificationError(
-                'insecure_tolerance',
-                'toleranceSec must be a positive number of seconds. A non-positive tolerance disables '
-                . 'webhook replay protection and is only permitted in tests that inject a fixed $nowSec.'
+                'stale_timestamp',
+                "Signature timestamp is outside the {$tolerance}s tolerance (replay?)."
             );
         }
-        // else: toleranceSec <= 0 AND a fixed $nowSec was injected - a deterministic fixed-vector
-        // test. The freshness window is intentionally skipped; the pinned clock makes replay moot.
 
         $expected = hash_hmac('sha256', $parsed['t'] . '.' . $raw, $secret);
 
@@ -136,8 +132,8 @@ final class Webhook
         string|\Stringable $payload,
         ?string $signature,
         #[\SensitiveParameter] string $secret,
-        int $toleranceSec = self::DEFAULT_TOLERANCE_SEC,
-        ?int $nowSec = null,
+        int|float $toleranceSec = self::DEFAULT_TOLERANCE_SEC,
+        int|float|null $nowSec = null,
     ): bool {
         try {
             self::verify($payload, $signature, $secret, $toleranceSec, $nowSec);
@@ -157,6 +153,36 @@ final class Webhook
         $v1 = hash_hmac('sha256', $t . '.' . (string) $payload, $secret);
 
         return "t={$t},v1={$v1}";
+    }
+
+    /**
+     * A tolerance / injected clock must be a FINITE, POSITIVE, WHOLE number of seconds.
+     *
+     * Rejecting NAN and INF matters: `abs(NAN - $t) > NAN` is false, so a NaN tolerance would make
+     * every freshness check pass - a silent, total loss of replay protection that looks like a
+     * working verifier. A non-integral value is refused too rather than truncated, so the window a
+     * caller asked for is always the window they get.
+     *
+     * @throws PaylodSignatureVerificationError
+     */
+    private static function requirePositiveInt(int|float $value, string $label): int
+    {
+        if (is_float($value) && (!is_finite($value) || floor($value) !== $value)) {
+            throw new PaylodSignatureVerificationError(
+                'insecure_tolerance',
+                "{$label} must be a finite, whole number of seconds (got " . var_export($value, true) . ').'
+            );
+        }
+        if ($value <= 0) {
+            throw new PaylodSignatureVerificationError(
+                'insecure_tolerance',
+                "{$label} must be greater than 0 (got " . var_export($value, true) . '). A zero or '
+                . 'negative tolerance disables webhook replay protection entirely. To verify a pinned '
+                . 'fixture, keep a normal tolerance and inject the fixture\'s own timestamp as $nowSec.'
+            );
+        }
+
+        return (int) $value;
     }
 
     /** A well-formed `v1` is 64 lowercase hex chars (an HMAC-SHA256 digest). */
