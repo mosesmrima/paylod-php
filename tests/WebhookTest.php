@@ -1,0 +1,246 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Paylod\Tests;
+
+use Paylod\Exceptions\PaylodSignatureVerificationError;
+use Paylod\Paylod;
+use Paylod\Tests\Support\MockTransport;
+use Paylod\Webhook;
+use PHPUnit\Framework\TestCase;
+
+final class WebhookTest extends TestCase
+{
+    private const SECRET = 'whsec_test_secret';
+
+    /** @return array<string,mixed> */
+    private static function event(): array
+    {
+        return [
+            'type' => 'payment.success',
+            'created' => 1700000000,
+            'data' => [
+                'paymentId' => 'pay_123',
+                'applicationId' => 'app_1',
+                'env' => 'sandbox',
+                'status' => 'success',
+                'amount' => 100,
+                'phone' => '254712345678',
+                'accountRef' => 'order-42',
+                'mpesaReceipt' => 'SFF6XYZ123',
+                'checkoutRequestId' => 'ws_CO_0001',
+                'resultCode' => 0,
+                'resultDesc' => 'The service request is processed successfully.',
+                'decoded' => null,
+            ],
+        ];
+    }
+
+    private static function raw(): string
+    {
+        return json_encode(self::event());
+    }
+
+    private static function now(): int
+    {
+        return 1700000000;
+    }
+
+    private function client(): Paylod
+    {
+        return new Paylod('mp_test_x', [
+            'webhookSecret' => self::SECRET,
+            'transport' => new MockTransport([]),
+        ]);
+    }
+
+    public function testProducesExactSchemeInHeader(): void
+    {
+        $header = Webhook::sign(self::raw(), self::SECRET, self::now());
+        $expected = hash_hmac('sha256', self::now() . '.' . self::raw(), self::SECRET);
+        $this->assertSame('t=' . self::now() . ',v1=' . $expected, $header);
+    }
+
+    public function testSignatureHeaderName(): void
+    {
+        $this->assertSame('x-webhook-signature', Webhook::SIGNATURE_HEADER);
+    }
+
+    /**
+     * SHARED GOLDEN VECTOR - the SAME secret+timestamp+body+expected-hex is pinned, byte-for-byte,
+     * in paylod-sdk (Node) and paylod-cli, and mirrors the backend signer. If any signing/verifying
+     * impl drifts, its copy of this vector fails. DO NOT edit these literals to "fix" a failure.
+     */
+    public function testMatchesSharedGoldenVector(): void
+    {
+        $goldenSecret = 'whsec_golden_vector_v1';
+        $goldenT = 1700000000;
+        $goldenBody = '{"type":"payment.success","created":1700000000,"data":{"paymentId":"pay_golden","amount":100,"phone":"254712345678"}}';
+        $goldenHeader = 't=1700000000,v1=3afe38e4c11734c84fad70dd16bbaeec6057ca998236f253be6bfa09ad2c2eb7';
+
+        $this->assertSame($goldenHeader, Webhook::sign($goldenBody, $goldenSecret, $goldenT));
+
+        // And the verifier accepts its own signer's golden output (freshness disabled - t is fixed).
+        $event = Webhook::verify($goldenBody, $goldenHeader, $goldenSecret, 0);
+        $this->assertSame('pay_golden', $event['data']['paymentId']);
+
+        // The boolean convenience form agrees.
+        $this->assertTrue(Webhook::isValid($goldenBody, $goldenHeader, $goldenSecret, 0));
+    }
+
+    public function testAcceptsValidSignatureAndReturnsEvent(): void
+    {
+        $event = Webhook::verify(self::raw(), Webhook::sign(self::raw(), self::SECRET, self::now()), self::SECRET, 300, self::now());
+        $this->assertSame('payment.success', $event['type']);
+        $this->assertSame('SFF6XYZ123', $event['data']['mpesaReceipt']);
+    }
+
+    public function testRejectsTamperedBody(): void
+    {
+        $header = Webhook::sign(self::raw(), self::SECRET, self::now());
+        $tampered = str_replace('"amount":100', '"amount":1', self::raw());
+        $this->assertNotSame(self::raw(), $tampered);
+
+        try {
+            Webhook::verify($tampered, $header, self::SECRET, 300, self::now());
+            $this->fail('expected a signature error');
+        } catch (PaylodSignatureVerificationError $e) {
+            $this->assertSame('no_match', $e->reason);
+        }
+    }
+
+    public function testRejectsWrongSecret(): void
+    {
+        $header = Webhook::sign(self::raw(), 'whsec_attacker', self::now());
+        $this->expectException(PaylodSignatureVerificationError::class);
+        $this->expectExceptionMessageMatches('/does not match/');
+        Webhook::verify(self::raw(), $header, self::SECRET, 300, self::now());
+    }
+
+    public function testRejectsStaleTimestamp(): void
+    {
+        $header = Webhook::sign(self::raw(), self::SECRET, self::now());
+        try {
+            Webhook::verify(self::raw(), $header, self::SECRET, 300, self::now() + 301);
+            $this->fail('expected a stale timestamp error');
+        } catch (PaylodSignatureVerificationError $e) {
+            $this->assertSame('stale_timestamp', $e->reason);
+        }
+    }
+
+    public function testRejectsFutureDatedTimestamp(): void
+    {
+        $header = Webhook::sign(self::raw(), self::SECRET, self::now() + 3600);
+        $this->expectException(PaylodSignatureVerificationError::class);
+        $this->expectExceptionMessageMatches('/tolerance/');
+        Webhook::verify(self::raw(), $header, self::SECRET, 300, self::now());
+    }
+
+    public function testAcceptsTimestampJustInsideTolerance(): void
+    {
+        $header = Webhook::sign(self::raw(), self::SECRET, self::now());
+        $event = Webhook::verify(self::raw(), $header, self::SECRET, 300, self::now() + 299);
+        $this->assertSame('pay_123', $event['data']['paymentId']);
+    }
+
+    public function testRejectsMissingHeader(): void
+    {
+        $this->expectException(PaylodSignatureVerificationError::class);
+        $this->expectExceptionMessageMatches('/Missing x-webhook-signature/');
+        Webhook::verify(self::raw(), null, self::SECRET);
+    }
+
+    public function testRejectsMalformedHeader(): void
+    {
+        $this->expectException(PaylodSignatureVerificationError::class);
+        $this->expectExceptionMessageMatches('/Malformed/');
+        Webhook::verify(self::raw(), 'deadbeef', self::SECRET);
+    }
+
+    public function testRefusesWhenNoSecretConfigured(): void
+    {
+        $this->expectException(PaylodSignatureVerificationError::class);
+        $this->expectExceptionMessageMatches('/signing secret/');
+        Webhook::verify(self::raw(), Webhook::sign(self::raw(), self::SECRET, self::now()), '');
+    }
+
+    public function testRejectsCorrectlySignedNonJson(): void
+    {
+        $raw = 'not json at all';
+        try {
+            Webhook::verify($raw, Webhook::sign($raw, self::SECRET, self::now()), self::SECRET, 300, self::now());
+            $this->fail('expected invalid_payload');
+        } catch (PaylodSignatureVerificationError $e) {
+            $this->assertSame('invalid_payload', $e->reason);
+        }
+    }
+
+    public function testRejectsCorrectlySignedNonEvent(): void
+    {
+        $raw = json_encode(['hello' => 'world']);
+        $this->expectException(PaylodSignatureVerificationError::class);
+        $this->expectExceptionMessageMatches('/not a paylod event/');
+        Webhook::verify($raw, Webhook::sign($raw, self::SECRET, self::now()), self::SECRET, 300, self::now());
+    }
+
+    public function testRejectsNonNumericTimestamp(): void
+    {
+        $good = Webhook::sign(self::raw(), self::SECRET, self::now());
+        $bad = preg_replace('/^t=\d+/', 't=abc', $good);
+        $this->expectException(PaylodSignatureVerificationError::class);
+        $this->expectExceptionMessageMatches('/not a number/');
+        Webhook::verify(self::raw(), $bad, self::SECRET);
+    }
+
+    public function testCanDisableFreshnessCheck(): void
+    {
+        $header = Webhook::sign(self::raw(), self::SECRET, 1); // ancient
+        $event = Webhook::verify(self::raw(), $header, self::SECRET, 0);
+        $this->assertSame('pay_123', $event['data']['paymentId']);
+    }
+
+    public function testReSerialisedBodyFails(): void
+    {
+        $spaced = json_encode(self::event(), JSON_PRETTY_PRINT);
+        $header = Webhook::sign(self::raw(), self::SECRET, self::now()); // signed over COMPACT bytes
+        $this->expectException(PaylodSignatureVerificationError::class);
+        Webhook::verify($spaced, $header, self::SECRET, 300, self::now());
+    }
+
+    public function testInstanceVerifyWebhookReturnsBool(): void
+    {
+        $paylod = $this->client();
+        $header = Webhook::sign(self::raw(), self::SECRET, time());
+        $this->assertTrue($paylod->verifyWebhook(self::raw(), $header));
+        $this->assertFalse($paylod->verifyWebhook(self::raw(), Webhook::sign(self::raw(), 'wrong', time())));
+    }
+
+    public function testInstanceParseWebhookReturnsEvent(): void
+    {
+        $paylod = $this->client();
+        $header = Webhook::sign(self::raw(), self::SECRET, time());
+        $event = $paylod->parseWebhook(self::raw(), $header);
+        $this->assertSame('pay_123', $event['data']['paymentId']);
+    }
+
+    public function testFailedEventDecodedMatchesOfflineCatalog(): void
+    {
+        $paylod = $this->client();
+        $failed = self::event();
+        $failed['type'] = 'payment.failed';
+        $failed['data']['status'] = 'failed';
+        $failed['data']['mpesaReceipt'] = null;
+        $failed['data']['resultCode'] = 1037;
+        $failed['data']['resultDesc'] = 'DS timeout';
+        $failed['data']['decoded'] = $paylod->decodeError(1037);
+
+        $raw = json_encode($failed);
+        $event = Webhook::verify($raw, Webhook::sign($raw, self::SECRET, self::now()), self::SECRET, 300, self::now());
+        $this->assertSame(
+            'The M-Pesa prompt expired before it was answered. Check your phone is on, then try again '
+            . 'and enter your PIN when it appears.',
+            $event['data']['decoded']['customerMessage']
+        );
+    }
+}
