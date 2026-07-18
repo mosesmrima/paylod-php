@@ -6,6 +6,118 @@ All notable changes to `paylod/paylod` are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-18
+
+**Breaking.** A fifth independent review found seven money-correctness defects and five mediums.
+They were real, and they are fixed here. Every protection below is verified NON-VACUOUS by
+`scripts/non-vacuity.php`, which reverts it in source and requires the guarding test to fail:
+**32/32 mutations caught** (up from 18/18). The golden webhook vector
+(`whsec_golden_vector_v1` -> `3afe38e4...2c2eb7`) still signs byte-for-byte identically.
+
+### Breaking
+
+- **`collect()` now REQUIRES a caller-persisted `idempotencyKey`.** Omitting it threw nothing
+  before: the SDK generated one and emitted a once-per-process `E_USER_WARNING`. A generated key is
+  not idempotency - it is a different value on every invocation, so it collapses nothing, and a
+  double-clicked Pay button, a refreshed tab, a redelivered queue job or a process restart each
+  raise a SEPARATE charge. The guard was therefore off by default, behind a warning that is
+  invisible in every production posture that matters (`display_errors=0`, a log nobody reads, a
+  handler that swallows `E_USER_WARNING`, or simply the second request in a worker's lifetime).
+
+  The refusal happens BEFORE any byte leaves the process, so no prompt can already be on a handset.
+  The escape hatch is explicit - `'unsafeGeneratedIdempotencyKey' => true` - and warns on EVERY
+  call, not once.
+
+- **`failed` / `cancelled` beside an in-flight result code is now `INDETERMINATE`, not
+  `in_flight`.** The record contradicts itself and the SDK no longer picks a winner. What a merchant
+  sees is unchanged: `PaymentOutcome` renders indeterminate as `pending`, so `wait()` keeps polling
+  and the webhook settles it. What changed is that the SDK stops CLAIMING to know.
+
+- **`Webhook` tolerance is now capped at `Webhook::MAX_TOLERANCE_SEC` (3600s).** A tolerance above
+  that is refused with `insecure_tolerance`.
+
+### Money correctness
+
+- **`DarajaCatalog::classifyStkResult()` matches success EXACTLY, never numerically.** It read
+  `is_numeric($raw) && $raw + 0 == 0`, and PHP's numeric-string grammar is far wider than the
+  schema's: `"0e999"`, `"+0"`, `"00"`, `"0.0"`, `"-0"`, `" 0 "` and float `-0.0` all coerced to zero
+  and classified `success`. A malformed, truncated or hostile record carrying any of them became
+  `EVIDENCE_SUCCESS`, and under `status: "success"` became **PAID** - a merchant ships goods on
+  that. Success is now identity against integer `0` or exact string equality with `"0"`. A terminal
+  code must additionally be canonically shaped (`^[1-9][0-9]*$`); anything else is `pending`, which
+  can never be paid and never retryable.
+
+- **`Semantics::judge()` has no default branch at all.** Four permissive `default` arms survived the
+  previous round. The claim is now normalised into a closed five-member alphabet by `claimFor()`,
+  and the verdict is a single `match` over the 25 `claim|evidence` pairs with **no default arm**: a
+  missing cell is an `UnhandledMatchError`, not a silent guess. Every contradiction maps to
+  `INDETERMINATE`. `SemanticsTest` walks the FULL generated cross-product and looks each pair up in
+  a pinned map, asserting both are exactly 25 entries - so a missing cell fails a test rather than
+  reaching a caller.
+
+- **A post-acknowledgement failure OVERWRITES the error's idempotency key and payment id** with the
+  acknowledgement's, via the new `PaylodException::bindToAcknowledgedPayment()`. The best-effort
+  `attach*()` semantics preserved whatever the error already carried - and an error thrown from an
+  `onPoll` callback can carry an UNRELATED charge's context. The caller then read the wrong payment,
+  concluded nothing had happened, and re-charged under a fresh key.
+
+- **Wait deadlines run on `hrtime(true)`, not `microtime()`.** The wall clock moves - an NTP step, a
+  DST transition, `date -s`. Backwards, a `wait()` hangs for as long as the clock was set back.
+  Forwards, it expires INSTANTLY and throws `PaylodTimeoutError` on a payment whose STK prompt is
+  live on the customer's handset; a caller that treats a timeout as "start again" charges twice.
+
+- **`CurlHttpClient` buffers through a bounded write callback** with an 8 MiB ceiling
+  (`MAX_RESPONSE_BYTES`), aborting the transfer as the bytes arrive rather than after. Previously
+  `CURLOPT_RETURNTRANSFER` buffered without any bound, so the peer chose the allocation size and an
+  endless body killed the process AFTER the charge had been dispatched - the worst possible moment,
+  because the natural recovery is to run it again. Overflow raises a KEYED, INDETERMINATE
+  `PaylodApiError`, deliberately not a `PaylodConnectionError`: connection errors are RETRIED.
+
+### Credential hygiene
+
+- **Wrapped exceptions no longer chain the original throwable as `previous`.** The wrapper's message
+  was carefully redacted and then the un-redacted original was attached beside it:
+  `getPrevious()->getMessage()` still held the echoed bearer token, and PHP's default
+  `__toString()` WALKS the chain and prints it into the log line the framework writes. The
+  original's trace is worse - with the development default `zend.exception_ignore_args=0` it records
+  the call arguments of the frames that were handed the credential. A sanitized surrogate carrying
+  the original's class name and its redacted message takes its place.
+
+- **`status()` redacts every field it returns.** Redaction had been an error-path measure, on the
+  reasoning that a `2xx` is "our own" data. It is not - it is bytes from the network, and the same
+  misconfigured gateway that quotes the `Authorization` header into a 400 can quote it into a 200,
+  most plausibly into `resultDesc`, which is free text handed to a caller who logs it, renders it,
+  or pastes it into a support ticket.
+
+### Laravel
+
+- **`timeout_ms` and `max_retries` are validated LEXICALLY, before any cast.** The provider cast
+  with `(int)` first, so `PAYLOD_TIMEOUT_MS=1.5` arrived at the client as a well-formed `1` - the
+  client's own guard (which exists because a truncated `0` DISABLES cURL's timeout) never saw
+  anything to complain about. The raw value is now inspected in the form the operator wrote it, and
+  a non-integral one is refused by name, naming both the config key and the environment variable.
+
+### Simulator
+
+- **`array_key_exists` rather than `isset`, and every forwarded field type-checked.** `isset()` is
+  false for a key that is PRESENT with a null value, so `['description' => null]` was silently
+  dropped from the body the idempotency layer FINGERPRINTS - letting a reused key with a changed
+  field replay in the simulator while production, which sees the difference, answers 409. A
+  simulator that disagrees with production about what a request IS teaches the wrong lesson, and
+  the lesson in question is "this cannot charge twice".
+
+### Documentation
+
+- **`SECURITY.md`** states the threat model explicitly - what is in scope (network attackers and
+  MITM, malicious API responses, cross-origin redirect credential capture, wrong-record settlement,
+  webhook forgery and replay, double-charge through idempotency mishandling, accidental credential
+  disclosure) and what is not (an adversary who can already execute code in the same PHP process,
+  host compromise, malicious dependencies already loaded). It is deliberately specific about the
+  limits of the closure-based secret storage: it resists `var_dump`, `print_r`, `var_export` and
+  serialization, but an attacker who can cast the client with `(array)` and invoke the resulting
+  closures can still recover the token. It is defence against accidental disclosure, not a security
+  boundary. Identical in substance across the paylod SDKs.
+
 ## [0.5.0] - 2026-07-18
 
 **Breaking.** Two ARCHITECTURAL roots are closed here rather than patched. Rounds 1-4 fixed

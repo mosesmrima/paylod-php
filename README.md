@@ -42,7 +42,7 @@ if ($outcome->paid) {
 
 That's the whole integration. `collectAndWait()` sends the STK prompt, polls with a sane backoff, and hands you something you can **render**.
 
-> **Pass `idempotencyKey`, and mint one per payment attempt.** Duplicates of that attempt - a double-clicked Pay button, a refreshed tab, a redelivered job - collapse into **one** prompt and **one** charge. Omit it and every call is a new charge. Do **not** key on the order or the product: that replays an old payment instead of making a new one. A retry after a wrong PIN is a new charge and needs a **new** key. See [Idempotency](#idempotency).
+> **`idempotencyKey` is REQUIRED, and you mint one per payment attempt.** Duplicates of that attempt - a double-clicked Pay button, a refreshed tab, a redelivered job - collapse into **one** prompt and **one** charge. Do **not** key on the order or the product: that replays an old payment instead of making a new one. A retry after a wrong PIN is a new charge and needs a **new** key. See [Idempotency](#idempotency).
 
 **One argument in, one renderable thing out.** You pass an API key - not a base URL, not a config object, not an OAuth token. You get back a `message` a customer can read and a `retryable` flag you can hang a button off. There is no result-code table in your app.
 
@@ -291,7 +291,11 @@ $paylod->collectAndWait(['amount' => $amount, 'phone' => $phone, 'idempotencyKey
 
 **The one case where the same key is not a safe retry:** if an earlier request under that key died mid-flight against Daraja, the key is *spent*. paylod returns a `409` **indeterminate** (`$err->isIdempotencyIndeterminate()`). That is a **stop** signal, not a retry signal - read the payment status (`$paylod->check($paymentId)`), and only if nothing happened start a new attempt with a **new** key. For money, at-most-once beats at-least-once.
 
-**If you omit the key**, the SDK generates a fresh one per call and returns it on the ack (`$ack['idempotencyKey']`) - persist it. That protects an internal network retry, but does nothing about your application sending the same logical charge twice. The SDK emits a one-time PHP warning when you omit it.
+**Omitting the key is an error.** `collect()` throws `PaylodInvalidRequestError` before any byte leaves the process, so no prompt can already be on a handset when you see it.
+
+This is deliberate, and it is a change in 0.6.0. Earlier versions generated a key for you and warned once per process. A generated key is *not* idempotency: it is a different value on every invocation, so it collapses nothing. It protects an internal network retry within a single call and nothing else - your application sending the same logical charge twice still charges twice. The guard was, in effect, off by default, behind a warning that is invisible in every production posture that matters.
+
+If you genuinely want an unprotected charge - a scratch script, never production - pass `'unsafeGeneratedIdempotencyKey' => true`. It warns on every call, and it can double-charge.
 
 ---
 
@@ -331,6 +335,19 @@ transport.
 
 Any PSR-18 client can be wrapped in an `HttpClient` in a few lines if you prefer to route through
 your existing HTTP stack in tests. It must not follow redirects.
+
+---
+
+## Security
+
+The threat model is stated explicitly in [SECURITY.md](SECURITY.md) - what this SDK defends against
+and, just as importantly, what it does not. It is honest about the limits: the closure-based secret
+storage resists `var_dump`, `print_r`, `var_export` and serialization, but an attacker who can
+already run code in your process can still recover the key by casting the client with `(array)` and
+invoking the resulting closures. That is defence against accidental disclosure, not a security
+boundary - no in-process client library can defend against hostile in-process code.
+
+Report a suspected vulnerability to **security@paylod.dev**, not via a public issue.
 
 ---
 
