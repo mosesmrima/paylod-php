@@ -12,6 +12,7 @@ use Paylod\Exceptions\PaylodInvalidRequestError;
 use Paylod\Exceptions\PaylodTimeoutError;
 use Paylod\Http\HttpClient;
 use Paylod\Http\Transport;
+use Paylod\Support\JsonLexeme;
 use Paylod\Support\Redact;
 use Paylod\Support\Uuid;
 use Paylod\Support\Validate;
@@ -291,7 +292,27 @@ final class Paylod
             $text = $res['body'];
             $parsed = null;
             if ($text !== '') {
-                $decoded = json_decode($text, true);
+                // THE RAW BYTES ARE INSPECTED FIRST. json_decode() maps `-0` and `0e999` onto the
+                // exact same values a genuine `0` produces, so the strict-zero rule downstream can
+                // no longer tell a real settlement from an impostor - the parser has already
+                // laundered it. A non-canonical resultCode token is therefore refused HERE, while
+                // the evidence still exists. See Support\JsonLexeme for the limits of the scan.
+                $badToken = JsonLexeme::nonCanonicalResultCodeToken($text);
+                if ($badToken !== null) {
+                    throw new PaylodApiError(
+                        'Refusing a paylod response because ' . JsonLexeme::explain($badToken) . '. The '
+                        . 'payment state could NOT be established from this response - treat it as '
+                        . 'unknown and re-read it; do not record it as settled either way.',
+                        (int) $res['status'],
+                        null,
+                        $idempotencyKey,
+                        true,
+                    );
+                }
+                // JSON_BIGINT_AS_STRING keeps an integer too large for PHP_INT_MAX as its exact
+                // digits instead of collapsing it into a lossy float, so the lexeme survives here
+                // too.
+                $decoded = json_decode($text, true, 512, JSON_BIGINT_AS_STRING);
                 $parsed = $decoded === null && json_last_error() !== JSON_ERROR_NONE ? $text : $decoded;
             }
 

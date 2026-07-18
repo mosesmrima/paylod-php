@@ -45,7 +45,9 @@ final class Phone
             throw new PaylodInvalidRequestError("unrecognized Kenyan phone format: {$input}");
         }
 
-        if (preg_match('/^254[17]\d{8}$/', $msisdn) !== 1) {
+        // `\z`, not `$`: PCRE's `$` also matches before a trailing newline, so "254712345678\n"
+        // would have passed as a normalised MSISDN.
+        if (preg_match('/^254[17]\d{8}\z/', $msisdn) !== 1) {
             throw new PaylodInvalidRequestError("not a valid Kenyan phone number: {$input}");
         }
 

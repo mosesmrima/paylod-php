@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Paylod;
 
 use Paylod\Exceptions\PaylodSignatureVerificationError;
+use Paylod\Support\JsonLexeme;
 use Paylod\Support\Validate;
 
 /**
@@ -125,7 +126,7 @@ final class Webhook
         // happily read "1e3", "+1000", " 1000" or a hex-ish form as a number, letting an attacker
         // present a timestamp whose textual form (which is what gets HMAC'd) differs from the value
         // we freshness-check. Digits only means the two can never diverge.
-        if (preg_match('/^[0-9]{1,19}$/', $parsed['t']) !== 1
+        if (preg_match('/^[0-9]{1,19}\z/', $parsed['t']) !== 1
             || filter_var($parsed['t'], FILTER_VALIDATE_INT) === false) {
             throw new PaylodSignatureVerificationError(
                 'malformed_signature',
@@ -151,7 +152,20 @@ final class Webhook
             );
         }
 
-        $event = json_decode($raw, true);
+        // THE RAW BYTES, BEFORE THE PARSER. A signature proves these bytes came from paylod; it says
+        // nothing about whether they are readable. `{"resultCode":-0}` decodes to the integer 0 -
+        // byte-for-byte the same value a genuine settlement produces - so the strict-zero rule in
+        // DarajaCatalog is blind to it once decoded. Checked here, after the HMAC (an unsigned body
+        // is rejected earlier and never reaches this line) and before json_decode().
+        $badToken = JsonLexeme::nonCanonicalResultCodeToken($raw);
+        if ($badToken !== null) {
+            throw new PaylodSignatureVerificationError(
+                'invalid_payload',
+                'Webhook body is signed correctly but ' . JsonLexeme::explain($badToken) . '.'
+            );
+        }
+
+        $event = json_decode($raw, true, 512, JSON_BIGINT_AS_STRING);
         if (!is_array($event)) {
             throw new PaylodSignatureVerificationError(
                 'invalid_payload',
@@ -398,7 +412,7 @@ final class Webhook
     }
 
     /** A well-formed `v1` is 64 lowercase hex chars (an HMAC-SHA256 digest). */
-    private const V1_RE = '/^[0-9a-f]{64}$/';
+    private const V1_RE = '/^[0-9a-f]{64}\z/';
 
     /**
      * Parse the signature header STRICTLY. The header is `t=<unix>,v1=<hex>` and we require EXACTLY

@@ -82,7 +82,7 @@ final class PaylodServiceProvider extends ServiceProvider
         // something plausible and wrong.
         $ok = is_int($value)
             || (is_float($value) && is_finite($value) && fmod($value, 1.0) === 0.0)
-            || (is_string($value) && preg_match('/^[+-]?[0-9]+$/', trim($value)) === 1);
+            || (is_string($value) && preg_match('/^[+-]?[0-9]+\z/', trim($value)) === 1);
 
         if (!$ok) {
             throw new \Paylod\Exceptions\PaylodConfigError(

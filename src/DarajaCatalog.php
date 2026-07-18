@@ -78,14 +78,43 @@ final class DarajaCatalog
         return self::$pendingCodes;
     }
 
-    /** Normalize a ResultCode that Daraja may send as a string OR a number (defensive). */
-    private static function normalizeCode(mixed $resultCode): string
+    /**
+     * The ResultCode's LEXEME - its original bytes, with NOTHING normalised away.
+     *
+     * -- Why this is not a normaliser -----------------------------------------------------------
+     * This function used to be `trim((string) $resultCode)`, and that single line defeated every
+     * check downstream of it. The exact-zero test below is correct; it was simply never shown the
+     * value the server actually sent. `" 0"` was trimmed to `"0"` and classified SUCCESS. The float
+     * `0.0` was stringified to `"0"` and classified SUCCESS. `" 1032"` was trimmed to `"1032"`,
+     * matched the canonical non-zero regex, and was LAUNDERED into a terminal cancellation - which
+     * the catalog marks retryable, i.e. the SDK told a merchant to charge the customer again on the
+     * strength of a code it had itself rewritten.
+     *
+     * A validator that runs after a normaliser does not validate the input; it validates the
+     * normaliser's output, and an impostor that the normaliser has already converted into canonical
+     * form is indistinguishable from the real thing. So the ORDER is inverted here: the original
+     * bytes survive, and every rule below is applied to them.
+     *
+     *   - An INT is its own canonical decimal form: `(string) $int` invents nothing.
+     *   - A STRING is returned VERBATIM. No trim, no case folding, no re-encoding.
+     *   - A FLOAT has NO lexeme. There is no lossless, unambiguous rendering of a float back to the
+     *     token the sender wrote (`0.0`, `-0.0`, `1032.0` and `1.0e3` all collapse), and the schema
+     *     defines no float ResultCode at all. Anything float-typed is therefore unreadable, and
+     *     unreadable is `pending` - never success, never terminal.
+     *   - Every other type (bool, null, array, object) is likewise unreadable. In particular
+     *     `false`, which `(string)` renders as `""` and `true`, which renders as `"1"` - a code
+     *     that would otherwise have been read as a real terminal failure.
+     */
+    private static function lexeme(mixed $resultCode): string
     {
-        if ($resultCode === null) {
-            return '';
+        if (is_int($resultCode)) {
+            return (string) $resultCode;
+        }
+        if (is_string($resultCode)) {
+            return $resultCode;
         }
 
-        return trim((string) $resultCode);
+        return '';
     }
 
     /**
@@ -96,7 +125,7 @@ final class DarajaCatalog
      */
     public static function classifyStkResult(mixed $resultCode, ?string $resultDesc = null): string
     {
-        $raw = self::normalizeCode($resultCode);
+        $raw = self::lexeme($resultCode);
         $desc = trim($resultDesc ?? '');
 
         // A terminal 500.* config error must not be mistaken for "still processing".
@@ -119,12 +148,16 @@ final class DarajaCatalog
         // merchant ships goods on that.
         //
         // The schema defines exactly one zero: the JSON number `0`, which Daraja may also send as
-        // the string "0". Those, and nothing else. The test is IDENTITY against the integer 0, or
-        // exact string equality with "0" after trimming - never `==`, never `is_numeric`, never
-        // arithmetic. Note that this also excludes the float negative zero: `-0.0 === 0.0` is TRUE
-        // in PHP, so a float comparison would have let `-0.0` through, while its string form "-0"
-        // does not match. (A plain `0.0` still succeeds, because it stringifies to "0".)
-        if ($resultCode === 0 || $raw === '0') {
+        // the string "0". Those, and nothing else.
+        //
+        // The comparison is made against the LEXEME - the sender's own bytes - precisely so that no
+        // earlier layer can manufacture a match. `" 0"` is not `"0"`; it is a four-byte string the
+        // schema does not define, and it stays that way all the way to this line. Floats have no
+        // lexeme at all, so `0.0`, `-0.0` and every other float-typed code fail here by
+        // construction rather than by a string-form coincidence.
+        //
+        // Never `==`, never `is_numeric`, never arithmetic, and now also never `trim`.
+        if ($raw === '0') {
             return 'success';
         }
 
@@ -133,7 +166,11 @@ final class DarajaCatalog
         // numeric ("0e999", "+1", "01", "1.0", "-1") is a representation the schema does not
         // define, so we do not know what it means - and "we do not know" is never a terminal
         // failure, because a terminal failure is what tells a merchant it is safe to charge again.
-        if (preg_match('/^[1-9][0-9]*$/', $raw) === 1) {
+        // ANCHORED WITH `\z`, NOT `$`. In PCRE, `$` also matches immediately BEFORE a trailing
+        // newline, so `/^[1-9][0-9]*$/` accepted "1032\n" as canonical - a padded code laundered
+        // into the real, RETRYABLE 1032 entry by the regex itself, with no trim() involved. `\z`
+        // means the true end of the subject and nothing else.
+        if (preg_match('/^[1-9][0-9]*\z/', $raw) === 1) {
             // A known-numeric, non-zero code is terminal - UNLESS the description says otherwise
             // (guards against a new "still processing" code we haven't catalogued yet).
             return preg_match(self::PENDING_DESC_RE, $desc) === 1 ? 'pending' : 'failed';
@@ -225,7 +262,11 @@ final class DarajaCatalog
      */
     public static function decode(mixed $resultCode, ?string $rawDesc = null, string $family = 'stk_result'): array
     {
-        $code = self::normalizeCode($resultCode);
+        // The LEXEME, not a normalised form: a catalog lookup that trims (or stringifies a float)
+        // would resolve `" 1032"` / `1032.0` to the real 1032 entry and hand back its `retryable`
+        // flag, which is the same laundering the classifier refuses. An unreadable code has no
+        // entry, and the fallbacks below are non-retryable.
+        $code = self::lexeme($resultCode);
 
         // An ABSENT code is not evidence of an in-flight payment - it is simply unknown.
         if ($code === '') {

@@ -187,7 +187,11 @@ final class DarajaCatalogTest extends TestCase
      */
     public static function schemaZeroProvider(): array
     {
-        return ['int zero' => [0], 'float zero' => [0.0], 'string zero' => ['0'], 'padded string zero' => ['  0  ']];
+        // EXACTLY TWO. The JSON number 0, and the string "0". `0.0` and `"  0  "` used to be listed
+        // here as schema-approved, which made this suite enforce the OPPOSITE of the rule: it
+        // required the classifier to accept a float and a padded string as proof money moved, so the
+        // normalise-before-validate defect was not merely uncaught, it was mandated.
+        return ['int zero' => [0], 'string zero' => ['0']];
     }
 
     /** @dataProvider schemaZeroProvider */
@@ -217,6 +221,19 @@ final class DarajaCatalogTest extends TestCase
             'decimal zero long' => ['0.00000'],
             'hex-ish zero' => ['0x0'],
             'float negative zero' => [-0.0],
+            // Promoted OUT of the schema-approved provider. Each of these is an impostor that an
+            // earlier normalisation step converted into the canonical "0" before the exact-zero
+            // check could see it.
+            'float zero' => [0.0],
+            'padded string zero' => ['  0  '],
+            'left-padded string zero' => [' 0'],
+            'right-padded string zero' => ['0 '],
+            'tab-padded string zero' => ["\t0"],
+            'newline-padded string zero' => ["0\n"],
+            // `(string) false` is "" and `(string) true` is "1" - a boolean would otherwise be read
+            // as an absent code or as a real terminal failure.
+            'boolean false' => [false],
+            'boolean true' => [true],
         ];
     }
 
@@ -248,6 +265,14 @@ final class DarajaCatalogTest extends TestCase
         foreach (['+1032', '01032', '1032.0', '1.032e3', ' -1032'] as $code) {
             $this->assertSame('pending', DarajaCatalog::classifyStkResult($code), "code {$code}");
         }
+        // PADDING IS NOT CANONICALISATION. A trim before the canonical-form check laundered these
+        // into the real 1032 - a cancellation the catalog marks RETRYABLE - so a hostile or
+        // corrupted record could talk the SDK into inviting a second charge.
+        foreach ([' 1032', '1032 ', "\t1032", "1032\n", ' 1032 '] as $code) {
+            $this->assertSame('pending', DarajaCatalog::classifyStkResult($code), "padded code {$code}");
+        }
+        // A float-typed code has no lexeme and is therefore unreadable, never terminal.
+        $this->assertSame('pending', DarajaCatalog::classifyStkResult(1032.0));
         // The canonical form still classifies exactly as it always did.
         $this->assertSame('failed', DarajaCatalog::classifyStkResult('1032'));
         $this->assertSame('failed', DarajaCatalog::classifyStkResult(1032));
@@ -275,5 +300,131 @@ final class DarajaCatalogTest extends TestCase
                 );
             }
         }
+    }
+
+    /**
+     * END TO END, through the STATUS surface a merchant actually reads: a fake zero beside a
+     * `status: "success"` must render as unsettled, never as a paid payment with a decoded success.
+     */
+    public function testAFakeZeroNeverRendersAsPaidThroughPaymentOutcome(): void
+    {
+        foreach (self::fakeZeroProvider() as $name => [$code]) {
+            $outcome = \Paylod\PaymentOutcome::fromPayment([
+                'id' => 'pay_1',
+                'status' => 'success',
+                'mpesaReceipt' => null,
+                'resultCode' => $code,
+                'resultDesc' => null,
+            ]);
+            $this->assertFalse($outcome->paid, "{$name} rendered as PAID through PaymentOutcome");
+            $this->assertFalse($outcome->retryable, "{$name} rendered as RETRYABLE through PaymentOutcome");
+        }
+    }
+
+    /**
+     * The RAW JSON LEXEMES that `json_decode()` launders into a genuine zero.
+     *
+     * These are written as raw tokens rather than PHP values on purpose: a PHP float `0.0`
+     * SERIALISES to the wire token `0`, which really is the schema's canonical zero, so it cannot
+     * express this attack. The attack lives in bytes that a merchant's HTTP server receives and that
+     * the parser then collapses - `-0` and `0e999` both decode to the exact value a real `0`
+     * produces, and after that no downstream check can tell them apart.
+     *
+     * @return array<string,array{0:string}>
+     */
+    public static function rawZeroLexemeProvider(): array
+    {
+        return [
+            'negative zero token' => ['-0'],
+            'exponent zero token' => ['0e999'],
+            'exponent zero token uppercase' => ['0E5'],
+            'decimal zero token' => ['0.0'],
+            'decimal zero token long' => ['0.00000'],
+            'negative decimal zero token' => ['-0.0'],
+            'negative exponent zero token' => ['-0e3'],
+        ];
+    }
+
+    /**
+     * And through the WEBHOOK surface: a correctly signed `payment.success` whose only evidence is a
+     * laundered zero must be refused, not handed to a fulfilment handler.
+     *
+     * @dataProvider rawZeroLexemeProvider
+     */
+    public function testARawZeroLexemeNeverPassesWebhookVerification(string $token): void
+    {
+        $secret = 'whsec_test';
+        $now = 1750000000;
+
+        // Assembled as BYTES. Round-tripping through json_encode() would destroy the very lexeme
+        // under test.
+        $raw = '{"type":"payment.success","created":' . $now
+            . ',"data":{"paymentId":"pay_1","status":"success","mpesaReceipt":null,"resultCode":'
+            . $token . ',"resultDesc":null}}';
+
+        try {
+            \Paylod\Webhook::verify($raw, \Paylod\Webhook::sign($raw, $secret, $now), $secret, 300, $now);
+            $this->fail("raw token {$token} was accepted as a verified payment.success");
+        } catch (\Paylod\Exceptions\PaylodSignatureVerificationError $e) {
+            $this->assertSame('invalid_payload', $e->reason, $token);
+            $this->assertStringContainsString('non-canonical resultCode token', $e->getMessage());
+        }
+    }
+
+    /**
+     * WHY THE RAW SCAN IS NECESSARY AND NOT MERELY BELT-AND-BRACES.
+     *
+     * `-0` is the case the type-level rules cannot reach. It decodes to the PHP INTEGER `0` - not a
+     * float, not a string, but the identical value a genuine settlement produces - so after parsing
+     * there is no property of the value left to test. Every other laundered token decodes to a
+     * float, which the lexeme rule already refuses because a float carries no lexeme.
+     */
+    public function testNegativeZeroDecodesIndistinguishablyFromARealZero(): void
+    {
+        $laundered = json_decode('{"resultCode":-0}', true)['resultCode'];
+        $genuine = json_decode('{"resultCode":0}', true)['resultCode'];
+
+        $this->assertSame(0, $laundered);
+        $this->assertSame($genuine, $laundered, 'the decoded values are indistinguishable by design');
+        // So the classifier - correctly, given what it is handed - calls it a success. The ONLY
+        // place the two can still be told apart is the raw body, which is why the guard lives there.
+        $this->assertSame('success', DarajaCatalog::classifyStkResult($laundered));
+        $this->assertSame('-0', \Paylod\Support\JsonLexeme::nonCanonicalResultCodeToken('{"resultCode":-0}'));
+        $this->assertNull(\Paylod\Support\JsonLexeme::nonCanonicalResultCodeToken('{"resultCode":0}'));
+    }
+
+    /** The genuine canonical zero still verifies - the guard must not reject real settlements. */
+    public function testTheCanonicalZeroLexemeStillVerifies(): void
+    {
+        $secret = 'whsec_test';
+        $now = 1750000000;
+        $raw = '{"type":"payment.success","created":' . $now
+            . ',"data":{"paymentId":"pay_1","status":"success","mpesaReceipt":"SFF6XYZ123","resultCode":0'
+            . ',"resultDesc":"Success"}}';
+
+        $event = \Paylod\Webhook::verify($raw, \Paylod\Webhook::sign($raw, $secret, $now), $secret, 300, $now);
+        $this->assertSame('pay_1', $event['data']['paymentId']);
+    }
+
+    /**
+     * A PADDED TERMINAL code must not be laundered into the catalog entry it resembles. 1032 is
+     * `retryable: true`; " 1032" is a code we cannot read, and an unreadable code is never an
+     * invitation to charge again.
+     */
+    public function testAPaddedTerminalCodeIsNeverDecodedAsTheRetryableEntry(): void
+    {
+        foreach ([' 1032', '1032 ', ' 1032 '] as $code) {
+            $d = DarajaCatalog::decode($code);
+            $this->assertFalse($d['retryable'], "padded code '{$code}' decoded as retryable");
+            $this->assertNotSame(
+                'Payment cancelled by the customer',
+                $d['title'],
+                "padded code '{$code}' resolved to the real 1032 entry"
+            );
+        }
+        // The canonical form is untouched: it still decodes to the real, retryable entry.
+        $canonical = DarajaCatalog::decode('1032');
+        $this->assertTrue($canonical['retryable']);
+        $this->assertSame('Payment cancelled by the customer', $canonical['title']);
     }
 }
