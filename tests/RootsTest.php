@@ -200,6 +200,27 @@ final class RootsTest extends TestCase
         $paylod->collect(['amount' => 1, 'phone' => '0712345678', 'idempotencyKey' => 'k1']);
     }
 
+    /**
+     * The RENDERING half of the same rule. judge() saying "indeterminate" is only useful if
+     * PaymentOutcome renders it as one - this is the exact shape that used to come back as
+     * `cancelled, retryable: true` and invite a second charge for a payment carrying a receipt.
+     */
+    public function testChangedAFailedRowCarryingAReceiptIsNeverRetryable(): void
+    {
+        [$paylod] = $this->client([[
+            'status' => 200,
+            'json' => [
+                'id' => 'pay_1', 'status' => 'failed',
+                'mpesaReceipt' => 'SFF6XYZ123', 'resultCode' => 1032,
+            ],
+        ]]);
+
+        $outcome = $paylod->check('pay_1');
+        $this->assertFalse($outcome->retryable, 'THE double-charge bug: never invite a second charge');
+        $this->assertFalse($outcome->paid);
+        $this->assertSame('pending', $outcome->status, 'indeterminate renders as pending so wait() keeps polling');
+    }
+
     // == The PHP-specific findings =============================================================
 
     /**
