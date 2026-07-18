@@ -26,8 +26,9 @@ class PaylodApiError extends PaylodException
         mixed $body = null,
         ?string $idempotencyKey = null,
         bool $indeterminate = false,
+        ?\Throwable $previous = null,
     ) {
-        parent::__construct($message, $status);
+        parent::__construct($message, $status, $previous);
         $this->status = $status;
         $this->body = $body;
         // `idempotencyKey` lives on the base class so a failed collect() can attach it to ANY error.

@@ -11,7 +11,9 @@ use Paylod\Exceptions\PaylodInvalidRequestError;
 use Paylod\Exceptions\PaylodTimeoutError;
 use Paylod\Http\CurlTransport;
 use Paylod\Http\Transport;
+use Paylod\Support\Redact;
 use Paylod\Support\Uuid;
+use Paylod\Support\Validate;
 
 /**
  * The paylod API client.
@@ -62,11 +64,18 @@ final class Paylod
     /**
      * @param string|array<string,mixed>|null $apiKey Your mp_live_... / mp_test_... key. Omit it to
      *   read PAYLOD_API_KEY from the environment. Pass an options array to use the object form.
+     *   Marked #[\SensitiveParameter] so the key is rendered as a placeholder in every stack trace
+     *   this frame appears in - without it, any uncaught exception anywhere below the constructor
+     *   prints a live money-moving key into the application log (PHP records call arguments in
+     *   traces whenever zend.exception_ignore_args=0, which is the default in development).
      * @param array<string,mixed> $options Escape hatches: baseUrl, webhookSecret, timeoutMs,
-     *   maxRetries, simulate, transport.
+     *   maxRetries, simulate, transport. Also sensitive: it carries webhookSecret (and apiKey, in
+     *   the object form).
      */
-    public function __construct(string|array|null $apiKey = null, array $options = [])
-    {
+    public function __construct(
+        #[\SensitiveParameter] string|array|null $apiKey = null,
+        #[\SensitiveParameter] array $options = [],
+    ) {
         if (is_array($apiKey)) {
             $options = $apiKey;
             $apiKey = null;
@@ -97,7 +106,7 @@ final class Paylod
         // A zero/negative timeout would DISABLE cURL's timeout - reject it rather than ship a client
         // that can hang forever.
         $this->timeoutMs = self::assertPositiveTimeoutMs($options['timeoutMs'] ?? self::DEFAULT_TIMEOUT_MS, 'timeoutMs');
-        $this->maxRetries = max(0, (int) ($options['maxRetries'] ?? self::DEFAULT_MAX_RETRIES));
+        $this->maxRetries = self::assertMaxRetries($options['maxRetries'] ?? self::DEFAULT_MAX_RETRIES);
         $this->transport = $options['transport'] ?? new CurlTransport();
 
         // Simulator mode is a TEST posture, so it is fenced off from production at CONSTRUCTION time.
@@ -164,10 +173,14 @@ final class Paylod
             $perRequestTimeout = $this->timeoutMs;
             $remaining = self::remaining($deadlineMs);
             if ($remaining !== null) {
-                if ($remaining <= 0) {
-                    break; // out of time - surface the last error / a timeout below
+                if ($remaining <= 0 && $attempt > 0) {
+                    break; // out of retries' time - surface the last error / a timeout below
                 }
-                $perRequestTimeout = min($perRequestTimeout, $remaining);
+                // The FIRST attempt always goes out, even against an already-expired deadline: an
+                // operation that returns "failed" without having tried once is indistinguishable
+                // from one that tried and lost, and on a money path those need different handling.
+                // (A 0 here would DISABLE the transport timeout, hence the floor of 1ms.)
+                $perRequestTimeout = max(1, min($perRequestTimeout, $remaining));
             }
 
             $headers = [
@@ -213,7 +226,12 @@ final class Paylod
                 ? $parsed['error']
                 : "paylod responded {$status}";
 
-            $apiError = new PaylodApiError($message, $status, $parsed, $idempotencyKey);
+            // A server error body is NOT trusted text: a misconfigured gateway that echoes the
+            // request (or a 400 that quotes the Authorization header) would otherwise carry the live
+            // API key straight into an exception message and the application's error log. Redact
+            // BEFORE the error object exists, so no un-redacted copy is ever constructed.
+            $message = $this->redact($message);
+            $apiError = new PaylodApiError($message, $status, $this->redact($parsed), $idempotencyKey);
 
             // 429 / transient 5xx are retried. A 409 is retried ONLY when it is explicitly "same key
             // still in progress" - every other 409 (body conflict, indeterminate) is a real answer.
@@ -225,7 +243,7 @@ final class Paylod
 
             $lastError = $apiError;
             // Honour Retry-After (delta-seconds OR HTTP-date), clamped to 10s and the operation deadline.
-            $retryAfterMs = self::parseRetryAfterMs($res['headers']['retry-after'] ?? null);
+            $retryAfterMs = self::parseRetryAfterMs($res['headers']);
             if ($retryAfterMs !== null && $retryAfterMs > 0) {
                 self::boundedSleepMs(min($retryAfterMs, 10000), $deadlineMs);
             }
@@ -304,7 +322,7 @@ final class Paylod
         } else {
             // A caller-supplied key is the double-charge guard - reject a blank/whitespace/control-char
             // one loudly rather than silently drop protection. A generated key is always well-formed.
-            self::assertValidIdempotencyKey($params['idempotencyKey']);
+            Validate::idempotencyKey($params['idempotencyKey']);
         }
         $idempotencyKey = $params['idempotencyKey'] ?? Uuid::v4();
 
@@ -333,21 +351,12 @@ final class Paylod
                 ];
             }
 
-            // A 2xx with no payment id is INDETERMINATE: the charge may have moved. Fail with the key
-            // attached rather than hand back an empty id a caller would treat as a new payment.
+            // A malformed 2xx is INDETERMINATE: the charge may have moved. The WHOLE ack schema is
+            // checked - a blank checkoutRequestId or a missing/mistyped status is just as unusable as
+            // a missing paymentId, and returning any of them as "success" hands the caller a shape it
+            // will treat as a new payment and retry under a fresh key.
             $ack = $this->request('POST', '/collect', $body, $idempotencyKey, null, function (array $parsed, int $status) use ($idempotencyKey): void {
-                $id = $parsed['paymentId'] ?? null;
-                if (!is_string($id) || trim($id) === '') {
-                    throw new PaylodApiError(
-                        'paylod returned a 2xx response with no paymentId - the charge state is '
-                        . 'INDETERMINATE. Read the payment with this idempotencyKey before starting any '
-                        . 'new attempt; do NOT mint a fresh key (that risks a second charge).',
-                        $status,
-                        $parsed,
-                        $idempotencyKey,
-                        true,
-                    );
-                }
+                Validate::collectAck($parsed, $status, $idempotencyKey, $this->redactor());
             });
 
             return [
@@ -378,15 +387,10 @@ final class Paylod
         }
 
         $p = $this->request('GET', '/status/' . rawurlencode($paymentId), null, null, $deadlineMs, function (array $parsed, int $status): void {
-            // A 2xx status body with no id is malformed - surface it rather than return an empty Payment.
-            $id = $parsed['id'] ?? null;
-            if (!is_string($id) || trim($id) === '') {
-                throw new PaylodApiError(
-                    'paylod returned a 2xx status body with no payment id (malformed response).',
-                    $status,
-                    $parsed,
-                );
-            }
+            // The FULL payment schema, including the rule that a `success` must carry evidence (a
+            // receipt or result code 0) - the status string on its own is a claim, not a proof, and
+            // shipping goods against an evidence-free claim loses real money.
+            Validate::paymentBody($parsed, $status, $this->redactor());
         });
 
         return [
@@ -418,12 +422,7 @@ final class Paylod
      */
     public function wait(string $paymentId, array $options = []): PaymentOutcome
     {
-        // Same rule as the client timeout: a non-positive wait budget would mean "wait forever".
-        $timeoutMs = self::assertPositiveTimeoutMs(
-            $options['timeoutMs'] ?? self::DEFAULT_WAIT_TIMEOUT_MS,
-            'wait() timeoutMs'
-        );
-        $onPoll = $options['onPoll'] ?? null;
+        [$timeoutMs, $onPoll] = self::parseWaitOptions($options);
         $startedAt = self::nowMs();
         $deadline = $startedAt + $timeoutMs;
 
@@ -460,9 +459,43 @@ final class Paylod
      */
     public function collectAndWait(array $params, array $options = []): PaymentOutcome
     {
+        // Validate the WAIT options BEFORE the charge is dispatched. Doing it inside wait() meant a
+        // typo'd timeoutMs threw only AFTER the STK prompt was already on the customer's phone -
+        // a validation error the caller reads as "nothing happened", when in fact a payment exists.
+        self::parseWaitOptions($options);
+
         $ack = $this->collect($params);
 
-        return $this->wait($ack['paymentId'], $options);
+        try {
+            return $this->wait($ack['paymentId'], $options);
+        } catch (\Throwable $e) {
+            // EVERYTHING past the acknowledgement is caught here - a timeout, a transport failure, an
+            // HTTP error, a malformed poll body. The payment EXISTS by this point, so an error that
+            // does not carry the effective idempotency key is a double-charge waiting to happen: the
+            // caller retries collectAndWait(), the SDK mints a FRESH key, and the customer is charged
+            // twice for one order. The key (and the payment id) must ride out on the exception.
+            if ($e instanceof \Paylod\Exceptions\PaylodException) {
+                $e->attachIdempotencyKey($ack['idempotencyKey']);
+                $e->attachPaymentId($ack['paymentId']);
+                throw $e;
+            }
+
+            // A non-paylod throwable (an injected transport's own exception, a callback's error)
+            // cannot carry the key, so it is WRAPPED in one that can rather than escaping bare.
+            $wrapped = new PaylodApiError(
+                'The payment was accepted but the wait failed: ' . $this->redact($e->getMessage())
+                . ' - the payment EXISTS. Read it with the attached paymentId / idempotencyKey; do '
+                . 'NOT retry with a fresh key (that risks a second charge).',
+                0,
+                null,
+                $ack['idempotencyKey'],
+                true,
+                $e,
+            );
+            $wrapped->attachPaymentId($ack['paymentId']);
+
+            throw $wrapped;
+        }
     }
 
     /**
@@ -486,7 +519,7 @@ final class Paylod
     public function verifyWebhook(
         string $rawBody,
         ?string $signatureHeader,
-        ?string $secret = null,
+        #[\SensitiveParameter] ?string $secret = null,
         int|float $toleranceSec = Webhook::DEFAULT_TOLERANCE_SEC,
     ): bool {
         return Webhook::isValid($rawBody, $signatureHeader, $secret ?? $this->webhookSecret ?? '', $toleranceSec);
@@ -501,13 +534,73 @@ final class Paylod
     public function parseWebhook(
         string $rawBody,
         ?string $signatureHeader,
-        ?string $secret = null,
+        #[\SensitiveParameter] ?string $secret = null,
         int|float $toleranceSec = Webhook::DEFAULT_TOLERANCE_SEC,
     ): array {
         return Webhook::verify($rawBody, $signatureHeader, $secret ?? $this->webhookSecret ?? '', $toleranceSec);
     }
 
     // -- Internals ------------------------------------------------------------
+
+    /**
+     * What print_r()/var_dump()/var_export-style debugging actually shows for this object.
+     *
+     * PHP dumps PRIVATE properties too, so without this a single `print_r($paylod)` in a debug
+     * branch - or a framework's exception page, or a queue worker logging its job payload - prints
+     * the live API key and the webhook secret verbatim. Only masked prefixes are exposed here:
+     * enough to tell "wrong environment" at a glance, never enough to use.
+     *
+     * @return array<string,mixed>
+     */
+    public function __debugInfo(): array
+    {
+        return [
+            'apiKey' => Redact::mask($this->apiKey),
+            'webhookSecret' => Redact::mask($this->webhookSecret),
+            'baseUrl' => $this->baseUrl,
+            'timeoutMs' => $this->timeoutMs,
+            'maxRetries' => $this->maxRetries,
+            'simulate' => $this->simulate,
+            'transport' => get_class($this->transport),
+        ];
+    }
+
+    /** The secrets this client holds, for scrubbing out of anything about to be thrown or logged. */
+    private function redact(mixed $value): mixed
+    {
+        return Redact::apply($value, [$this->apiKey, $this->webhookSecret]);
+    }
+
+    /** The same scrubbing, as a callable the validators can apply to an error body. */
+    private function redactor(): \Closure
+    {
+        return fn (mixed $value): mixed => $this->redact($value);
+    }
+
+    /**
+     * Validate wait options and return [timeoutMs, onPoll].
+     *
+     * Split out so `collectAndWait()` can run it BEFORE dispatching the charge: a bad wait option is
+     * a programmer error, and a programmer error must never be reported after a customer's phone has
+     * already rung.
+     *
+     * @param array<string,mixed> $options
+     * @return array{0:int,1:?callable}
+     */
+    private static function parseWaitOptions(array $options): array
+    {
+        // Same rule as the client timeout: a non-positive wait budget would mean "wait forever".
+        $timeoutMs = self::assertPositiveTimeoutMs(
+            $options['timeoutMs'] ?? self::DEFAULT_WAIT_TIMEOUT_MS,
+            'wait() timeoutMs'
+        );
+        $onPoll = $options['onPoll'] ?? null;
+        if ($onPoll !== null && !is_callable($onPoll)) {
+            throw new PaylodConfigError('wait() onPoll must be callable.');
+        }
+
+        return [$timeoutMs, $onPoll];
+    }
 
     private static function warnMissingIdempotencyKey(): void
     {
@@ -639,9 +732,21 @@ final class Paylod
                 . 'negative timeout disables the timeout entirely, so a hung request would never return.'
             );
         }
-        if ($ms > self::MAX_TIMEOUT_MS) {
+        // A FRACTIONAL timeout is the nastiest form of this bug: 0.5 is "greater than 0", passes
+        // every bound below, and then (int) truncates it to 0 - which is precisely the value that
+        // DISABLES cURL's timeout. A caller asking for half a millisecond would get an indefinite
+        // hang. Whole milliseconds only, and they must be exactly representable as an int.
+        if (fmod($ms, 1.0) !== 0.0) {
             throw new PaylodConfigError(
-                "{$label} must be at most " . self::MAX_TIMEOUT_MS . ' ms.'
+                "{$label} must be a WHOLE number of milliseconds (got " . var_export($value, true)
+                . '). A fractional value truncates towards zero, and a truncated 0 disables the '
+                . 'timeout entirely - the opposite of what you asked for.'
+            );
+        }
+        if ($ms < 1 || $ms > self::MAX_TIMEOUT_MS) {
+            throw new PaylodConfigError(
+                "{$label} must be between 1 and " . self::MAX_TIMEOUT_MS . ' ms (got '
+                . var_export($value, true) . ').'
             );
         }
 
@@ -649,69 +754,58 @@ final class Paylod
     }
 
     /**
-     * Reject an idempotency key that would silently drop double-charge protection: blank/whitespace
-     * keys, keys carrying control characters (which also cannot go in an HTTP header), and absurdly
-     * long values. A caller-supplied key is the ONE thing standing between a double-click and a
-     * double-charge, so a bad one must fail loudly rather than be quietly accepted.
+     * Retries are BOUNDED. The backoff is exponential (250ms * 2^n), so an unbounded maxRetries does
+     * not just retry a lot - it sleeps for geometrically growing stretches: attempt 20 alone would
+     * wait over a day. A request budget is a config value, not a licence to hang a worker forever.
      */
-    private static function assertValidIdempotencyKey(mixed $key): void
+    private const MAX_RETRIES_LIMIT = 10;
+
+    private static function assertMaxRetries(mixed $value): int
     {
-        if (!is_string($key) || trim($key) === '') {
-            throw new PaylodInvalidRequestError(
-                'idempotencyKey must be a non-empty, non-whitespace string - a blank key silently drops '
-                . 'double-charge protection.'
+        if (is_bool($value) || (!is_int($value) && !(is_float($value) && is_finite($value) && fmod($value, 1.0) === 0.0))) {
+            throw new PaylodConfigError('maxRetries must be a whole number between 0 and ' . self::MAX_RETRIES_LIMIT . '.');
+        }
+        $n = (int) $value;
+        if ($n < 0 || $n > self::MAX_RETRIES_LIMIT) {
+            throw new PaylodConfigError(
+                "maxRetries must be between 0 and " . self::MAX_RETRIES_LIMIT . " (got {$n}). The "
+                . 'backoff between attempts doubles each time, so an unbounded retry count means '
+                . 'unbounded sleeping, not merely more attempts.'
             );
         }
-        // Bound the BYTE length: this goes out as an HTTP header value, and header sizes are bytes.
-        if (strlen($key) > 255) {
-            throw new PaylodInvalidRequestError('idempotencyKey must be 255 bytes or fewer.');
-        }
-        // The Unicode classes below are only meaningful over well-formed UTF-8. Invalid UTF-8 in a
-        // header value is itself a bug, so reject it rather than fall back to a byte-wise check.
-        if (preg_match('//u', $key) !== 1) {
-            throw new PaylodInvalidRequestError('idempotencyKey must be valid UTF-8.');
-        }
-        // The FULL control ranges: C0 (U+0000-U+001F), DEL (U+007F) and C1 (U+0080-U+009F). All are
-        // illegal in an HTTP header value, and a C1 byte pair sneaking through a byte-only C0 check
-        // was how a mangled key used to be accepted silently.
-        if (preg_match('/[\x{0000}-\x{001F}\x{007F}-\x{009F}]/u', $key) === 1) {
-            throw new PaylodInvalidRequestError(
-                'idempotencyKey must not contain control characters (tabs, newlines, NULs, and the '
-                . 'C1 range).'
-            );
-        }
-        // Unicode-only whitespace: NBSP, ideographic space, the line/paragraph separators and the BOM
-        // all survive trim() (which only strips ASCII), so "\u{00A0}" used to pass as a "real" key
-        // while being invisible - and two visually identical keys would be two different charges.
-        if (preg_match('/[^\P{Z}\x{0020}]|[\x{FEFF}\x{180E}]/u', $key) === 1) {
-            throw new PaylodInvalidRequestError(
-                'idempotencyKey must not contain Unicode-only whitespace (non-breaking space, '
-                . 'ideographic space, BOM, line/paragraph separators). Use plain ASCII.'
-            );
-        }
-        // Finally: PRINTABLE ASCII only (0x20-0x7E). HTTP header values are ASCII on the wire
-        // (RFC 9110), so a printable non-ASCII character like the accented e in "ordr-cafe-1" is not
-        // merely exotic - it is unrepresentable. It either blows up in the transport as an opaque
-        // encoding error, or (worse, on a laxer stack) gets silently re-encoded, so two requests that
-        // were meant to carry ONE key no longer do and the duplicate-charge guard quietly vanishes.
-        if (preg_match('/[^\x20-\x7e]/', $key) === 1) {
-            throw new PaylodInvalidRequestError(
-                'idempotencyKey must be printable ASCII only (letters, digits and punctuation in the '
-                . 'range 0x20-0x7E). HTTP header values are ASCII on the wire, so an accented or '
-                . 'non-Latin character cannot be sent reliably - and a silently re-encoded key stops '
-                . 'matching the retry it was meant to deduplicate. Derive the key from an id you '
-                . 'control (a UUID, or your order id slugged to ASCII).'
-            );
-        }
+
+        return $n;
     }
 
     /**
-     * Parse a Retry-After header value into milliseconds. Accepts BOTH forms the RFC allows: a
-     * delta-seconds integer ("5") and an HTTP-date ("Wed, 21 Oct 2015 07:28:00 GMT"). Returns null
-     * when absent/unparseable, and never a negative delay.
+     * Parse the Retry-After response header into milliseconds.
+     *
+     * Three things were wrong with the previous version, all of them reachable from a response an
+     * upstream proxy can shape:
+     *
+     *  - The header was looked up by the EXACT key `retry-after`. Header names are case-insensitive
+     *    (RFC 9110), so a transport that preserved `Retry-After` made the SDK silently ignore a
+     *    server's explicit back-off instruction and hammer it on the fixed schedule instead.
+     *  - `ctype_digit` accepts arbitrarily many digits, and `(int) $value * 1000` on a 30-digit
+     *    number overflows to a float - which then raised a TypeError on the `int` return, turning a
+     *    retryable 429 into a crash mid-payment.
+     *  - `strtotime()` is permissive: "now", "+1 day", "tomorrow" and other non-HTTP-date forms all
+     *    parsed, so a hostile or merely broken value could steer the client's sleep.
+     *
+     * Only the two forms the RFC actually defines are accepted: delta-seconds, and an IMF-fixdate.
+     * The result is saturating and always clamped to [0, MAX_SLEEP_MS].
+     *
+     * @param array<string,string> $headers
      */
-    private static function parseRetryAfterMs(mixed $value): ?int
+    private static function parseRetryAfterMs(array $headers): ?int
     {
+        $value = null;
+        foreach ($headers as $name => $candidate) {
+            if (is_string($name) && strcasecmp($name, 'retry-after') === 0) {
+                $value = $candidate;
+                break;
+            }
+        }
         if (!is_string($value)) {
             return null;
         }
@@ -719,16 +813,37 @@ final class Paylod
         if ($value === '') {
             return null;
         }
+
+        // delta-seconds. Bounded to 9 digits BEFORE any arithmetic, so nothing can overflow; a
+        // larger value is not rejected outright (the server did mean "wait a long time") but is
+        // saturated to the ceiling, which the caller clamps further.
         if (ctype_digit($value)) {
-            return (int) $value * 1000;
+            if (strlen($value) > 9) {
+                return self::MAX_SLEEP_MS;
+            }
+
+            return (int) min((int) $value * 1000, self::MAX_SLEEP_MS);
         }
-        $ts = strtotime($value);
-        if ($ts === false) {
+
+        // IMF-fixdate, strictly: "Wed, 21 Oct 2015 07:28:00 GMT". Parsed with an exact format and a
+        // round-trip check, so no other date dialect gets in.
+        $parsed = \DateTimeImmutable::createFromFormat(
+            'D, d M Y H:i:s T',
+            $value,
+            new \DateTimeZone('UTC'),
+        );
+        if ($parsed === false || $parsed->format('D, d M Y H:i:s T') !== $value) {
             return null;
         }
-        $deltaMs = ($ts - time()) * 1000;
 
-        return $deltaMs > 0 ? $deltaMs : 0;
+        // Saturating: the subtraction is done in float so a year-3000 date cannot overflow, and the
+        // result is clamped into range before it becomes an int.
+        $deltaMs = ((float) $parsed->getTimestamp() - (float) time()) * 1000.0;
+        if (!is_finite($deltaMs) || $deltaMs <= 0) {
+            return 0;
+        }
+
+        return (int) min($deltaMs, (float) self::MAX_SLEEP_MS);
     }
 
     private static function nowMs(): int
@@ -749,17 +864,34 @@ final class Paylod
         }
     }
 
-    /** A sleep clamped to the operation deadline, so a backoff can never push past wait()'s cap. */
+    /**
+     * The hard ceiling on any single sleep, deadline or no deadline.
+     *
+     * Without it, the only thing bounding a backoff was the operation deadline - and `collect()` has
+     * none. An exponential ramp with no ceiling meant a plain retry could park a worker for hours on
+     * one call. One minute is already far longer than any sane back-off for a payment.
+     */
+    private const MAX_SLEEP_MS = 60000;
+
+    /**
+     * A sleep clamped to the operation deadline AND to an unconditional ceiling, so a backoff can
+     * never push past wait()'s cap - nor, when there is no cap, run away on its own.
+     */
     private static function boundedSleepMs(int $ms, ?int $deadlineMs): void
     {
-        $capped = $ms;
+        self::sleepMs(self::cappedSleepMs($ms, $deadlineMs));
+    }
+
+    /** The clamp itself, separated from the sleeping so it can be asserted without waiting a minute. */
+    private static function cappedSleepMs(int $ms, ?int $deadlineMs): int
+    {
+        $capped = min($ms, self::MAX_SLEEP_MS);
         $remaining = self::remaining($deadlineMs);
         if ($remaining !== null) {
             $capped = min($capped, max(0, $remaining));
         }
-        if ($capped > 0) {
-            self::sleepMs($capped);
-        }
+
+        return max(0, $capped);
     }
 
     /** +/-20% jitter so a fleet of servers doesn't poll in lockstep. */

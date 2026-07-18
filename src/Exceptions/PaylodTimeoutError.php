@@ -14,8 +14,6 @@ namespace Paylod\Exceptions;
  */
 class PaylodTimeoutError extends PaylodException
 {
-    public readonly string $paymentId;
-
     /**
      * The last `pending` snapshot we read before giving up.
      *

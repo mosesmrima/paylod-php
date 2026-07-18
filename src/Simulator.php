@@ -7,6 +7,8 @@ namespace Paylod;
 use Closure;
 use Paylod\Exceptions\PaylodInvalidRequestError;
 use Paylod\Exceptions\PaylodSandboxOnlyError;
+use Paylod\Support\Redact;
+use Paylod\Support\Validate;
 
 /**
  * The sandbox simulator - a phone that isn't there.
@@ -37,7 +39,7 @@ final class Simulator
     /**
      * @param Closure(array{method:string,path:string,body?:mixed,idempotencyKey?:string}):array<string,mixed> $request
      */
-    public function __construct(string $apiKey, Closure $request)
+    public function __construct(#[\SensitiveParameter] string $apiKey, Closure $request)
     {
         $this->apiKey = $apiKey;
         $this->request = $request;
@@ -46,7 +48,7 @@ final class Simulator
     /**
      * Refuse a production key locally. Called by every simulator method, before any request.
      */
-    public static function assertSandboxKey(string $apiKey, string $what): void
+    public static function assertSandboxKey(#[\SensitiveParameter] string $apiKey, string $what): void
     {
         if (str_starts_with($apiKey, self::SANDBOX_PREFIX)) {
             return;
@@ -61,6 +63,23 @@ final class Simulator
             . 'the wrong credential - no amount of retrying or key-rotating will make this work. '
             . 'Use your mp_test_ key here. Nothing is ever sent to a real phone.'
         );
+    }
+
+    /**
+     * Masked rendering for print_r()/var_dump() - the simulator holds the API key too, and a dumped
+     * client object reaches it through the public `simulator` property.
+     *
+     * @return array<string,mixed>
+     */
+    public function __debugInfo(): array
+    {
+        return ['apiKey' => Redact::mask($this->apiKey)];
+    }
+
+    /** Scrub the key out of anything attached to an error raised from here. */
+    private function redactor(): Closure
+    {
+        return fn (mixed $value): mixed => Redact::apply($value, [$this->apiKey]);
     }
 
     /** The five outcomes, as a list. */
@@ -105,15 +124,24 @@ final class Simulator
 
         $call = ['method' => 'POST', 'path' => '/simulate/collect', 'body' => $body];
         if (isset($params['idempotencyKey'])) {
+            // The SAME key rules production enforces. The simulator exists so a test can prove "a
+            // double-click cannot charge twice" against the real thing - a simulator that accepted a
+            // key production would reject would make that test a lie.
+            Validate::idempotencyKey($params['idempotencyKey']);
             $call['idempotencyKey'] = $params['idempotencyKey'];
         }
 
         $ack = ($this->request)($call);
 
+        // And the SAME acknowledgement schema. Reading paymentId straight out of the body used to
+        // produce an empty id (or a TypeError) from a malformed 2xx instead of a keyed indeterminate
+        // error, which is exactly the failure mode the production path was hardened against.
+        Validate::collectAck($ack, 200, $params['idempotencyKey'] ?? null, $this->redactor());
+
         return [
             'paymentId' => (string) $ack['paymentId'],
             'status' => 'pending',
-            'checkoutRequestId' => (string) ($ack['checkoutRequestId'] ?? ''),
+            'checkoutRequestId' => (string) $ack['checkoutRequestId'],
             'outcomes' => $ack['outcomes'] ?? [],
         ];
     }
@@ -138,12 +166,14 @@ final class Simulator
         ]);
 
         $payment = [
-            'id' => (string) $ack['paymentId'],
-            'status' => (string) $ack['status'],
+            'id' => $ack['paymentId'] ?? null,
+            'status' => $ack['status'] ?? null,
             'mpesaReceipt' => $ack['mpesaReceipt'] ?? null,
             'resultCode' => $ack['resultCode'] ?? null,
             'resultDesc' => $ack['resultDesc'] ?? null,
         ];
+        // Same payment-schema rules as status(), including "a success must carry evidence".
+        Validate::paymentBody($payment, 200, $this->redactor());
 
         return [
             'outcome' => PaymentOutcome::fromPayment($payment),

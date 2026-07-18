@@ -6,6 +6,82 @@ All notable changes to `paylod/paylod` are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-18
+
+Third-round fixes from a codex re-verification of 0.3.0, which found a **Critical double-charge
+path**. The golden webhook vector (`whsec_golden_vector_v1` -> `3afe38e4...2c2eb7`) still passes
+byte-for-byte. Every fix below has a test that fails when the fix is reverted.
+
+### Fixed (Critical)
+
+- **`collectAndWait()` no longer loses the idempotency key when the wait fails.** This was a
+  straightforward route to charging a customer twice. `collect()` attaches the effective key to any
+  error it raises - but `collectAndWait()` called `wait()` **outside** that protection. So once the
+  STK prompt was on the phone, *every* subsequent failure (the wait timing out, a network blip
+  mid-poll, a 5xx, a malformed status body) surfaced an error with **no key on it**. An
+  SDK-generated key at that point is irrecoverable: it existed only inside the call. The caller's
+  natural response - retry `collectAndWait()` - mints a **fresh** key, which the idempotency layer
+  correctly treats as a new charge. Two prompts, two payments, one order. Now every
+  post-acknowledgement failure carries both the effective `idempotencyKey` and the `paymentId`
+  (`PaylodException::$paymentId`, new), and a non-paylod throwable is wrapped in an indeterminate
+  `PaylodApiError` that can carry them rather than escaping bare.
+- **Wait options are validated BEFORE the charge is dispatched.** `collectAndWait(..., ['timeoutMs'
+  => 0])` used to ring the customer's phone and *then* throw a config error, which reads to the
+  caller as "nothing happened" while a payment is live.
+
+### Fixed (High)
+
+- **The COMPLETE acknowledgement schema is validated on every 2xx.** 0.3.0 checked only
+  `paymentId`, so a 2xx with a missing or blank `checkoutRequestId`, a missing `status`, or a
+  `status` of the wrong type returned "successfully" with an unusable shape - which the caller then
+  treats as a new payment and retries under a new key. Every malformed 2xx is now a
+  `PaylodApiError` with `indeterminate: true` carrying the effective key.
+- **Status responses get the same treatment, plus an evidence rule.** A `status: "success"` is only
+  believed when the body carries actual proof - an `mpesaReceipt`, or result code `0`. The status
+  string alone is a claim, not a receipt; shipping goods against an evidence-free claim is a real
+  loss. Unknown statuses and wrongly-typed `mpesaReceipt` / `resultCode` / `resultDesc` are
+  rejected too.
+- **Secrets no longer leak into traces, dumps, or error bodies.** Four separate holes:
+  `#[\SensitiveParameter]` now marks every secret-bearing parameter (the constructor's key and
+  options, `verifyWebhook()` / `parseWebhook()`'s `$secret`, the simulator's key), so PHP renders
+  them as placeholders in stack traces - which matters because `zend.exception_ignore_args=0` is
+  the development default and any uncaught exception would otherwise print a live money-moving key
+  into the log. `__debugInfo()` on the client and the simulator means `print_r()` / `var_dump()`
+  show masked prefixes (`mp_test_***`) instead of the private properties' real values. And server
+  error bodies are now recursively redacted before an error is constructed, so a gateway that
+  echoes the `Authorization` header back cannot put the key into an exception message. Anything
+  merely *shaped* like a paylod credential (`mp_live_`/`mp_test_`/`whsec_`) is redacted too.
+- **Fractional timeouts are refused.** `timeoutMs: 0.5` passed the "greater than 0" check and then
+  truncated to `0` on the cast - and `0` **disables** cURL's timeout entirely, so a request asking
+  for half a millisecond would instead hang indefinitely. Timeouts must now be finite, whole
+  integers in 1..600000.
+
+### Fixed (Medium/Low)
+
+- **Retries are bounded and every sleep has a ceiling.** `maxRetries` was unbounded and coerced
+  with `(int)`, while the backoff doubles each attempt - so a config typo did not merely retry more,
+  it slept geometrically longer (attempt 20 alone is over a day). `maxRetries` is now validated to
+  0..10, and every backoff / `Retry-After` sleep is clamped to 60s **even when there is no
+  deadline** (which is exactly `collect()`'s case).
+- **`Retry-After` parsing hardened.** The lookup matched only the exact lowercase key, so a
+  transport preserving `Retry-After` made the SDK ignore the server's explicit back-off; oversized
+  digit strings overflowed to a float and raised a `TypeError` on a retryable 429 mid-payment; and
+  `strtotime()` accepted non-HTTP-date forms (`now`, `+1 day`, ISO-8601). Lookup is now
+  case-insensitive, only delta-seconds and a strict IMF-fixdate are accepted, and the arithmetic
+  saturates rather than overflowing.
+- **The simulator uses the production validators.** It was a second public dispatch surface with
+  none of the guards: it accepted idempotency keys production rejects, and turned a malformed 2xx
+  into an empty payment id instead of a keyed indeterminate error - so a test asserting "a
+  double-click cannot charge twice" was not testing the real rules. The idempotency and
+  acknowledgement/payment validators now live in `Paylod\Support\Validate` and are shared.
+
+### Changed
+
+- The first attempt of a request now always goes out, even against an already-expired deadline, so
+  an operation never reports failure without having tried once.
+- `PaylodTimeoutError::$paymentId` moved to the `PaylodException` base class (still public, no
+  longer `readonly`) so every paylod error can carry it. Reading it is unchanged.
+
 ## [0.3.0] - 2026-07-18
 
 Second-round money-path and security fixes from a codex re-verification of 0.2.0. The 0.2.0 pass was

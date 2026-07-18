@@ -24,6 +24,15 @@ class PaylodException extends \Exception
     public ?string $idempotencyKey = null;
 
     /**
+     * The payment this error concerns, when one had already been acknowledged.
+     *
+     * Set alongside {@see $idempotencyKey} when a `collectAndWait()` fails AFTER the STK push was
+     * accepted: at that point a payment exists, and the caller needs its id to read the real
+     * outcome rather than start a second charge.
+     */
+    public ?string $paymentId = null;
+
+    /**
      * Attach the effective idempotency key, but NEVER clobber one an error already carries. Mirrors
      * the Node SDK's `attachIdempotencyKey` best-effort semantics.
      */
@@ -31,6 +40,14 @@ class PaylodException extends \Exception
     {
         if ($this->idempotencyKey === null) {
             $this->idempotencyKey = $key;
+        }
+    }
+
+    /** Attach the acknowledged payment id, never clobbering one the error already carries. */
+    public function attachPaymentId(string $paymentId): void
+    {
+        if ($this->paymentId === null && $paymentId !== '') {
+            $this->paymentId = $paymentId;
         }
     }
 }
