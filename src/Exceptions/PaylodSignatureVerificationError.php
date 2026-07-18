@@ -9,6 +9,8 @@ class PaylodSignatureVerificationError extends PaylodException
 {
     /**
      * One of: missing_signature | malformed_signature | stale_timestamp | no_match | invalid_payload
+     * | insecure_tolerance (a non-positive toleranceSec was used outside a fixed-clock test, which
+     * would have silently disabled replay protection).
      */
     public readonly string $reason;
 

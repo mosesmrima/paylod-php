@@ -70,6 +70,49 @@ final class OutcomeTest extends TestCase
         $this->assertFalse($o->retryable); // live prompt - never safe to re-charge
     }
 
+    public function testRawSuccessStatusCannotOverridePendingCode(): void
+    {
+        // status:"success" but the code (4999) classifies as pending -> reported pending, NOT paid.
+        $o = PaymentOutcome::fromPayment(self::payment([
+            'status' => 'success',
+            'mpesaReceipt' => 'SHOULD_NOT_SHOW',
+            'resultCode' => 4999,
+        ]));
+        $this->assertSame('pending', $o->status);
+        $this->assertFalse($o->paid);
+        $this->assertFalse($o->retryable);
+        $this->assertNull($o->receipt);
+    }
+
+    public function testContradictorySuccessStatusWithFailureCodeIsIndeterminate(): void
+    {
+        // status:"success" contradicts a terminal FAILURE code (1032) -> indeterminate, surfaced as
+        // pending. Never paid, never retryable.
+        $o = PaymentOutcome::fromPayment(self::payment([
+            'status' => 'success',
+            'resultCode' => 1032,
+        ]));
+        $this->assertSame('pending', $o->status);
+        $this->assertFalse($o->paid);
+        $this->assertFalse($o->retryable);
+        $this->assertNull($o->receipt);
+        $this->assertStringContainsStringIgnoringCase("couldn't confirm", $o->message);
+    }
+
+    public function testContradictoryFailedStatusWithSuccessCodeIsIndeterminate(): void
+    {
+        // status:"failed" contradicts a terminal SUCCESS code (0) -> indeterminate, surfaced pending.
+        $o = PaymentOutcome::fromPayment(self::payment([
+            'status' => 'failed',
+            'mpesaReceipt' => 'SFF6XYZ123',
+            'resultCode' => 0,
+        ]));
+        $this->assertSame('pending', $o->status);
+        $this->assertFalse($o->paid);
+        $this->assertFalse($o->retryable);
+        $this->assertNull($o->receipt);
+    }
+
     public function testPendingForBuildsRenderableAck(): void
     {
         $o = PaymentOutcome::pendingFor('pay_abc');

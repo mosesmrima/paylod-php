@@ -106,10 +106,11 @@ Throws `Paylod\Exceptions\PaylodConfigError` immediately if there is no key anyw
 | Option | Type | Default |
 | --- | --- | --- |
 | `apiKey` | `string` | `PAYLOD_API_KEY` env |
-| `baseUrl` | `string` | `PAYLOD_BASE_URL` env, else `https://paylod.dev/functions/v1` |
+| `baseUrl` | `string` | `PAYLOD_BASE_URL` env, else `https://paylod.dev/functions/v1` (must be `https://`) |
+| `allowInsecureBaseUrl` | `bool` | `false` (test-only: permit `http://` loopback `baseUrl`; never with an `mp_live_` key) |
 | `webhookSecret` | `string` | `PAYLOD_WEBHOOK_SECRET` env |
 | `timeoutMs` | `int` | `30000` |
-| `maxRetries` | `int` | `2` (transient failures only: network, 5xx, 429) |
+| `maxRetries` | `int` | `2` (transient failures only: network, transient 5xx, 429; not 501/505/511) |
 | `simulate` | `bool` | `false` (sandbox simulator; requires a `mp_test_` key) |
 | `transport` | `Paylod\Http\Transport` | `CurlTransport` (inject for tests/proxies) |
 
@@ -259,7 +260,7 @@ if ($event['type'] === 'payment.success') {
 
 > **The raw body is load-bearing.** Re-serialising a parsed body does not reliably reproduce the same bytes, so it will fail verification. In Laravel, read `$request->getContent()` (the raw string), never the parsed array.
 
-**Deliveries can repeat.** Key your fulfilment on `data.paymentId` (or the `x-webhook-id` header) and make it idempotent.
+**Deliveries can repeat.** Dedup your fulfilment on the **signed** `data.paymentId` and make it idempotent. Never dedup on the unsigned `x-webhook-id` header - it is replayable and not covered by the signature.
 
 `Paylod\Webhook::sign($rawBody, $secret, $timestamp)` is exported so you can build realistic fixtures in your own tests without a network.
 

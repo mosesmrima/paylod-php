@@ -95,4 +95,50 @@ final class DarajaCatalogTest extends TestCase
         // A numeric code we don't know, but the description says it's still processing -> pending.
         $this->assertSame('pending', DarajaCatalog::classifyStkResult(123456, 'The transaction is being processed'));
     }
+
+    /**
+     * Owner-approved catalog correction: 17 / 26 / 1025 / 9999 were flipped retryable true -> false.
+     * "Safe to charge again" was set on non-authoritative evidence; until no-debit is proven, false
+     * is the safe money call.
+     */
+    public function testCorrectedCatalogCodesAreNotRetryable(): void
+    {
+        foreach (['17', '26', '1025', '9999'] as $code) {
+            $d = DarajaCatalog::decode($code);
+            $this->assertFalse($d['retryable'], "code {$code} must not be retryable");
+        }
+    }
+
+    public function testApiErrorFamilyDecodesTerminallyNotPending(): void
+    {
+        // A dotted api_error code has no STK entry; it must decode terminally by its real family
+        // rather than fall through the STK unknown -> pending rule.
+        $d = DarajaCatalog::decode('400.002.02');
+        $this->assertSame('credentials', $d['category']);
+        $this->assertNotSame('pending', $d['category']);
+    }
+
+    public function testB2cC2bFamilyDecodesTerminally(): void
+    {
+        $d = DarajaCatalog::decode('C2B00011');
+        $this->assertSame('customer', $d['category']);
+        $this->assertNotSame('pending', $d['category']);
+    }
+
+    public function testOverloaded500DecodesTerminallyOnApiErrorSurface(): void
+    {
+        // Same code, different surface: on the api_error family 500.001.1001 is the terminal server
+        // error, NOT "still processing".
+        $d = DarajaCatalog::decode('500.001.1001', null, 'api_error');
+        $this->assertSame('mpesa_system', $d['category']);
+
+        // On the STK surface it is still pending.
+        $stk = DarajaCatalog::decode('500.001.1001');
+        $this->assertSame('pending', $stk['category']);
+    }
+
+    public function testInsufficientFundsMessageMakes500Terminal(): void
+    {
+        $this->assertSame('failed', DarajaCatalog::classifyStkResult('500.001.1001', 'Insufficient funds'));
+    }
 }

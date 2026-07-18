@@ -17,10 +17,11 @@ interface Transport
     /**
      * Perform one HTTP request.
      *
-     * @param array<string,string> $headers
+     * @param array<string,string> $headers carries the Authorization Bearer key; implementations
+     *   SHOULD mark it #[\SensitiveParameter] so the secret is scrubbed from stack traces.
      * @return array{status:int, headers:array<string,string>, body:string}
      *
      * @throws PaylodConnectionError on any transport-level failure (DNS, TLS, socket, timeout).
      */
-    public function send(string $method, string $url, array $headers, ?string $body, int $timeoutMs): array;
+    public function send(string $method, string $url, #[\SensitiveParameter] array $headers, ?string $body, int $timeoutMs): array;
 }

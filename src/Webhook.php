@@ -42,7 +42,7 @@ final class Webhook
     public static function verify(
         string|\Stringable $payload,
         ?string $signature,
-        string $secret,
+        #[\SensitiveParameter] string $secret,
         int $toleranceSec = self::DEFAULT_TOLERANCE_SEC,
         ?int $nowSec = null,
     ): array {
@@ -69,14 +69,17 @@ final class Webhook
             );
         }
 
+        // `t` must ALWAYS be an integer, regardless of tolerance - a non-numeric timestamp is
+        // malformed. (Node validates this before the tolerance branch for the same reason.)
+        if (filter_var($parsed['t'], FILTER_VALIDATE_INT) === false) {
+            throw new PaylodSignatureVerificationError(
+                'malformed_signature',
+                'Signature timestamp is not a number.'
+            );
+        }
+        $t = (int) $parsed['t'];
+
         if ($toleranceSec > 0) {
-            if (!is_numeric($parsed['t'])) {
-                throw new PaylodSignatureVerificationError(
-                    'malformed_signature',
-                    'Signature timestamp is not a number.'
-                );
-            }
-            $t = (int) $parsed['t'];
             $now = $nowSec ?? time();
             if (abs($now - $t) > $toleranceSec) {
                 throw new PaylodSignatureVerificationError(
@@ -84,7 +87,18 @@ final class Webhook
                     "Signature timestamp is outside the {$toleranceSec}s tolerance (replay?)."
                 );
             }
+        } elseif ($nowSec === null) {
+            // A non-positive tolerance would DISABLE replay protection. That is only ever acceptable
+            // with a fixed, injected clock (a pinned test vector). In production - no $nowSec - refuse
+            // it loudly rather than silently accept replays of any age.
+            throw new PaylodSignatureVerificationError(
+                'insecure_tolerance',
+                'toleranceSec must be a positive number of seconds. A non-positive tolerance disables '
+                . 'webhook replay protection and is only permitted in tests that inject a fixed $nowSec.'
+            );
         }
+        // else: toleranceSec <= 0 AND a fixed $nowSec was injected - a deterministic fixed-vector
+        // test. The freshness window is intentionally skipped; the pinned clock makes replay moot.
 
         $expected = hash_hmac('sha256', $parsed['t'] . '.' . $raw, $secret);
 
@@ -121,7 +135,7 @@ final class Webhook
     public static function isValid(
         string|\Stringable $payload,
         ?string $signature,
-        string $secret,
+        #[\SensitiveParameter] string $secret,
         int $toleranceSec = self::DEFAULT_TOLERANCE_SEC,
         ?int $nowSec = null,
     ): bool {
@@ -137,7 +151,7 @@ final class Webhook
      * Sign a payload the way the paylod webhook worker does. Exported so you can build realistic
      * fixtures in your own tests - you never need this in production code.
      */
-    public static function sign(string|\Stringable $payload, string $secret, ?int $timestampSec = null): string
+    public static function sign(string|\Stringable $payload, #[\SensitiveParameter] string $secret, ?int $timestampSec = null): string
     {
         $t = $timestampSec ?? time();
         $v1 = hash_hmac('sha256', $t . '.' . (string) $payload, $secret);
@@ -145,23 +159,54 @@ final class Webhook
         return "t={$t},v1={$v1}";
     }
 
+    /** A well-formed `v1` is 64 lowercase hex chars (an HMAC-SHA256 digest). */
+    private const V1_RE = '/^[0-9a-f]{64}$/';
+
     /**
+     * Parse the signature header STRICTLY. The header is `t=<unix>,v1=<hex>` and we require EXACTLY
+     * ONE `t` and EXACTLY ONE `v1`, rejecting anything else.
+     *
+     * This closes a last-value-wins hole: two `x-webhook-signature` headers combined into one
+     * comma-joined value (`t=1,v1=<real>,t=9999999999,v1=<forged>`) must NOT be accepted by silently
+     * taking the last pair. A duplicate of either key is fatal, as is a malformed `v1`.
+     *
      * @return array{t:string,v1:string}|null
      */
     private static function parseHeader(string $header): ?array
     {
-        $parts = [];
+        $t = null;
+        $v1 = null;
+        $tCount = 0;
+        $v1Count = 0;
         foreach (explode(',', $header) as $seg) {
-            $idx = strpos($seg, '=');
+            $s = trim($seg);
+            if ($s === '') {
+                continue;
+            }
+            $idx = strpos($s, '=');
             if ($idx === false || $idx === 0) {
                 continue;
             }
-            $parts[trim(substr($seg, 0, $idx))] = trim(substr($seg, $idx + 1));
+            $key = trim(substr($s, 0, $idx));
+            $val = trim(substr($s, $idx + 1));
+            if ($key === 't') {
+                $t = $val;
+                $tCount++;
+            } elseif ($key === 'v1') {
+                $v1 = $val;
+                $v1Count++;
+            }
+            // Unknown keys are ignored for forward-compatibility; a duplicate t/v1 is fatal below.
         }
-        if (!isset($parts['t'], $parts['v1']) || $parts['t'] === '' || $parts['v1'] === '') {
+        if ($tCount !== 1 || $v1Count !== 1 || $t === null || $v1 === null || $t === '' || $v1 === '') {
+            return null;
+        }
+        // `v1` must be exactly one 64-char lowercase-hex digest. `t` is validated (integer) by the
+        // caller so the "not a number" diagnostic stays specific.
+        if (preg_match(self::V1_RE, $v1) !== 1) {
             return null;
         }
 
-        return ['t' => $parts['t'], 'v1' => $parts['v1']];
+        return ['t' => $t, 'v1' => $v1];
     }
 }

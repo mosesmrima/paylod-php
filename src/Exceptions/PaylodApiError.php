@@ -13,15 +13,26 @@ class PaylodApiError extends PaylodException
     /** The parsed JSON body, when the response had one. */
     public readonly mixed $body;
 
-    /** `Idempotency-Key` sent with the offending request, if any - useful for support tickets. */
-    public readonly ?string $idempotencyKey;
+    /**
+     * `true` when the money state cannot be proven either way. Set for a malformed 2xx (a success
+     * response with no `paymentId`): the charge may or may not have been raised, so this is a STOP
+     * signal - read the status with {@see $idempotencyKey}, do NOT blindly retry with a new key.
+     */
+    public readonly bool $indeterminate;
 
-    public function __construct(string $message, int $status, mixed $body = null, ?string $idempotencyKey = null)
-    {
+    public function __construct(
+        string $message,
+        int $status,
+        mixed $body = null,
+        ?string $idempotencyKey = null,
+        bool $indeterminate = false,
+    ) {
         parent::__construct($message, $status);
         $this->status = $status;
         $this->body = $body;
+        // `idempotencyKey` lives on the base class so a failed collect() can attach it to ANY error.
         $this->idempotencyKey = $idempotencyKey;
+        $this->indeterminate = $indeterminate;
     }
 
     /** 401 - the API key is missing or invalid. */

@@ -81,12 +81,14 @@ final class WebhookTest extends TestCase
 
         $this->assertSame($goldenHeader, Webhook::sign($goldenBody, $goldenSecret, $goldenT));
 
-        // And the verifier accepts its own signer's golden output (freshness disabled - t is fixed).
-        $event = Webhook::verify($goldenBody, $goldenHeader, $goldenSecret, 0);
+        // And the verifier accepts its own signer's golden output. The fixed vector pins the clock
+        // via $nowSec (the freshness window is deterministic) - the sanctioned way to verify an
+        // ancient fixture with toleranceSec: 0 without disabling replay protection in production.
+        $event = Webhook::verify($goldenBody, $goldenHeader, $goldenSecret, 0, $goldenT);
         $this->assertSame('pay_golden', $event['data']['paymentId']);
 
         // The boolean convenience form agrees.
-        $this->assertTrue(Webhook::isValid($goldenBody, $goldenHeader, $goldenSecret, 0));
+        $this->assertTrue(Webhook::isValid($goldenBody, $goldenHeader, $goldenSecret, 0, $goldenT));
     }
 
     public function testAcceptsValidSignatureAndReturnsEvent(): void
@@ -193,11 +195,77 @@ final class WebhookTest extends TestCase
         Webhook::verify(self::raw(), $bad, self::SECRET);
     }
 
-    public function testCanDisableFreshnessCheck(): void
+    public function testVerifiesAncientFixtureByPinningClock(): void
     {
+        // toleranceSec: 0 is only permitted with a fixed, injected clock (a pinned test vector).
         $header = Webhook::sign(self::raw(), self::SECRET, 1); // ancient
-        $event = Webhook::verify(self::raw(), $header, self::SECRET, 0);
+        $event = Webhook::verify(self::raw(), $header, self::SECRET, 0, 1);
         $this->assertSame('pay_123', $event['data']['paymentId']);
+    }
+
+    public function testRefusesNonPositiveToleranceInProductionWithoutFixedClock(): void
+    {
+        // A non-positive tolerance would silently disable replay protection - refuse it loudly unless
+        // a fixed $nowSec is injected. No $nowSec here => insecure_tolerance.
+        $header = Webhook::sign(self::raw(), self::SECRET, self::now());
+        try {
+            Webhook::verify(self::raw(), $header, self::SECRET, 0);
+            $this->fail('expected an insecure_tolerance error');
+        } catch (PaylodSignatureVerificationError $e) {
+            $this->assertSame('insecure_tolerance', $e->reason);
+        }
+    }
+
+    public function testRefusesNegativeToleranceUnlessFixedClockInjected(): void
+    {
+        $header = Webhook::sign(self::raw(), self::SECRET, self::now());
+        try {
+            Webhook::verify(self::raw(), $header, self::SECRET, -5);
+            $this->fail('expected an insecure_tolerance error');
+        } catch (PaylodSignatureVerificationError $e) {
+            $this->assertSame('insecure_tolerance', $e->reason);
+        }
+        // ...but with a pinned clock (a fixed-vector test) it is allowed.
+        $event = Webhook::verify(self::raw(), $header, self::SECRET, -5, self::now());
+        $this->assertSame('pay_123', $event['data']['paymentId']);
+    }
+
+    public function testRejectsCommaCombinedTwoSignatureHeader(): void
+    {
+        // Two x-webhook-signature values joined by a comma: a forged pair appended after a real one.
+        // Last-value-wins must NOT accept it.
+        $goodV1 = explode('v1=', Webhook::sign(self::raw(), self::SECRET, self::now()))[1];
+        $combined = 't=' . self::now() . ',v1=' . $goodV1 . ',t=9999999999,v1=' . str_repeat('0', 64);
+        try {
+            Webhook::verify(self::raw(), $combined, self::SECRET, 300, self::now());
+            $this->fail('expected a malformed_signature error');
+        } catch (PaylodSignatureVerificationError $e) {
+            $this->assertSame('malformed_signature', $e->reason);
+        }
+    }
+
+    public function testRejectsDuplicatedV1(): void
+    {
+        $goodV1 = explode('v1=', Webhook::sign(self::raw(), self::SECRET, self::now()))[1];
+        $dup = 't=' . self::now() . ',v1=' . $goodV1 . ',v1=' . $goodV1;
+        $this->expectException(PaylodSignatureVerificationError::class);
+        $this->expectExceptionMessageMatches('/Malformed/');
+        Webhook::verify(self::raw(), $dup, self::SECRET, 300, self::now());
+    }
+
+    public function testRejectsV1ThatIsNotSixtyFourLowercaseHex(): void
+    {
+        $t = self::now();
+        $short = "t={$t},v1=deadbeef";
+        $upper = 't=' . $t . ',v1=' . strtoupper(explode('v1=', Webhook::sign(self::raw(), self::SECRET, $t))[1]);
+        foreach ([$short, $upper] as $bad) {
+            try {
+                Webhook::verify(self::raw(), $bad, self::SECRET, 300, $t);
+                $this->fail('expected a malformed_signature error');
+            } catch (PaylodSignatureVerificationError $e) {
+                $this->assertSame('malformed_signature', $e->reason);
+            }
+        }
     }
 
     public function testReSerialisedBodyFails(): void

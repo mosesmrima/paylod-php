@@ -28,7 +28,7 @@ final class DarajaCatalog
      * NOT treated as pending.
      */
     private const TERMINAL_500_MESSAGE_RE =
-        '/\b(?:wrong\s+credentials|merchant\s+does\s+not\s+exist|invalid\s+access\s+token|unable\s+to\s+lock\s+subscriber)\b/i';
+        '/\b(?:wrong\s+credentials|merchant\s+does\s+not\s+exist|invalid\s+access\s+token|unable\s+to\s+lock\s+subscriber|insufficient\s+funds?)\b/i';
 
     /** @var list<array<string,mixed>>|null */
     private static ?array $entries = null;
@@ -181,9 +181,22 @@ final class DarajaCatalog
     }
 
     /**
-     * Decode a Daraja ResultCode into a normalized, human-readable error. Defers to the classifier
-     * FIRST, so pending/in-flight codes (4999, 500.001.1001) can never decode as a failure and can
-     * never be advertised as retryable.
+     * Decode a Daraja ResultCode into a normalized, human-readable error.
+     *
+     * Family-awareness: the STK "still processing -> pending" semantics (and the blank/unknown-numeric
+     * -> pending fallback) apply ONLY to the STK result surface. A dotted `api_error` code (e.g.
+     * 400.002.02, 500.001.1001) or an alphanumeric `b2c_c2b_result` code (e.g. C2B00011) is a
+     * TERMINAL error; routing it through classifyStkResult used to misclassify it as `pending` and
+     * decode it as "payment still in progress", which is wrong. So we select by family:
+     *
+     *   - STK family: defer to classifyStkResult, so 4999 / 500.001.1001 can never decode as a
+     *     failure and can never be advertised as retryable.
+     *   - Non-STK families: decode straight from the catalog by family - no pending semantics. This
+     *     also disambiguates the OVERLOADED 500.001.1001, whose api_error entry is the terminal
+     *     "merchant does not exist / insufficient funds" server error.
+     *
+     * If the caller asks for the (default) STK family but the code exists ONLY in non-STK families,
+     * decode it by its real family rather than letting the STK unknown->pending rule mislabel it.
      *
      * @return array{code:string,title:string,cause:string,fix:string,category:string,retryable:bool,customerMessage:string}
      */
@@ -196,26 +209,80 @@ final class DarajaCatalog
             return self::failedFallback('unknown', $rawDesc);
         }
 
-        $outcome = self::classifyStkResult($code, $rawDesc);
-        $entry = self::pickEntry($code, $family, $outcome);
-
-        if ($entry !== null) {
-            return [
-                'code' => $code,
-                'title' => (string) $entry['title'],
-                'cause' => (string) $entry['cause'],
-                'fix' => (string) $entry['fix'],
-                'category' => (string) $entry['category'],
-                'retryable' => (bool) $entry['retryable'],
-                'customerMessage' => (string) $entry['customerMessage'],
-            ];
+        $matches = array_values(array_filter(
+            self::allEntries(),
+            static fn (array $e): bool => (string) $e['code'] === $code
+        ));
+        $hasStk = false;
+        foreach ($matches as $e) {
+            if (($e['family'] ?? null) === 'stk_result') {
+                $hasStk = true;
+                break;
+            }
         }
 
-        if ($outcome === 'pending') {
-            return self::pendingFallback($code);
+        // If STK was requested but the code is not an STK code, decode it by the family it DOES have.
+        $effectiveFamily = ($family === 'stk_result' && !$hasStk && $matches !== [])
+            ? (string) $matches[0]['family']
+            : $family;
+
+        if ($effectiveFamily === 'stk_result') {
+            $outcome = self::classifyStkResult($code, $rawDesc);
+            $entry = self::pickEntry($code, $effectiveFamily, $outcome);
+            if ($entry !== null) {
+                return self::decodedFrom($code, $entry);
+            }
+            if ($outcome === 'pending') {
+                return self::pendingFallback($code);
+            }
+
+            return self::failedFallback($code !== '' ? $code : 'unknown', $rawDesc);
+        }
+
+        // Terminal (api_error / b2c_c2b_result): no STK pending semantics. Pick the entry for this
+        // family (falling back to any non-STK match, then any match), else an indeterminate failure.
+        $entry = null;
+        foreach ($matches as $e) {
+            if (($e['family'] ?? null) === $effectiveFamily) {
+                $entry = $e;
+                break;
+            }
+        }
+        if ($entry === null) {
+            foreach ($matches as $e) {
+                if (($e['family'] ?? null) !== 'stk_result') {
+                    $entry = $e;
+                    break;
+                }
+            }
+        }
+        if ($entry === null && $matches !== []) {
+            $entry = $matches[0];
+        }
+        if ($entry !== null) {
+            return self::decodedFrom($code, $entry);
         }
 
         return self::failedFallback($code !== '' ? $code : 'unknown', $rawDesc);
+    }
+
+    /**
+     * Strip the internal-only fields off a catalog entry to produce a decoded error.
+     *
+     * @param array<string,mixed> $entry
+     * @return array{code:string,title:string,cause:string,fix:string,category:string,retryable:bool,customerMessage:string}
+     */
+    private static function decodedFrom(string $code, array $entry): array
+    {
+        return [
+            'code' => $code,
+            'title' => (string) $entry['title'],
+            'cause' => (string) $entry['cause'],
+            'fix' => (string) $entry['fix'],
+            'category' => (string) $entry['category'],
+            'retryable' => (bool) $entry['retryable'],
+            'customerMessage' => (string) $entry['customerMessage'],
+        ];
     }
 
     /**

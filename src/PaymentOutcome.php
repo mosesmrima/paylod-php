@@ -24,6 +24,16 @@ final class PaymentOutcome
     /** Shown while the prompt is live but M-Pesa has not given us a code to decode yet. */
     private const WAITING = 'Check your phone and enter your M-Pesa PIN to complete this payment.';
 
+    /**
+     * Shown when the record contradicts itself - the raw `status` field says one terminal thing and
+     * the decoded result code says another. We CANNOT prove money did or did not move, so this is an
+     * indeterminate payment: never `paid`, never `retryable`. It is surfaced as `pending` so wait()
+     * lets a webhook settle it (and ultimately throws PaylodTimeoutError) rather than reporting a
+     * false success or a false failure.
+     */
+    private const INDETERMINATE =
+        "We couldn't confirm this payment yet. Please wait - do not retry - while it settles.";
+
     private const CANCELLED_CODE = '1032';
 
     /**
@@ -85,13 +95,40 @@ final class PaymentOutcome
         $mpesaReceipt = $payment['mpesaReceipt'] ?? null;
 
         $hasCode = $resultCode !== null;
-        $detail = $hasCode
-            ? DarajaCatalog::decode($resultCode, is_string($resultDesc) ? $resultDesc : null)
-            : null;
+        $desc = is_string($resultDesc) ? $resultDesc : null;
+        $detail = $hasCode ? DarajaCatalog::decode($resultCode, $desc) : null;
         $code = $detail['code'] ?? null;
 
-        if ($hasCode) {
-            $outcome = DarajaCatalog::classifyStkResult($resultCode, is_string($resultDesc) ? $resultDesc : null);
+        // When M-Pesa has given us a code, the CLASSIFIER is authoritative and the raw `status` field
+        // must NOT override it. A row marked status:"success" that carries a pending code (4999) or a
+        // failure code (1032) must never be reported as paid. Before there is a code, the API's own
+        // status is all we have.
+        $classified = $hasCode ? DarajaCatalog::classifyStkResult($resultCode, $desc) : null;
+
+        // A genuine contradiction between two TERMINAL signals - the raw status says success while
+        // the code classifies as a failure, or vice versa. Neither can be trusted, so the payment is
+        // INDETERMINATE: not paid, not safe to charge again. (A `pending` classification is NOT a
+        // contradiction - it just means "still in flight, keep polling".)
+        $contradictory = $classified !== null
+            && (($classified === 'success' && $rawStatus === 'failed')
+                || ($classified === 'failed' && $rawStatus === 'success'));
+
+        if ($contradictory) {
+            return new self(
+                status: 'pending',
+                message: self::INDETERMINATE,
+                retryable: false,
+                paid: false,
+                paymentId: $paymentId,
+                receipt: null,
+                code: $code,
+                detail: $detail,
+                payment: $payment,
+            );
+        }
+
+        if ($classified !== null) {
+            $outcome = $classified;
         } elseif ($rawStatus === 'success') {
             $outcome = 'success';
         } elseif ($rawStatus === 'failed') {
@@ -100,7 +137,7 @@ final class PaymentOutcome
             $outcome = 'pending';
         }
 
-        if ($outcome === 'success' || $rawStatus === 'success') {
+        if ($outcome === 'success') {
             return new self(
                 status: 'succeeded',
                 message: $detail['customerMessage'] ?? 'Payment received - thank you!',

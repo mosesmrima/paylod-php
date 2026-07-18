@@ -6,6 +6,7 @@ namespace Paylod\Tests;
 
 use Paylod\Exceptions\PaylodApiError;
 use Paylod\Exceptions\PaylodConfigError;
+use Paylod\Exceptions\PaylodConnectionError;
 use Paylod\Exceptions\PaylodInvalidRequestError;
 use Paylod\Exceptions\PaylodTimeoutError;
 use Paylod\Paylod;
@@ -246,5 +247,128 @@ final class PaylodClientTest extends TestCase
         [$paylod] = $this->client([]);
         $d = $paylod->decodeError(1);
         $this->assertSame('balance', $d['category']);
+    }
+
+    // -- HTTPS enforcement on baseUrl -----------------------------------------
+
+    public function testConstructorRejectsPlaintextHttpBaseUrl(): void
+    {
+        $this->expectException(PaylodConfigError::class);
+        $this->expectExceptionMessageMatches('/https/');
+        new Paylod('mp_test_x', ['baseUrl' => 'http://paylod.dev/functions/v1', 'transport' => new MockTransport([])]);
+    }
+
+    public function testConstructorAllowsLoopbackHttpBehindTestFlag(): void
+    {
+        $paylod = new Paylod('mp_test_x', [
+            'baseUrl' => 'http://localhost:9999/v1',
+            'allowInsecureBaseUrl' => true,
+            'transport' => new MockTransport([['status' => 202, 'json' => self::ACK]]),
+        ]);
+        $ack = $paylod->collect(['amount' => 1, 'phone' => '0712345678', 'idempotencyKey' => 'a']);
+        $this->assertSame('pay_123', $ack['paymentId']);
+    }
+
+    public function testConstructorRefusesLoopbackHttpWithLiveKeyEvenBehindFlag(): void
+    {
+        $this->expectException(PaylodConfigError::class);
+        new Paylod('mp_live_secret', [
+            'baseUrl' => 'http://localhost:9999/v1',
+            'allowInsecureBaseUrl' => true,
+            'transport' => new MockTransport([]),
+        ]);
+    }
+
+    // -- Idempotency key validation -------------------------------------------
+
+    public function testCollectRejectsBlankIdempotencyKey(): void
+    {
+        [$paylod] = $this->client([]);
+        $this->expectException(PaylodInvalidRequestError::class);
+        $paylod->collect(['amount' => 100, 'phone' => '0712345678', 'idempotencyKey' => '   ']);
+    }
+
+    public function testCollectRejectsControlCharIdempotencyKey(): void
+    {
+        [$paylod] = $this->client([]);
+        $this->expectException(PaylodInvalidRequestError::class);
+        $paylod->collect(['amount' => 100, 'phone' => '0712345678', 'idempotencyKey' => "bad\nkey"]);
+    }
+
+    // -- The effective key is attached to a failure ---------------------------
+
+    public function testConnectionFailureCarriesTheEffectiveIdempotencyKey(): void
+    {
+        // Every attempt is a transport failure; the generated key must ride the thrown error so the
+        // caller retries with the SAME key rather than mint a fresh one and double-charge.
+        [$paylod] = $this->client([['throw' => true]]);
+        try {
+            $paylod->collect(['amount' => 100, 'phone' => '0712345678', 'idempotencyKey' => 'attempt-7']);
+            $this->fail('expected a connection error');
+        } catch (PaylodConnectionError $e) {
+            $this->assertSame('attempt-7', $e->idempotencyKey);
+        }
+    }
+
+    // -- 409 "already in progress" is the ONLY retried 409 --------------------
+
+    public function testRetriesInProgress409ThenSucceeds(): void
+    {
+        [$paylod, $transport] = $this->client([
+            ['status' => 409, 'json' => ['error' => 'An idempotency request is already in progress for this key']],
+            ['status' => 202, 'json' => self::ACK],
+        ]);
+
+        $ack = $paylod->collect(['amount' => 100, 'phone' => '0712345678', 'idempotencyKey' => 'a']);
+        $this->assertSame('pay_123', $ack['paymentId']);
+        $this->assertSame(2, $transport->count());
+    }
+
+    public function testDoesNotRetryBodyConflict409(): void
+    {
+        [$paylod, $transport] = $this->client([['status' => 409, 'json' => ['error' => 'Idempotency-Key reused with a different body']]]);
+        try {
+            $paylod->collect(['amount' => 100, 'phone' => '0712345678', 'idempotencyKey' => 'a']);
+            $this->fail('expected an API error');
+        } catch (PaylodApiError $e) {
+            $this->assertSame(409, $e->status);
+            $this->assertTrue($e->isIdempotencyBodyConflict());
+        }
+        $this->assertSame(1, $transport->count());
+    }
+
+    // -- Transient-status restriction: 501 is NOT retried ---------------------
+
+    public function testDoesNotRetryNonTransient501(): void
+    {
+        [$paylod, $transport] = $this->client([['status' => 501, 'json' => ['error' => 'not implemented']]]);
+        try {
+            $paylod->status('pay_123');
+            $this->fail('expected an API error');
+        } catch (PaylodApiError $e) {
+            $this->assertSame(501, $e->status);
+        }
+        $this->assertSame(1, $transport->count()); // 501/505/511 are not blips
+    }
+
+    // -- Malformed 2xx is indeterminate ---------------------------------------
+
+    public function testMalformed2xxCollectIsIndeterminateAndCarriesKey(): void
+    {
+        [$paylod] = $this->client([['status' => 202, 'json' => ['status' => 'pending']]]); // no paymentId
+        try {
+            $paylod->collect(['amount' => 100, 'phone' => '0712345678', 'idempotencyKey' => 'attempt-x']);
+            $this->fail('expected an indeterminate API error');
+        } catch (PaylodApiError $e) {
+            $this->assertTrue($e->indeterminate);
+            $this->assertSame('attempt-x', $e->idempotencyKey);
+        }
+    }
+
+    public function testMalformed2xxStatusIsRejected(): void
+    {
+        [$paylod] = $this->client([['status' => 200, 'json' => ['status' => 'success']]]); // no id
+        $this->expectException(PaylodApiError::class);
+        $paylod->status('pay_123');
     }
 }
