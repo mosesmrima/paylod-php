@@ -85,9 +85,12 @@ final class MoneyPathHardeningTest extends TestCase
             ['status' => 200, 'json' => self::PENDING],
         ]);
 
-        set_error_handler(static fn (): bool => true); // silence the one-time no-key warning
+        set_error_handler(static fn (): bool => true); // silence the unsafe-generated-key warning
         try {
-            $paylod->collectAndWait(['amount' => 100, 'phone' => '0712345678'], ['timeoutMs' => 1]);
+            $paylod->collectAndWait(
+                ['amount' => 100, 'phone' => '0712345678', 'unsafeGeneratedIdempotencyKey' => true],
+                ['timeoutMs' => 1],
+            );
             $this->fail('expected a timeout');
         } catch (PaylodTimeoutError $e) {
             $this->assertIsString($e->idempotencyKey);

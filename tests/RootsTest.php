@@ -271,7 +271,16 @@ final class RootsTest extends TestCase
         } catch (PaylodApiError $e) {
             $this->assertTrue($e->indeterminate, 'the charge state is unknown, so it must say so');
             $this->assertSame('k-boom', $e->idempotencyKey, 'without the key the caller double-charges');
-            $this->assertInstanceOf(\RuntimeException::class, $e->getPrevious());
+            // The ORIGINAL throwable is deliberately NOT chained. Keeping it as `previous` kept an
+            // un-redacted copy of its message, its stack trace and (with the development default
+            // zend.exception_ignore_args=0) its recorded call arguments reachable - and PHP's
+            // default __toString() walks the chain and prints all of it. What survives is a
+            // sanitized surrogate naming the original's class and its redacted message.
+            $previous = $e->getPrevious();
+            $this->assertNotInstanceOf(\RuntimeException::class, $previous);
+            $this->assertInstanceOf(\Paylod\Exceptions\PaylodConnectionError::class, $previous);
+            $this->assertStringContainsString('RuntimeException', (string) $previous?->getMessage());
+            $this->assertStringContainsString('the stubbed client exploded', (string) $previous?->getMessage());
         }
     }
 

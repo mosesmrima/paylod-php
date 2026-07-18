@@ -31,6 +31,23 @@ final class Webhook
     public const DEFAULT_TOLERANCE_SEC = 300;
 
     /**
+     * The HARD CEILING on the anti-replay window, seconds. One hour.
+     *
+     * A tolerance had a floor but no ceiling, so `PHP_INT_MAX` (or any absurd value arrived at by a
+     * config typo, a milliseconds-for-seconds mix-up, or a caller "turning off the flakiness")
+     * passed validation and made `abs($now - $t) <= $tolerance` true for every timestamp that has
+     * ever existed. Replay protection was then GONE while every other check still passed - the
+     * worst possible failure mode, because the verifier looks like it is working. A correctly
+     * signed webhook captured last year would be accepted and re-delivered to the handler, and on a
+     * `payment.success` that means fulfilling the same order again.
+     *
+     * One hour is far beyond any legitimate need: the window exists to absorb clock skew and
+     * delivery retries, both of which are seconds-to-minutes. The default is 300s and should stay
+     * there; this bound exists so that no configuration can silently mean "forever".
+     */
+    public const MAX_TOLERANCE_SEC = 3600;
+
+    /**
      * Verify a paylod webhook and return the typed event as an associative array.
      *
      * Throws {@see PaylodSignatureVerificationError} on any failure - never returns a half-trusted
@@ -80,7 +97,7 @@ final class Webhook
         // there is no caller - test or otherwise - who needs that: a pinned fixture verifies fine
         // with a normal window and an injected $nowSec. Validated FIRST so a misconfigured verifier
         // can never reach the HMAC comparison and return a "valid" verdict.
-        $tolerance = self::requirePositiveInt($toleranceSec, 'toleranceSec');
+        $tolerance = self::requireTolerance($toleranceSec);
         $now = $nowSec === null ? time() : self::requirePositiveInt($nowSec, 'nowSec');
 
         if ($secret === '') {
@@ -338,6 +355,46 @@ final class Webhook
         }
 
         return (int) $value;
+    }
+
+    /**
+     * The anti-replay window: finite, positive, whole - AND BOUNDED ABOVE.
+     *
+     * Positivity alone is not a security property. `PHP_INT_MAX` is positive, finite and whole, and
+     * it disables replay protection completely. A window is only a window if it has both edges.
+     *
+     * @throws PaylodSignatureVerificationError
+     */
+    private static function requireTolerance(int|float $value): int
+    {
+        // THE CEILING IS CHECKED ON THE RAW VALUE, BEFORE ANY CAST. `(int) (float) PHP_INT_MAX`
+        // OVERFLOWS to PHP_INT_MIN, so a ceiling applied after the cast would see a large NEGATIVE
+        // number, wave it through, and hand back the very unbounded window it exists to forbid.
+        if ($value > self::MAX_TOLERANCE_SEC) {
+            self::rejectTolerance($value);
+        }
+
+        $seconds = self::requirePositiveInt($value, 'toleranceSec');
+        if ($seconds > self::MAX_TOLERANCE_SEC) {
+            self::rejectTolerance($value);
+        }
+
+        return $seconds;
+    }
+
+    /** @throws PaylodSignatureVerificationError */
+    private static function rejectTolerance(int|float $value): never
+    {
+        throw new PaylodSignatureVerificationError(
+            'insecure_tolerance',
+            'toleranceSec must be at most ' . self::MAX_TOLERANCE_SEC . ' seconds (got '
+            . var_export($value, true) . '). A window wider than that is not replay protection: '
+            . 'a correctly signed webhook captured arbitrarily long ago would still verify, and '
+            . 'a replayed payment.success gets the same order fulfilled twice. The default of '
+            . self::DEFAULT_TOLERANCE_SEC . 's already absorbs clock skew and delivery retries. '
+            . 'To verify a pinned fixture, keep a normal tolerance and inject the fixture\'s own '
+            . 'timestamp as $nowSec.'
+        );
     }
 
     /** A well-formed `v1` is 64 lowercase hex chars (an HMAC-SHA256 digest). */

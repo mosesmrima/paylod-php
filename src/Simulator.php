@@ -103,6 +103,21 @@ final class Simulator
     }
 
     /**
+     * A request field that must be a string, checked HERE rather than at JSON-encoding time or at
+     * the API - so the error names the field the caller got wrong.
+     */
+    private static function requireString(mixed $value, string $field): string
+    {
+        if (!is_string($value)) {
+            throw new PaylodInvalidRequestError(
+                "simulate.collect(): {$field} must be a string (got " . get_debug_type($value) . ').'
+            );
+        }
+
+        return $value;
+    }
+
+    /**
      * Create a real, pending, sandbox payment. No phone rings.
      *
      * @param array{phone?:string,amount?:int,accountReference?:string,description?:string,metadata?:array<string,mixed>,idempotencyKey?:string} $params
@@ -120,20 +135,41 @@ final class Simulator
         }
 
         $body = [
-            'phone' => isset($params['phone']) ? Phone::normalize($params['phone']) : self::DEFAULT_SIM_PHONE,
+            'phone' => array_key_exists('phone', $params)
+                ? Phone::normalize(self::requireString($params['phone'], 'phone'))
+                : self::DEFAULT_SIM_PHONE,
             'amount' => $amount,
         ];
-        // The backend calls this field `accountRef`; the SDK calls it `accountReference`.
-        if (isset($params['accountReference'])) {
-            $body['accountRef'] = $params['accountReference'];
+
+        // ARRAY_KEY_EXISTS, NOT ISSET - and every value type-checked before it is forwarded.
+        //
+        // `isset()` is false for a key that is PRESENT with a null value, so `['description' =>
+        // null]` was silently dropped from the body rather than forwarded or rejected. That matters
+        // precisely because of the comment below: the idempotency layer FINGERPRINTS this body. A
+        // field the SDK drops is a field the fingerprint does not see, so the simulator would let a
+        // reused key with a changed (null-ed) description replay happily while production, which
+        // sees the difference, answers 409. The simulator exists to prove things about the
+        // production path; one that silently disagrees with it about what a request IS teaches the
+        // wrong lesson, and the lesson in question is "this cannot charge twice".
+        //
+        // The values were also forwarded unvalidated - an array where a string belongs, an object,
+        // a resource - and only failed later, at JSON encoding or at the API, by which time the
+        // caller has no idea which field was wrong.
+        if (array_key_exists('accountReference', $params)) {
+            // The backend calls this field `accountRef`; the SDK calls it `accountReference`.
+            $body['accountRef'] = self::requireString($params['accountReference'], 'accountReference');
         }
-        // Send the FULL body - the idempotency layer fingerprints it, so a dropped field would let
-        // a reused key with changed description/metadata replay here while it 409s in production.
-        if (isset($params['description'])) {
-            $body['description'] = $params['description'];
+        if (array_key_exists('description', $params)) {
+            $body['description'] = self::requireString($params['description'], 'description');
         }
-        if (isset($params['metadata'])) {
-            $body['metadata'] = $params['metadata'];
+        if (array_key_exists('metadata', $params)) {
+            $metadata = $params['metadata'];
+            if (!is_array($metadata)) {
+                throw new PaylodInvalidRequestError(
+                    'simulate.collect(): metadata must be an array (got ' . get_debug_type($metadata) . ').'
+                );
+            }
+            $body['metadata'] = $metadata;
         }
 
         if (isset($params['idempotencyKey'])) {

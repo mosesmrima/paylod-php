@@ -50,4 +50,25 @@ class PaylodException extends \Exception
             $this->paymentId = $paymentId;
         }
     }
+
+    /**
+     * OVERWRITE both fields with the acknowledged payment's AUTHORITATIVE context. Unconditional,
+     * on purpose.
+     *
+     * `attach*()` is best-effort and never clobbers, which is right when the error arose from the
+     * request that owns the key. It is WRONG once a payment has been acknowledged. Past that point
+     * the caller is holding a live payment, and the key and id that identify it are facts, not
+     * suggestions - but the error is often not from that request at all. An `onPoll` callback can
+     * throw a `PaylodException` it constructed itself, or one it caught earlier from an unrelated
+     * charge; a stale error object can be rethrown. Under `attach*()` that error's PRE-EXISTING key
+     * or payment id survived, and the caller then read the wrong payment, decided nothing had
+     * happened, and re-charged the customer under a fresh key.
+     *
+     * So the acknowledgement wins. There is exactly one payment this error can be about.
+     */
+    public function bindToAcknowledgedPayment(string $idempotencyKey, string $paymentId): void
+    {
+        $this->idempotencyKey = $idempotencyKey;
+        $this->paymentId = $paymentId !== '' ? $paymentId : null;
+    }
 }

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Paylod\Http;
 
+use Paylod\Exceptions\PaylodApiError;
 use Paylod\Exceptions\PaylodConnectionError;
 
 /**
@@ -17,6 +18,22 @@ use Paylod\Exceptions\PaylodConnectionError;
  */
 final class CurlHttpClient implements HttpClient
 {
+    /**
+     * The hard ceiling on a response body, in bytes. 8 MiB.
+     *
+     * `CURLOPT_RETURNTRANSFER` buffers the WHOLE response in memory with no bound, so the size of
+     * the allocation was chosen entirely by whoever was on the other end of the socket. A
+     * compromised or merely broken endpoint - or anything that can MITM a connection - answering a
+     * `/collect` with an endless body drove the process into the memory limit and killed it. That
+     * is not a denial of service on a status page: it happens AFTER the charge has been dispatched,
+     * so the process dies without ever learning the payment id or recording the outcome, and the
+     * natural recovery (run it again) charges the customer a second time.
+     *
+     * 8 MiB is orders of magnitude larger than any real paylod response (they are small JSON
+     * objects); it is a backstop, not a tuning knob.
+     */
+    public const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
+
     /**
      * @param array<string,string> $headers marked #[\SensitiveParameter] so the Authorization
      *   Bearer key is scrubbed from any stack trace this frame appears in - PHP renders a sensitive
@@ -44,11 +61,33 @@ final class CurlHttpClient implements HttpClient
 
         $responseHeaders = [];
 
+        // The BOUNDED buffer. Body bytes are accumulated by hand rather than by
+        // CURLOPT_RETURNTRANSFER so the ceiling is enforced AS THEY ARRIVE: the moment the limit is
+        // passed the write callback returns a short count, which makes cURL abort the transfer and
+        // tear down the connection. Nothing beyond the ceiling is ever allocated, so the peer
+        // cannot choose how much memory this process spends.
+        $buffer = '';
+        $bytes = 0;
+        $overflowed = false;
+
         curl_setopt_array($ch, [
             CURLOPT_URL => $url,
             CURLOPT_CUSTOMREQUEST => $method,
             CURLOPT_HTTPHEADER => $headerLines,
             CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_WRITEFUNCTION => function ($curl, string $chunk) use (&$buffer, &$bytes, &$overflowed): int {
+                $len = strlen($chunk);
+                if ($bytes + $len > self::MAX_RESPONSE_BYTES) {
+                    $overflowed = true;
+
+                    // A short return is cURL's documented "abort now" signal.
+                    return 0;
+                }
+                $buffer .= $chunk;
+                $bytes += $len;
+
+                return $len;
+            },
             CURLOPT_TIMEOUT_MS => $timeoutMs,
             CURLOPT_CONNECTTIMEOUT_MS => $timeoutMs,
             // NEVER auto-follow. A 3xx to another host would put the bearer key on that host.
@@ -74,6 +113,27 @@ final class CurlHttpClient implements HttpClient
         }
 
         $raw = curl_exec($ch);
+
+        // The overflow is checked BEFORE the generic transport-failure branch, because an aborted
+        // write makes curl_exec() return false and the generic branch would misreport it as a
+        // network blip - which request() RETRIES. Re-POSTing a charge because the response was too
+        // big is exactly the double-charge this SDK exists to prevent. So it is raised as a KEYED,
+        // INDETERMINATE PaylodApiError instead: not a connection error, therefore not retried, and
+        // collect() attaches the effective idempotency key to it on the way out.
+        if ($overflowed) {
+            throw new PaylodApiError(
+                'paylod returned a response larger than the ' . self::MAX_RESPONSE_BYTES
+                . '-byte ceiling and the transfer was aborted. The request WAS sent, so the charge '
+                . 'state is INDETERMINATE - the STK prompt may already be on the phone. Read the '
+                . 'payment with the attached idempotencyKey before starting any new attempt; do NOT '
+                . 'mint a fresh key (that risks a second charge).',
+                0,
+                null,
+                null,
+                true,
+            );
+        }
+
         if ($raw === false) {
             $err = curl_error($ch);
             // Rethrow SANITIZED: scrub the bearer token out of the message in case a URL/proxy error
@@ -88,7 +148,9 @@ final class CurlHttpClient implements HttpClient
         return [
             'status' => (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE),
             'headers' => $responseHeaders,
-            'body' => (string) $raw,
+            // The hand-accumulated buffer, not curl_exec()'s return value: with a WRITEFUNCTION
+            // set, cURL hands the bytes to the callback and returns true rather than the body.
+            'body' => $buffer,
             // Reported so Transport can prove, independently of this class, that nothing was
             // followed - see Transport::assertNotRedirected().
             'effectiveUrl' => is_string($effectiveUrl) && $effectiveUrl !== '' ? $effectiveUrl : null,

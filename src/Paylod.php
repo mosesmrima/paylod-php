@@ -392,23 +392,17 @@ final class Paylod
      * Send an STK Push. Resolves as soon as the prompt is on the customer's phone - the payment is
      * `pending`. Settle it with status(), wait(), or a webhook.
      *
-     * Pass `idempotencyKey`, and mint ONE KEY PER PAYMENT ATTEMPT - one press of Pay, not an order
-     * and never a product. Duplicates of that attempt collapse into one payment and one prompt.
+     * `idempotencyKey` is REQUIRED. Mint ONE KEY PER PAYMENT ATTEMPT - one press of Pay, not an
+     * order and never a product - and PERSIST it alongside the attempt before calling this method.
+     * Duplicates of that attempt then collapse into one payment and one prompt.
      *
-     * @param array{amount:int|float,phone:string,accountReference?:string,description?:string,metadata?:array<string,mixed>,idempotencyKey?:string} $params
+     * @param array{amount:int|float,phone:string,accountReference?:string,description?:string,metadata?:array<string,mixed>,idempotencyKey?:string,unsafeGeneratedIdempotencyKey?:bool} $params
      * @return array{paymentId:string,status:string,checkoutRequestId:string,idempotencyKey:string}
      */
     public function collect(array $params): array
     {
         $body = $this->buildCollectBody($params);
-        if (!isset($params['idempotencyKey'])) {
-            self::warnMissingIdempotencyKey();
-        } else {
-            // A caller-supplied key is the double-charge guard - reject a blank/whitespace/control-char
-            // one loudly rather than silently drop protection. A generated key is always well-formed.
-            Validate::idempotencyKey($params['idempotencyKey']);
-        }
-        $idempotencyKey = $params['idempotencyKey'] ?? Uuid::v4();
+        $idempotencyKey = self::resolveIdempotencyKey($params);
 
         try {
             // Simulator mode: same call, same ack, no handset. The key was proven a sandbox key in
@@ -472,7 +466,7 @@ final class Paylod
                 null,
                 $idempotencyKey,
                 true,
-                $e,
+                self::sanitizedCause($e, $this->redactor()),
             );
 
             throw $wrapped;
@@ -497,12 +491,22 @@ final class Paylod
             Validate::paymentBody($parsed, $status, $this->redactor(), $paymentId);
         });
 
+        // REDACTED ON THE WAY OUT, not only on the error path.
+        //
+        // Redaction used to be applied to error bodies and exception messages only, on the
+        // reasoning that a 2xx is "our own" data. It is not: it is bytes from the network, and the
+        // same misconfigured gateway or debug-echo endpoint that quotes the Authorization header
+        // into a 400 can quote it into a 200 - most plausibly into `resultDesc`, which is free text
+        // the SDK hands straight to a caller who logs it, renders it, or puts it in a support
+        // ticket. A live key escaping through the SUCCESS path is the same disclosure as one
+        // escaping through the failure path. The exact-secret and credential-shape scrubbing is
+        // therefore applied to every field returned here.
         return [
             'id' => (string) ($p['id'] ?? $paymentId),
-            'status' => (string) ($p['status'] ?? 'pending'),
-            'mpesaReceipt' => $p['mpesaReceipt'] ?? null,
-            'resultCode' => $p['resultCode'] ?? null,
-            'resultDesc' => $p['resultDesc'] ?? null,
+            'status' => (string) $this->redact((string) ($p['status'] ?? 'pending')),
+            'mpesaReceipt' => $this->redact($p['mpesaReceipt'] ?? null),
+            'resultCode' => $this->redact($p['resultCode'] ?? null),
+            'resultDesc' => $this->redact($p['resultDesc'] ?? null),
         ];
     }
 
@@ -579,8 +583,13 @@ final class Paylod
             // caller retries collectAndWait(), the SDK mints a FRESH key, and the customer is charged
             // twice for one order. The key (and the payment id) must ride out on the exception.
             if ($e instanceof \Paylod\Exceptions\PaylodException) {
-                $e->attachIdempotencyKey($ack['idempotencyKey']);
-                $e->attachPaymentId($ack['paymentId']);
+                // OVERWRITE, never "attach". The best-effort attach* semantics preserved whatever
+                // key or payment id the error already happened to carry - and an error thrown from
+                // an onPoll callback can carry an UNRELATED one, from a different charge entirely.
+                // The caller then read the wrong payment, concluded nothing had happened, and
+                // re-charged under a fresh key. Past the acknowledgement there is exactly one
+                // payment this error can be about, and the ack is what names it.
+                $e->bindToAcknowledgedPayment($ack['idempotencyKey'], $ack['paymentId']);
                 throw $e;
             }
 
@@ -594,9 +603,9 @@ final class Paylod
                 null,
                 $ack['idempotencyKey'],
                 true,
-                $e,
+                self::sanitizedCause($e, $this->redactor()),
             );
-            $wrapped->attachPaymentId($ack['paymentId']);
+            $wrapped->bindToAcknowledgedPayment($ack['idempotencyKey'], $ack['paymentId']);
 
             throw $wrapped;
         }
@@ -725,20 +734,66 @@ final class Paylod
         return [$timeoutMs, $onPoll];
     }
 
-    private static function warnMissingIdempotencyKey(): void
+    /**
+     * THE DOUBLE-CHARGE GUARD, resolved before a single byte leaves the process.
+     *
+     * A generated key is NOT idempotency. It is a fresh value on every invocation, so it collapses
+     * exactly nothing: a double-clicked Pay button, a refreshed tab, a redelivered queue job and a
+     * process restart mid-request each mint a NEW key and each raise a SEPARATE charge. The old
+     * behaviour - generate one and emit a once-per-process `trigger_error` - meant the protection
+     * was off by default, and the warning was invisible in every production posture that matters
+     * (`display_errors=0`, a log nobody reads, a custom error handler that swallows E_USER_WARNING,
+     * or simply the second request in the worker's lifetime).
+     *
+     * So the key is REQUIRED. The only way to get a generated one is to say, in the call itself,
+     * that you accept an unprotected charge - and it still warns, every single time, because there
+     * is no posture in which this is a good idea outside a scratch script.
+     *
+     * @param array<string,mixed> $params
+     */
+    private static function resolveIdempotencyKey(array $params): string
     {
-        if (self::$warnedMissingIdempotencyKey) {
-            return;
+        if (isset($params['idempotencyKey'])) {
+            // A caller-supplied key is the double-charge guard - reject a blank/whitespace/control-char
+            // one loudly rather than silently drop protection.
+            Validate::idempotencyKey($params['idempotencyKey']);
+
+            return (string) $params['idempotencyKey'];
         }
-        self::$warnedMissingIdempotencyKey = true;
+
+        if (($params['unsafeGeneratedIdempotencyKey'] ?? false) !== true) {
+            throw new PaylodInvalidRequestError(
+                'collect() requires an idempotencyKey. Mint ONE KEY PER PAYMENT ATTEMPT - an id you '
+                . 'create when the customer presses Pay and PERSIST on that attempt - and pass it '
+                . 'here. Without it this charge has no double-charge protection at all: a '
+                . 'double-clicked button, a refreshed tab, a redelivered job or a process restart '
+                . 'will fire a SECOND STK prompt and can charge your customer twice. A key the SDK '
+                . 'generates for you is not idempotency - it is different on every call, so it '
+                . 'collapses nothing. If you genuinely want an unprotected charge (a scratch script, '
+                . 'never production), pass "unsafeGeneratedIdempotencyKey" => true and accept that '
+                . 'this call can double-charge. See https://paylod.dev/docs/sdk#idempotency'
+            );
+        }
+
+        self::warnUnsafeGeneratedIdempotencyKey();
+
+        return Uuid::v4();
+    }
+
+    private static function warnUnsafeGeneratedIdempotencyKey(): void
+    {
+        // Deliberately NOT once-per-process. The old once-per-process warning meant a worker that
+        // handled a thousand charges warned about the first one only.
         trigger_error(
-            '[paylod] collect() was called without an idempotencyKey, so this charge is not '
-            . 'protected against being sent twice. A double-clicked Pay button, a refreshed tab, or '
-            . 'a redelivered job will fire a SECOND STK prompt and can charge your customer twice. '
-            . 'Pass ONE KEY PER PAYMENT ATTEMPT - an id you mint when the customer presses Pay, and '
-            . 'persist on that attempt. See https://paylod.dev/docs/sdk#idempotency',
+            '[paylod] collect() was called with unsafeGeneratedIdempotencyKey => true, so this '
+            . 'charge is NOT protected against being sent twice. The key is freshly generated and '
+            . 'therefore collapses nothing: a double-clicked Pay button, a refreshed tab, or a '
+            . 'redelivered job will fire a SECOND STK prompt and can charge your customer twice. '
+            . 'Pass ONE KEY PER PAYMENT ATTEMPT instead - an id you mint when the customer presses '
+            . 'Pay, and persist on that attempt. See https://paylod.dev/docs/sdk#idempotency',
             E_USER_WARNING
         );
+        self::$warnedMissingIdempotencyKey = true;
     }
 
     /**
@@ -874,9 +929,47 @@ final class Paylod
         return (int) min($deltaMs, (float) self::MAX_SLEEP_MS);
     }
 
+    /**
+     * A MONOTONIC millisecond clock, used for every deadline and every remaining-time computation.
+     *
+     * `microtime()` reads the WALL clock, and the wall clock moves. An NTP step, a daylight-saving
+     * transition, a leap-second smear or an administrator running `date -s` mid-payment all shift
+     * it - and a wait() deadline computed from it shifts with it. Backwards, a wait(30s) can hang
+     * for as long as the clock was set back. Forwards, it expires INSTANTLY: the SDK throws
+     * PaylodTimeoutError on a payment whose STK prompt is live on the customer's handset, and a
+     * caller that treats a timeout as "start again" charges twice.
+     *
+     * `hrtime(true)` counts nanoseconds from an arbitrary but MONOTONIC origin. It cannot be
+     * stepped, and it is unaffected by the system time entirely. The absolute value is meaningless
+     * - which is fine, because every use here is a difference.
+     */
     private static function nowMs(): int
     {
-        return (int) (microtime(true) * 1000);
+        return intdiv(hrtime(true), 1_000_000);
+    }
+
+    /**
+     * A cause safe to attach to a thrown error.
+     *
+     * A wrapper whose message is carefully redacted, carrying the ORIGINAL throwable as `previous`,
+     * is not redacted at all. `getPrevious()->getMessage()` still holds the raw text, and PHP's
+     * default `__toString()` on the wrapper WALKS the previous chain and prints it - so the very
+     * echoed bearer token the wrapper scrubbed reappears in the log line the framework writes, in
+     * the exception page, and in any error tracker that serialises the chain. The original's stack
+     * trace is worse: with `zend.exception_ignore_args=0` (the development default) it records call
+     * arguments, and the frames below us are the ones that were handed the credential.
+     *
+     * So the original is DROPPED and a sanitized surrogate takes its place: the original's class
+     * name and its redacted message, and nothing else. The diagnostic value - what kind of thing
+     * went wrong, and where - survives; the secret does not travel with it.
+     */
+    private static function sanitizedCause(\Throwable $e, \Closure $redact): \Throwable
+    {
+        return new PaylodConnectionError(
+            'sanitized cause: ' . $e::class . ': ' . (string) $redact($e->getMessage())
+            . ' (the original throwable is deliberately NOT chained - its message, its trace and '
+            . 'its recorded call arguments can carry the API key)'
+        );
     }
 
     /** Remaining time to the deadline in ms, or null when there is no deadline. */

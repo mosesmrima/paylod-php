@@ -69,24 +69,71 @@ final class PaylodClientTest extends TestCase
         $this->assertSame(100, $call['body']['amount']);
     }
 
-    public function testCollectGeneratesKeyWhenOmittedAndWarnsOnce(): void
+    /**
+     * THE DEFAULT IS PROTECTED. Omitting the key is a hard error, not a warning: a generated key is
+     * a different value on every invocation and therefore collapses nothing, so the old
+     * generate-and-warn behaviour shipped the double-charge guard switched off by default - with a
+     * once-per-process E_USER_WARNING that is invisible in every production posture that matters.
+     */
+    public function testCollectRefusesToChargeWithoutACallerPersistedIdempotencyKey(): void
     {
         [$paylod, $transport] = $this->client([['status' => 202, 'json' => self::ACK]]);
 
-        $warned = false;
-        set_error_handler(function (int $errno, string $msg) use (&$warned): bool {
-            $warned = str_contains($msg, 'idempotencyKey');
+        try {
+            $paylod->collect(['amount' => 100, 'phone' => '0712345678']);
+            $this->fail('expected collect() to refuse an unkeyed charge');
+        } catch (PaylodInvalidRequestError $e) {
+            $this->assertStringContainsString('idempotencyKey', $e->getMessage());
+            $this->assertStringContainsString('unsafeGeneratedIdempotencyKey', $e->getMessage());
+        }
+
+        // And - the point of the whole exercise - NOTHING WAS DISPATCHED. The refusal happens
+        // before any byte leaves the process, so no STK prompt can already be on a handset.
+        $this->assertSame([], $transport->calls, 'an unkeyed charge must never reach the network');
+    }
+
+    /**
+     * The escape hatch exists, is explicit, and warns EVERY time (not once per process - a worker
+     * handling a thousand charges warned about the first one only).
+     */
+    public function testTheUnsafeGeneratedKeyEscapeHatchIsExplicitAndWarnsEveryTime(): void
+    {
+        [$paylod, $transport] = $this->client([
+            ['status' => 202, 'json' => self::ACK],
+            ['status' => 202, 'json' => self::ACK],
+        ]);
+
+        $warnings = [];
+        set_error_handler(function (int $errno, string $msg) use (&$warnings): bool {
+            $warnings[] = $msg;
             return true;
         }, E_USER_WARNING);
 
         try {
-            $ack = $paylod->collect(['amount' => 100, 'phone' => '0712345678']);
+            $first = $paylod->collect([
+                'amount' => 100,
+                'phone' => '0712345678',
+                'unsafeGeneratedIdempotencyKey' => true,
+            ]);
+            $second = $paylod->collect([
+                'amount' => 100,
+                'phone' => '0712345678',
+                'unsafeGeneratedIdempotencyKey' => true,
+            ]);
         } finally {
             restore_error_handler();
         }
 
-        $this->assertNotSame('', $ack['idempotencyKey']);
-        $this->assertSame($ack['idempotencyKey'], $transport->calls[0]['headers']['idempotency-key']);
+        $this->assertCount(2, $warnings, 'the unsafe path must warn on every call, not once');
+        foreach ($warnings as $msg) {
+            $this->assertStringContainsString('NOT protected', $msg);
+        }
+
+        $this->assertNotSame('', $first['idempotencyKey']);
+        $this->assertSame($first['idempotencyKey'], $transport->calls[0]['headers']['idempotency-key']);
+        // And the reason it is unsafe, demonstrated rather than asserted in prose: two identical
+        // calls produced two DIFFERENT keys, i.e. two separate charges.
+        $this->assertNotSame($first['idempotencyKey'], $second['idempotencyKey']);
     }
 
     public function testCollectValidatesAmountLocally(): void
