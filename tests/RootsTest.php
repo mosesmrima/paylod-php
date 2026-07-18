@@ -7,6 +7,7 @@ namespace Paylod\Tests;
 use Paylod\Exceptions\PaylodApiError;
 use Paylod\Exceptions\PaylodConfigError;
 use Paylod\Exceptions\PaylodConnectionError;
+use Paylod\Exceptions\PaylodCredentialCompromiseError;
 use Paylod\Exceptions\PaylodSignatureVerificationError;
 use Paylod\Http\HttpClient;
 use Paylod\Http\Transport;
@@ -98,14 +99,29 @@ final class RootsTest extends TestCase
         $this->assertNotContains('mp_test_x', array_values((array) $paylod));
     }
 
-    /** ROOT 1 - REFUSES A 3xx rather than following it. */
+    /**
+     * ROOT 1 - REFUSES A 3xx rather than following it, AND DISPATCHES EXACTLY ONCE.
+     *
+     * The dispatch count is the load-bearing assertion. These detections used to throw
+     * `PaylodConnectionError`, which the retry loop treats as a network blip, so a DETECTED
+     * compromise was retried three times with the default maxRetries - replaying the bearer key to
+     * the attacker twice more after the SDK had already identified the attack. The mock repeats its
+     * last step, so nothing in the old assertions could see it happening.
+     */
     public function testRootOneRefusesARedirectStatus(): void
     {
-        [$paylod] = $this->client([['status' => 302, 'json' => [], 'headers' => ['location' => 'https://evil.example/']]]);
+        [$paylod, $http] = $this->client([['status' => 302, 'json' => [], 'headers' => ['location' => 'https://evil.example/']]]);
 
-        $this->expectException(PaylodConnectionError::class);
-        $this->expectExceptionMessageMatches('/redirect/i');
-        $paylod->status('pay_1');
+        try {
+            $paylod->status('pay_1');
+            $this->fail('expected a credential compromise error');
+        } catch (PaylodCredentialCompromiseError $e) {
+            $this->assertMatchesRegularExpression('/redirect/i', $e->getMessage());
+        }
+
+        $this->assertCount(1, $http->calls, 'a detected compromise must never be re-dispatched');
+        // And it is NOT a connection error, which is what made it retryable.
+        $this->assertNotInstanceOf(PaylodConnectionError::class, new PaylodCredentialCompromiseError('x'));
     }
 
     /**
@@ -116,29 +132,58 @@ final class RootsTest extends TestCase
      */
     public function testRootOneRefusesATwoHundredReachedByFollowingARedirect(): void
     {
-        [$paylod] = $this->client([[
+        [$paylod, $http] = $this->client([[
             'status' => 200,
             'json' => ['id' => 'pay_1', 'status' => 'pending'],
             'redirectCount' => 1,
         ]]);
 
-        $this->expectException(PaylodConnectionError::class);
-        $this->expectExceptionMessageMatches('/FOLLOWED/');
-        $paylod->status('pay_1');
+        try {
+            $paylod->status('pay_1');
+            $this->fail('expected a credential compromise error');
+        } catch (PaylodCredentialCompromiseError $e) {
+            $this->assertMatchesRegularExpression('/FOLLOWED/', $e->getMessage());
+        }
+
+        $this->assertCount(1, $http->calls, 'the key must not be replayed again after detection');
     }
 
-    /** ROOT 1 - refuses a 2xx whose final URL is off the pinned origin. */
+    /** ROOT 1 - refuses a 2xx whose final URL is off the pinned origin, once. */
     public function testRootOneRefusesAResponseFromOffThePinnedOrigin(): void
     {
-        [$paylod] = $this->client([[
+        [$paylod, $http] = $this->client([[
             'status' => 200,
             'json' => ['id' => 'pay_1', 'status' => 'pending'],
             'effectiveUrl' => 'https://evil.example/functions/v1/status/pay_1',
         ]]);
 
-        $this->expectException(PaylodConnectionError::class);
-        $this->expectExceptionMessageMatches('/pinned paylod origin/');
-        $paylod->status('pay_1');
+        try {
+            $paylod->status('pay_1');
+            $this->fail('expected a credential compromise error');
+        } catch (PaylodCredentialCompromiseError $e) {
+            $this->assertMatchesRegularExpression('/pinned paylod origin/', $e->getMessage());
+        }
+
+        $this->assertCount(1, $http->calls);
+    }
+
+    /**
+     * THE MONEY-PATH CONSEQUENCE. On /collect each retry is another POSTED CHARGE, so a redirect in
+     * front of the API turned one payment into three attempts. Exactly one dispatch, and the error
+     * still carries the idempotency key so the caller can settle the one attempt that was made.
+     */
+    public function testRootOneARedirectOnCollectDispatchesTheChargeExactlyOnce(): void
+    {
+        [$paylod, $http] = $this->client([['status' => 302, 'json' => [], 'headers' => ['location' => 'https://evil.example/']]]);
+
+        try {
+            $paylod->collect(['amount' => 100, 'phone' => '0712345678', 'idempotencyKey' => 'key-1']);
+            $this->fail('expected a credential compromise error');
+        } catch (PaylodCredentialCompromiseError $e) {
+            $this->assertSame('key-1', $e->idempotencyKey);
+        }
+
+        $this->assertCount(1, $http->calls, 'a redirect must not re-POST the charge');
     }
 
     /** A response from the pinned origin, with the default port written explicitly, is fine. */

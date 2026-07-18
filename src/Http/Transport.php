@@ -6,7 +6,7 @@ namespace Paylod\Http;
 
 use Closure;
 use Paylod\Exceptions\PaylodConfigError;
-use Paylod\Exceptions\PaylodConnectionError;
+use Paylod\Exceptions\PaylodCredentialCompromiseError;
 
 /**
  * THE CREDENTIALED TRANSPORT.
@@ -183,6 +183,11 @@ final class Transport
      *      redirect while lying about (or omitting) the count.
      *
      * None of these is retryable: a redirect is a configuration error or an attack, never a blip.
+     * That is enforced BY THE TYPE. Each throws {@see PaylodCredentialCompromiseError}, which is
+     * NOT a `PaylodConnectionError` and therefore cannot be swallowed by the retry loop in
+     * {@see \Paylod\Paylod::request()}. Previously these were connection errors, so a detected
+     * compromise was retried: the bearer key was replayed to the attacker twice more, and on
+     * `/collect` each retry was another posted charge.
      *
      * @param array<string,mixed> $res
      */
@@ -190,7 +195,7 @@ final class Transport
     {
         $status = (int) ($res['status'] ?? 0);
         if ($status >= 300 && $status < 400) {
-            throw new PaylodConnectionError($this->scrub(
+            throw new PaylodCredentialCompromiseError($this->scrub(
                 "paylod returned an unexpected redirect (HTTP {$status}) from {$requested}. Refusing "
                 . 'to follow it - a cross-origin redirect could leak your Authorization header to '
                 . 'another host.'
@@ -199,7 +204,7 @@ final class Transport
 
         $redirectCount = $res['redirectCount'] ?? null;
         if (is_int($redirectCount) && $redirectCount > 0) {
-            throw new PaylodConnectionError($this->scrub(
+            throw new PaylodCredentialCompromiseError($this->scrub(
                 'The HTTP client FOLLOWED ' . $redirectCount . ' redirect(s) even though this SDK '
                 . 'disabled redirect following. Your Authorization header may already have been '
                 . 'replayed to another host - treat this API key as compromised and rotate it. This '
@@ -220,10 +225,10 @@ final class Transport
     {
         $origin = self::originOf($candidate);
         if ($origin === null) {
-            throw new PaylodConnectionError($this->scrub("{$what} is not a valid URL."));
+            throw new PaylodCredentialCompromiseError($this->scrub("{$what} is not a valid URL."));
         }
         if ($origin !== $this->origin) {
-            throw new PaylodConnectionError($this->scrub(
+            throw new PaylodCredentialCompromiseError($this->scrub(
                 "Refusing a request that is not addressed to the pinned paylod origin: {$what} "
                 . "resolves to \"{$origin}\", but this client is pinned to \"{$this->origin}\". Your "
                 . 'API key is a bearer credential and is sent on every request, so it may only ever '
