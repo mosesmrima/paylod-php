@@ -442,6 +442,39 @@ final class MoneyPathHardeningTest extends TestCase
         }
     }
 
+    /**
+     * THE STATUS-READ PATH must refuse a laundered zero too. `{"resultCode":-0}` decodes to the
+     * integer 0 - indistinguishable from a genuine settlement - so a `status: "success"` body
+     * carrying it would otherwise be reported PAID and a merchant would ship goods.
+     */
+    public function testARawZeroLexemeOnTheStatusPathIsRefusedAsIndeterminate(): void
+    {
+        foreach (['-0', '0e999', '0.0'] as $token) {
+            $raw = '{"id":"pay_123","status":"success","mpesaReceipt":null,"resultCode":'
+                . $token . ',"resultDesc":null}';
+
+            [$paylod] = $this->client([['status' => 200, 'raw' => $raw]]);
+
+            try {
+                $paylod->status('pay_123');
+                $this->fail("raw token {$token} was accepted on the status path");
+            } catch (PaylodApiError $e) {
+                $this->assertTrue($e->indeterminate, $token);
+                $this->assertStringContainsString('non-canonical resultCode token', $e->getMessage());
+            }
+        }
+    }
+
+    /** The genuine canonical zero still reads as paid - the guard must not break real settlements. */
+    public function testTheCanonicalZeroStillReadsAsPaidOnTheStatusPath(): void
+    {
+        $raw = '{"id":"pay_123","status":"success","mpesaReceipt":"SFF6XYZ123","resultCode":0,'
+            . '"resultDesc":"Success"}';
+        [$paylod] = $this->client([['status' => 200, 'raw' => $raw]]);
+
+        $this->assertTrue($paylod->check('pay_123')->paid);
+    }
+
     // -- 3b. Identifier shape on the acknowledgement path --------------------------
 
     /**

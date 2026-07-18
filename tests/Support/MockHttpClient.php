@@ -58,7 +58,12 @@ final class MockHttpClient implements HttpClient
         return [
             'status' => (int) ($step['status'] ?? 200),
             'headers' => $step['headers'] ?? [],
-            'body' => json_encode($step['json'] ?? new \stdClass()),
+            // A `raw` step supplies the response BYTES verbatim. json_encode() would re-serialise
+            // and so destroy the exact numeric lexeme some tests exist to exercise: `-0` comes back
+            // out of a decode/encode round trip as `0`, which is the very laundering under test.
+            'body' => array_key_exists('raw', $step)
+                ? (string) $step['raw']
+                : json_encode($step['json'] ?? new \stdClass()),
             // A stubbed client has no real effective URL and follows nothing. Both are reported
             // honestly so Transport's redirect checks are exercised rather than short-circuited; a
             // step may override either to simulate a lying/redirect-following client.

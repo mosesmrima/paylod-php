@@ -203,7 +203,7 @@ $CASES = [
         'edits' => [
             [
                 'src/DarajaCatalog.php',
-                "        if (\$resultCode === 0 || \$raw === '0') {",
+                "        if (\$raw === '0') {",
                 "        if (\$raw !== '' && is_numeric(\$raw) && \$raw + 0 == 0) {",
             ],
         ],
@@ -215,7 +215,7 @@ $CASES = [
         'edits' => [
             [
                 'src/DarajaCatalog.php',
-                "        if (preg_match('/^[1-9][0-9]*\$/', \$raw) === 1) {",
+                '        if (preg_match(\'/^[1-9][0-9]*\\z/\', $raw) === 1) {',
                 "        if (\$raw !== '' && is_numeric(\$raw)) {",
             ],
         ],
@@ -400,6 +400,205 @@ $CASES = [
             ['src/Webhook.php', "        if (\$type === 'payment.failed' && \$judgement->verdict !== Semantics::VERDICT_FAILED) {", '        if (false) {'],
         ],
     ],
+
+
+    // == SIXTH ROUND - validate before normalising, and re-derive every conclusion ==============
+    //
+    // NOTE ON ANCHORS: every `find` below is a SINGLE-QUOTED PHP string. A double-quoted anchor
+    // containing $resultCode / $raw / $status is interpolated by PHP before it is ever compared,
+    // so it silently matches 0x and the case reports BROKEN-ANCHOR.
+    [
+        'id' => 'S6-lexeme-trim',
+        'what' => 'the result code is trimmed before validation again, laundering " 1032" into the retryable 1032 entry',
+        'test' => 'testAPaddedTerminalCodeIsNeverDecodedAsTheRetryableEntry',
+        'edits' => [
+            [
+                'src/DarajaCatalog.php',
+                '        if (is_string($resultCode)) {' . "\n" . '            return $resultCode;' . "\n" . '        }',
+                '        if (is_string($resultCode)) {' . "\n" . '            return trim($resultCode);' . "\n" . '        }',
+            ],
+        ],
+    ],
+    [
+        'id' => 'S6-lexeme-float',
+        'what' => 'a float result code is stringified again, so 0.0 and " 0 " become SUCCESS',
+        'test' => 'testNoOtherZeroLikeRepresentationIsEverSuccess',
+        'edits' => [
+            [
+                'src/DarajaCatalog.php',
+                '        return \'\';' . "\n" . '    }' . "\n" . "\n" . '    /**' . "\n" . '     * Classify a synchronous STK Query result.',
+                '        return $resultCode === null ? \'\' : trim((string) $resultCode);' . "\n" . '    }' . "\n" . "\n" . '    /**' . "\n" . '     * Classify a synchronous STK Query result.',
+            ],
+        ],
+    ],
+    [
+        'id' => 'S6-anchor',
+        'what' => 'the canonical-code regex is anchored with $ again, so "1032\n" passes as canonical',
+        'test' => 'testNonCanonicalNonZeroCodesAreNotTerminalEither',
+        'edits' => [
+            [
+                'src/DarajaCatalog.php',
+                '        if (preg_match(\'/^[1-9][0-9]*\z/\', $raw) === 1) {',
+                '        if (preg_match(\'/^[1-9][0-9]*$/\', $raw) === 1) {',
+            ],
+        ],
+    ],
+    [
+        'id' => 'S6-rawjson-webhook',
+        'what' => 'the webhook decodes without checking raw numeric lexemes, so `-0` is laundered into a paid success',
+        'test' => 'testARawZeroLexemeNeverPassesWebhookVerification',
+        'edits' => [
+            [
+                'src/Webhook.php',
+                '        $badToken = JsonLexeme::nonCanonicalResultCodeToken($raw);',
+                '        $badToken = null;',
+            ],
+        ],
+    ],
+    [
+        'id' => 'S6-rawjson-money',
+        'what' => 'the status path decodes without checking raw numeric lexemes',
+        'test' => 'testARawZeroLexemeOnTheStatusPathIsRefusedAsIndeterminate',
+        'edits' => [
+            [
+                'src/Paylod.php',
+                '                $badToken = JsonLexeme::nonCanonicalResultCodeToken($text);',
+                '                $badToken = null;',
+            ],
+        ],
+    ],
+    [
+        'id' => 'S6-derived',
+        'what' => 'the webhook forwards server-supplied conclusions, so a forged retryable=true reaches the handler',
+        'test' => 'testAForgedRetryableOnATerminalFailureIsOverwritten',
+        'edits' => [
+            [
+                'src/Webhook.php',
+                '        return self::withAuthoritativeDerivedFields($event);',
+                '        return $event;',
+            ],
+        ],
+    ],
+    [
+        'id' => 'S6-decoded-synth',
+        'what' => 'a missing decoded block is left absent rather than synthesized',
+        'test' => 'testAMissingDecodedBlockIsSynthesizedAndNonRetryable',
+        'edits' => [
+            [
+                'src/Webhook.php',
+                '        $decoded = $outcome->detail ?? self::synthesizeDecoded($outcome);',
+                '        $decoded = $outcome->detail ?? [\'category\' => \'unknown\', \'retryable\' => true];',
+            ],
+        ],
+    ],
+    [
+        'id' => 'S6-strip-unknown',
+        'what' => 'derived fields on an unknown event type are forwarded unchecked',
+        'test' => 'testDerivedFieldsAreStrippedFromUnknownEventTypes',
+        'edits' => [
+            [
+                'src/Webhook.php',
+                '            return self::stripDerived($event);',
+                '            return $event;',
+            ],
+        ],
+    ],
+    [
+        'id' => 'S6-terminal-redirect',
+        'what' => 'a detected credential compromise is a connection error again, so the retry loop re-dispatches the charge',
+        'test' => 'testRootOneARedirectOnCollectDispatchesTheChargeExactlyOnce',
+        'edits' => [
+            [
+                'src/Http/Transport.php',
+                '            throw new PaylodCredentialCompromiseError($this->scrub(' . "\n" . '                "paylod returned an unexpected redirect',
+                '            throw new \Paylod\Exceptions\PaylodConnectionError($this->scrub(' . "\n" . '                "paylod returned an unexpected redirect',
+            ],
+        ],
+    ],
+    [
+        'id' => 'S6-id-grammar',
+        'what' => 'acknowledgement identifiers lose their shape check',
+        'test' => 'testAnAckWithAMalformedIdentifierIsRefused',
+        'edits' => [
+            [
+                'src/Support/Validate.php',
+                '        if (preg_match(self::IDENTIFIER_RE, $value) !== 1) {',
+                '        if (false) {',
+            ],
+        ],
+    ],
+    [
+        'id' => 'S6-id-credential',
+        'what' => 'an identifier carrying the bearer token is accepted, putting the key in the payment log',
+        'test' => 'testAnAckWhoseIdentifiersCarryTheApiKeyIsRefusedAsIndeterminate',
+        'edits' => [
+            [
+                'src/Support/Validate.php',
+                '        if ($redact !== null && $redact($value) !== $value) {',
+                '        if (false) {',
+            ],
+        ],
+    ],
+    [
+        'id' => 'S6-baseurl-redact',
+        'what' => 'baseUrl validation errors quote the credential they just caught',
+        'test' => 'testBaseUrlValidationErrorsDoNotQuoteTheCredential',
+        'edits' => [
+            [
+                'src/Http/Transport.php',
+                '        $shown = Redact::text($baseUrl, [$apiKey]);',
+                '        $shown = $baseUrl;',
+            ],
+        ],
+    ],
+    [
+        'id' => 'S6-header-bytes',
+        'what' => 'response headers lose their aggregate byte ceiling',
+        'test' => 'testTheResponseHeadersHaveAnAggregateCeiling',
+        'edits' => [
+            [
+                'src/Http/CurlHttpClient.php',
+                '        if ($headerBytes > self::MAX_HEADER_BYTES) {',
+                '        if (false) {',
+            ],
+        ],
+    ],
+    [
+        'id' => 'S6-header-count',
+        'what' => 'response headers lose their count ceiling, so many tiny headers still exhaust memory',
+        'test' => 'testTheResponseHeadersHaveAnAggregateCeiling',
+        'edits' => [
+            [
+                'src/Http/CurlHttpClient.php',
+                '        if (!isset($headers[$key]) && count($headers) >= self::MAX_HEADER_COUNT) {',
+                '        if (false) {',
+            ],
+        ],
+    ],
+    [
+        'id' => 'S6-config-cast',
+        'what' => 'the shipped config file pre-casts timeout_ms, silencing the provider check one layer up',
+        'test' => 'testAFractionalEnvValueSurvivesTheConfigFileAndIsRefused',
+        'edits' => [
+            [
+                'config/paylod.php',
+                "    'timeout_ms' => env('PAYLOD_TIMEOUT_MS', 30000),",
+                "    'timeout_ms' => (int) env('PAYLOD_TIMEOUT_MS', 30000),",
+            ],
+        ],
+    ],
+    [
+        'id' => 'S6-trace-args',
+        'what' => 'the collect validator closure stops being #[\SensitiveParameter], leaking a reflected key into the trace',
+        'test' => 'testSecretsAreScrubbedFromStackTracesWithExceptionArgsEnabled',
+        'edits' => [
+            [
+                'src/Paylod.php',
+                'function (#[\SensitiveParameter] array $parsed, int $status) use ($idempotencyKey): void {',
+                'function (array $parsed, int $status) use ($idempotencyKey): void {',
+            ],
+        ],
+    ],
 ];
 
 /**
@@ -409,7 +608,10 @@ $CASES = [
  */
 function runTests(string $selector): array
 {
-    $cmd = 'vendor/bin/phpunit --filter ' . escapeshellarg('/::' . preg_quote($selector, '/') . '$/')
+    // The selector matches the method name at a boundary, NOT at end-of-string: a @dataProvider
+    // test is named `method with data set "..."`, so a `$` anchor matched none of them and
+    // reported BROKEN-SELECTOR - this harness's own documented trap, sprung on itself.
+    $cmd = 'vendor/bin/phpunit --filter ' . escapeshellarg('/::' . preg_quote($selector, '/') . '(?:$| with data set)/')
         . ' --do-not-cache-result 2>&1';
     exec($cmd, $lines, $code);
     $out = implode("\n", $lines);

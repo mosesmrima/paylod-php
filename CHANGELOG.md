@@ -6,6 +6,120 @@ All notable changes to `paylod/paylod` are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-07-18
+
+**Breaking.** A sixth independent review found no criticals - the first round with none - but five
+highs and four mediums, plus four test-quality defects that were masking real bugs. Every protection
+below is verified NON-VACUOUS by `scripts/non-vacuity.php`: **48/48 mutations caught** (up from
+32/32). The golden webhook vector (`whsec_golden_vector_v1` -> `3afe38e4...2c2eb7`) still signs
+byte-for-byte identically.
+
+The theme of this round is ORDERING. In every one of the money-correctness defects the check itself
+was correct and a layer BELOW it had already converted the impostor into canonical form before the
+check ran. A validator downstream of a normaliser does not validate its input; it validates the
+normaliser's output.
+
+### Breaking
+
+- **`Webhook::verify()` now OVERWRITES every derived field** rather than returning the event
+  unchanged. `data.decoded`, `data.retryable`, `data.customerMessage` and `data.category` are
+  recomputed from the local `DarajaCatalog`, at the root and inside `data`, and a missing `decoded`
+  block is synthesized rather than left absent. A signature proves ORIGIN; it does not make a
+  CONCLUSION true. A signed `payment.failed` carrying result code 17 and a forged
+  `decoded.retryable = true` previously passed every check and told the caller to charge again.
+  Unknown event types have their derived fields stripped, since nothing can verify them.
+
+- **`Webhook::verifySignature()` no longer returns an event-shaped value.** It returns
+  `{signatureValid, actionable: false, unverifiedEvent}`. Two functions with the same return shape,
+  one safe and one not, is a trap rather than an API. `isValidSignature()` is renamed
+  `isValidSignatureOnlyNotActionable()`. Both are `@internal` - they exist to pin the cross-repo
+  golden vector. Use `verify()` / `isValid()` for anything reaching a handler.
+
+- **Redirect and off-origin detections now throw `PaylodCredentialCompromiseError`**, not
+  `PaylodConnectionError`. It extends `PaylodException`, so `catch (PaylodException $e)` is
+  unaffected, but the retry loop cannot swallow it.
+
+- **A collect acknowledgement's identifiers must satisfy an identifier grammar.** A `paymentId` or
+  `checkoutRequestId` that is oversized, malformed, or credential-shaped is a keyed INDETERMINATE
+  error rather than a successful ack.
+
+### Money correctness
+
+- **Result codes are validated on their LEXEME, before anything can normalise them.**
+  `DarajaCatalog::normalizeCode()` trimmed strings and stringified floats, so `" 0"` and the float
+  `0.0` were both classified SUCCESS, and `" 1032"` was laundered into the real 1032 entry - a
+  cancellation the catalog marks RETRYABLE, i.e. the SDK invited a second charge on a code it had
+  itself rewritten. Ints render canonically, strings pass through VERBATIM, and floats, booleans and
+  null have no lexeme at all - unreadable, which is `pending`, never success and never terminal.
+
+- **Raw JSON numeric lexemes are checked before `json_decode()` destroys them.**
+  `{"resultCode":-0}` decodes to the PHP integer `0` - byte-identical to a genuine settlement - so
+  no post-parse check could tell them apart, and a `status: "success"` body carrying it was reported
+  PAID. `Support\JsonLexeme` scans the raw bytes on both the money path and the webhook path and
+  refuses the body. The scan is lexical, governs `resultCode` only, and fails closed; its limits are
+  documented on the class.
+
+- **A detected credential compromise is no longer retried.** These threw `PaylodConnectionError`,
+  which the retry loop treats as a network blip, so a detected compromise was dispatched three times
+  with the default `maxRetries` - replaying the bearer key to the attacker twice more, and on
+  `/collect` posting the charge three times.
+
+- **PCRE anchors are `\z`, not `$`.** `$` also matches before a trailing newline, so `"1032\n"`
+  passed the canonical-code regex with no `trim()` involved. Fixed in `DarajaCatalog`, `Phone`, the
+  webhook timestamp and digest checks, and the Laravel provider's lexical number check.
+
+### Secret hygiene
+
+- **Raw response bodies and validator closures are `#[\SensitiveParameter]`.** PHP records call
+  arguments in every stack trace when `zend.exception_ignore_args=0`, so a reflected bearer token
+  was scrubbed from the message and the attached body while sitting verbatim in `getTrace()`.
+  Marking `Validate::collectAck()` was not sufficient - the validator CLOSURE is its own frame,
+  invoked with the raw body as its argument.
+
+- **`baseUrl` is sensitive and redacted in configuration errors.** `https://mp_live_key@paylod.dev/`
+  is refused for carrying userinfo - correctly - but the message interpolated the URL verbatim, so
+  the diagnostic printed the live key into the caller's log. A check that leaks the secret it
+  detects is not a protection.
+
+- **Identifier fields cannot carry a credential.** A 202 returned `paymentId` / `checkoutRequestId`
+  with no shape check, so a server echoing the bearer token into either put it into commonly logged
+  output through the SUCCESS path, where nothing redacts.
+
+### Robustness
+
+- **Response headers have an aggregate ceiling** (`MAX_HEADER_BYTES` 256 KiB, `MAX_HEADER_COUNT`
+  200). libcurl caps each individual header at 100 KiB and hands them over one at a time, which
+  limits nothing about how many arrive; every one was accumulated forever. Overflow raises the same
+  keyed indeterminate error a body overflow does.
+
+- **`config/paylod.php` no longer pre-casts `timeout_ms` / `max_retries`.** `(int) env(...)` ran
+  before the provider's lexical checks, so `PAYLOD_TIMEOUT_MS=1.5` arrived as a well-formed `1` -
+  the operator's value neither honoured nor rejected. For a timeout that matters: `(int) 0.5` is
+  `0`, and `0` disables cURL's timeout entirely.
+
+### Tests
+
+Four test-quality defects, each of which was masking a real bug:
+
+- `DarajaCatalogTest` declared the float `0.0` and the padded `"  0  "` SCHEMA-APPROVED, enforcing
+  the opposite of the required rule. Both move to the impostor provider, along with booleans, with
+  end-to-end assertions through `PaymentOutcome` and webhook verification.
+- The decoded-webhook test built its expectation from the same catalog it asserted against, so it
+  passed whether the block was re-derived or forwarded. It now supplies deliberately false
+  conclusions and requires them to be overwritten.
+- The redirect tests asserted only the exception; `MockHttpClient` repeats its last step, so the
+  extra dispatches were invisible. They now assert exactly ONE dispatch.
+- The stack-trace probe ignored a failed temp-file write, so `"Could not open input file"` satisfied
+  its non-empty assertion and the probe passed without running. It now asserts the file, the
+  subprocess exit status and the presence of real paylod frames, and inspects the COMPLETE
+  structured trace rather than only `getTraceAsString()`. `phpunit failOnWarning` is now `true`.
+
+The Laravel tests injected a config `Repository` directly and so never executed the shipped config
+file - the layer where the defect lived. New tests load it for real with the environment set.
+
+`MockHttpClient` gained a `raw` step so a test can supply response BYTES; `json_encode()` would
+re-serialise and destroy the very lexemes several of these tests exist to exercise.
+
 ## [0.6.0] - 2026-07-18
 
 **Breaking.** A fifth independent review found seven money-correctness defects and five mediums.
@@ -462,7 +576,11 @@ v0.3.x) to idiomatic PHP 8.1+, with first-class Laravel support.
 - Injectable HTTP transport (`Paylod\Http\Transport`), defaulting to `CurlTransport`, so the
   whole test suite runs with no network.
 
-[Unreleased]: https://github.com/mosesmrima/paylod-php/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/mosesmrima/paylod-php/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/mosesmrima/paylod-php/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/mosesmrima/paylod-php/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/mosesmrima/paylod-php/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/mosesmrima/paylod-php/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/mosesmrima/paylod-php/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/mosesmrima/paylod-php/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/mosesmrima/paylod-php/releases/tag/v0.1.0
