@@ -11,7 +11,7 @@ use Paylod\Exceptions\PaylodException;
 use Paylod\Exceptions\PaylodInvalidRequestError;
 use Paylod\Exceptions\PaylodTimeoutError;
 use Paylod\Paylod;
-use Paylod\Tests\Support\MockTransport;
+use Paylod\Tests\Support\MockHttpClient;
 use PHPUnit\Framework\TestCase;
 
 /**
@@ -38,13 +38,13 @@ final class MoneyPathHardeningTest extends TestCase
 
     /**
      * @param list<array<string,mixed>> $steps
-     * @return array{0:Paylod,1:MockTransport}
+     * @return array{0:Paylod,1:MockHttpClient}
      */
     private function client(array $steps, array $options = [], string $key = 'mp_test_x'): array
     {
-        $transport = new MockTransport($steps);
+        $transport = new MockHttpClient($steps);
 
-        return [new Paylod($key, array_merge(['transport' => $transport], $options)), $transport];
+        return [new Paylod($key, array_merge(['httpClient' => $transport, 'allowCustomHttpClient' => true], $options)), $transport];
     }
 
     private static function invoke(string $method, mixed ...$args): mixed
@@ -211,8 +211,9 @@ final class MoneyPathHardeningTest extends TestCase
             'missing status' => [['id' => 'pay_1']],
             'status wrong type' => [['id' => 'pay_1', 'status' => 1]],
             'unknown status' => [['id' => 'pay_1', 'status' => 'weird']],
-            'success without evidence' => [['id' => 'pay_1', 'status' => 'success', 'mpesaReceipt' => null, 'resultCode' => null]],
-            'success with blank receipt' => [['id' => 'pay_1', 'status' => 'success', 'mpesaReceipt' => '  ', 'resultCode' => null]],
+            // NOTE: an evidence-free `success` is NOT listed here. It is a well-SHAPED body that
+            // makes an unsupported CLAIM, so it is not a validator's business - it is law L2, and it
+            // resolves to INDETERMINATE in Semantics::judge(). See the two tests below.
             'receipt wrong type' => [['id' => 'pay_1', 'status' => 'pending', 'mpesaReceipt' => 42]],
             'resultCode wrong type' => [['id' => 'pay_1', 'status' => 'pending', 'resultCode' => ['x']]],
         ];
@@ -230,19 +231,26 @@ final class MoneyPathHardeningTest extends TestCase
         $paylod->status('pay_1');
     }
 
+    /**
+     * L2, on the read path. The money question, stated plainly: an evidence-free "success" must not
+     * ship goods.
+     *
+     * It resolves to INDETERMINATE rather than throwing, and that difference is deliberate: an
+     * indeterminate payment must keep being POLLED so a webhook can settle it. Throwing here would
+     * abort wait() on a payment that is very likely about to succeed.
+     */
     public function testSuccessWithoutEvidenceIsNeverReportedAsPaid(): void
     {
-        // The money question, stated plainly: an evidence-free "success" must not ship goods.
-        [$paylod] = $this->client([[
-            'status' => 200,
-            'json' => ['id' => 'pay_1', 'status' => 'success', 'mpesaReceipt' => null, 'resultCode' => null],
-        ]]);
+        foreach ([null, '  '] as $receipt) {
+            [$paylod] = $this->client([[
+                'status' => 200,
+                'json' => ['id' => 'pay_1', 'status' => 'success', 'mpesaReceipt' => $receipt, 'resultCode' => null],
+            ]]);
 
-        try {
             $outcome = $paylod->check('pay_1');
-            $this->fail('a success with no receipt and no result code must not read as paid, got: ' . $outcome->status);
-        } catch (PaylodApiError $e) {
-            $this->assertTrue($e->indeterminate);
+            $this->assertFalse($outcome->paid, 'an evidence-free success must never read as paid');
+            $this->assertFalse($outcome->retryable, 'an indeterminate payment is never safe to re-charge');
+            $this->assertSame('pending', $outcome->status);
         }
     }
 
@@ -359,7 +367,7 @@ final class MoneyPathHardeningTest extends TestCase
     public function testFractionalOrOutOfRangeConstructorTimeoutIsRefused(mixed $value): void
     {
         $this->expectException(PaylodConfigError::class);
-        new Paylod('mp_test_x', ['transport' => new MockTransport([]), 'timeoutMs' => $value]);
+        new Paylod('mp_test_x', ['httpClient' => new MockHttpClient([]), 'allowCustomHttpClient' => true, 'timeoutMs' => $value]);
     }
 
     /** @dataProvider badTimeouts */
@@ -389,7 +397,7 @@ final class MoneyPathHardeningTest extends TestCase
     public function testMaxRetriesIsBounded(mixed $value): void
     {
         $this->expectException(PaylodConfigError::class);
-        new Paylod('mp_test_x', ['transport' => new MockTransport([]), 'maxRetries' => $value]);
+        new Paylod('mp_test_x', ['httpClient' => new MockHttpClient([]), 'allowCustomHttpClient' => true, 'maxRetries' => $value]);
     }
 
     public function testSleepIsClampedToSixtySecondsEvenWithNoDeadline(): void
@@ -488,14 +496,16 @@ final class MoneyPathHardeningTest extends TestCase
         }
     }
 
-    public function testSimulatorOutcomeRejectsAnEvidenceFreeSuccess(): void
+    /** L2 on the simulator's settle path: the same rule, reached through the same judge(). */
+    public function testSimulatorOutcomeNeverReportsAnEvidenceFreeSuccessAsPaid(): void
     {
         [$paylod] = $this->client([[
             'status' => 200,
             'json' => ['paymentId' => 'pay_sim', 'status' => 'success', 'resultCode' => null, 'mpesaReceipt' => null],
         ]]);
 
-        $this->expectException(PaylodApiError::class);
-        $paylod->simulator->outcome('pay_sim', 'approve');
+        $res = $paylod->simulator->outcome('pay_sim', 'approve');
+        $this->assertFalse($res['outcome']->paid);
+        $this->assertFalse($res['outcome']->retryable);
     }
 }

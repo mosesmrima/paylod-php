@@ -8,6 +8,7 @@ use Closure;
 use Paylod\Exceptions\PaylodInvalidRequestError;
 use Paylod\Exceptions\PaylodSandboxOnlyError;
 use Paylod\Support\Redact;
+use Paylod\Support\Uuid;
 use Paylod\Support\Validate;
 
 /**
@@ -31,17 +32,30 @@ final class Simulator
     private const SANDBOX_PREFIX = 'mp_test_';
     private const LIVE_PREFIX = 'mp_live_';
 
-    private string $apiKey;
+    /**
+     * The credential, behind a closure - see {@see \Paylod\Paylod::$apiKey} for why a string
+     * property is not good enough (var_export() ignores __debugInfo() and dumps real properties).
+     *
+     * @var Closure():string
+     */
+    private Closure $apiKey;
 
-    /** @var Closure(array{method:string,path:string,body?:mixed,idempotencyKey?:string}):array<string,mixed> */
+    /** The masked prefix, safe to print. */
+    private ?string $apiKeyMasked;
+
+    /**
+     * @var Closure(array{method:string,path:string,body?:mixed,idempotencyKey?:string,validate?:?\Closure}):array<string,mixed>
+     */
     private Closure $request;
 
     /**
-     * @param Closure(array{method:string,path:string,body?:mixed,idempotencyKey?:string}):array<string,mixed> $request
+     * @param Closure():string $apiKey
+     * @param Closure(array{method:string,path:string,body?:mixed,idempotencyKey?:string,validate?:?\Closure}):array<string,mixed> $request
      */
-    public function __construct(#[\SensitiveParameter] string $apiKey, Closure $request)
+    public function __construct(Closure $apiKey, Closure $request)
     {
         $this->apiKey = $apiKey;
+        $this->apiKeyMasked = Redact::mask(($apiKey)());
         $this->request = $request;
     }
 
@@ -73,13 +87,13 @@ final class Simulator
      */
     public function __debugInfo(): array
     {
-        return ['apiKey' => Redact::mask($this->apiKey)];
+        return ['apiKey' => $this->apiKeyMasked];
     }
 
     /** Scrub the key out of anything attached to an error raised from here. */
     private function redactor(): Closure
     {
-        return fn (mixed $value): mixed => Redact::apply($value, [$this->apiKey]);
+        return fn (mixed $value): mixed => Redact::apply($value, [($this->apiKey)()]);
     }
 
     /** The five outcomes, as a list. */
@@ -96,7 +110,7 @@ final class Simulator
      */
     public function collect(array $params = []): array
     {
-        self::assertSandboxKey($this->apiKey, 'simulate.collect()');
+        self::assertSandboxKey(($this->apiKey)(), 'simulate.collect()');
 
         $amount = $params['amount'] ?? 1;
         if (!is_int($amount) || $amount <= 0) {
@@ -122,21 +136,32 @@ final class Simulator
             $body['metadata'] = $params['metadata'];
         }
 
-        $call = ['method' => 'POST', 'path' => '/simulate/collect', 'body' => $body];
         if (isset($params['idempotencyKey'])) {
             // The SAME key rules production enforces. The simulator exists so a test can prove "a
             // double-click cannot charge twice" against the real thing - a simulator that accepted a
             // key production would reject would make that test a lie.
             Validate::idempotencyKey($params['idempotencyKey']);
-            $call['idempotencyKey'] = $params['idempotencyKey'];
         }
+        // A missing key is GENERATED rather than omitted. Settling is a mutating call, and a
+        // simulator that dispatches an unkeyed charge cannot be used to prove anything about the
+        // keyed production path it stands in for.
+        $idempotencyKey = $params['idempotencyKey'] ?? Uuid::v4();
+        $redact = $this->redactor();
 
-        $ack = ($this->request)($call);
-
-        // And the SAME acknowledgement schema. Reading paymentId straight out of the body used to
-        // produce an empty id (or a TypeError) from a malformed 2xx instead of a keyed indeterminate
-        // error, which is exactly the failure mode the production path was hardened against.
-        Validate::collectAck($ack, 200, $params['idempotencyKey'] ?? null, $this->redactor());
+        $ack = ($this->request)([
+            'method' => 'POST',
+            'path' => '/simulate/collect',
+            'body' => $body,
+            'idempotencyKey' => $idempotencyKey,
+            // THE SAME validator production runs, INSIDE the request, with the REAL HTTP status -
+            // including the 202 requirement. Validating after the fact meant the status was not
+            // available, so the check was run against a hardcoded 200 and the ack could not be
+            // rejected on it. A simulator that tolerates an acknowledgement production would reject
+            // teaches the wrong thing about the shape of a real response.
+            'validate' => static function (array $parsed, int $status) use ($idempotencyKey, $redact): void {
+                Validate::collectAck($parsed, $status, $idempotencyKey, $redact);
+            },
+        ]);
 
         return [
             'paymentId' => (string) $ack['paymentId'],
@@ -154,26 +179,33 @@ final class Simulator
      */
     public function outcome(string $paymentId, string $outcome): array
     {
-        self::assertSandboxKey($this->apiKey, 'simulate.outcome()');
+        self::assertSandboxKey(($this->apiKey)(), 'simulate.outcome()');
         if ($paymentId === '') {
             throw new PaylodInvalidRequestError('simulate.outcome(): paymentId is required.');
         }
+
+        $redact = $this->redactor();
 
         $ack = ($this->request)([
             'method' => 'POST',
             'path' => '/simulate/outcome',
             'body' => ['paymentId' => $paymentId, 'outcome' => $outcome],
+            // Settling is a MUTATING call and it used to carry no idempotency key at all, so a
+            // network retry could re-dispatch it. The key is derived deterministically from the
+            // operation, which is exactly the right shape here: retrying "settle THIS payment as
+            // THIS outcome" is the same operation and must replay, while settling it as a different
+            // outcome is a different operation.
+            'idempotencyKey' => "sim-outcome-{$paymentId}-{$outcome}",
+            // The settle response describes a PAYMENT, so it runs the payment validator - the same
+            // one status() runs, ID BINDING (law L1) INCLUDED. This surface previously validated
+            // against a hardcoded 200 and did not bind at all, so a body describing a DIFFERENT
+            // payment was classified on its merits and returned as this payment's outcome.
+            'validate' => static function (array $parsed, int $status) use ($paymentId, $redact): void {
+                Validate::paymentBody(self::normalizeSettleAck($parsed), $status, $redact, $paymentId);
+            },
         ]);
 
-        $payment = [
-            'id' => $ack['paymentId'] ?? null,
-            'status' => $ack['status'] ?? null,
-            'mpesaReceipt' => $ack['mpesaReceipt'] ?? null,
-            'resultCode' => $ack['resultCode'] ?? null,
-            'resultDesc' => $ack['resultDesc'] ?? null,
-        ];
-        // Same payment-schema rules as status(), including "a success must carry evidence".
-        Validate::paymentBody($payment, 200, $this->redactor());
+        $payment = self::normalizeSettleAck($ack);
 
         return [
             'outcome' => PaymentOutcome::fromPayment($payment),
@@ -194,5 +226,25 @@ final class Simulator
         $created = $this->collect($params);
 
         return $this->outcome($created['paymentId'], $outcome);
+    }
+
+    /**
+     * The settle acknowledgement, reshaped into the payment record shape the validators and the
+     * semantic model speak. Done in ONE place so the body that is validated is byte-for-byte the
+     * body that is judged - normalising differently in the two would make the binding check guard a
+     * record nobody then acts on.
+     *
+     * @param array<string,mixed> $ack
+     * @return array<string,mixed>
+     */
+    private static function normalizeSettleAck(array $ack): array
+    {
+        return [
+            'id' => $ack['paymentId'] ?? null,
+            'status' => $ack['status'] ?? null,
+            'mpesaReceipt' => $ack['mpesaReceipt'] ?? null,
+            'resultCode' => $ack['resultCode'] ?? null,
+            'resultDesc' => $ack['resultDesc'] ?? null,
+        ];
     }
 }

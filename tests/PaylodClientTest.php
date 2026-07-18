@@ -10,7 +10,7 @@ use Paylod\Exceptions\PaylodConnectionError;
 use Paylod\Exceptions\PaylodInvalidRequestError;
 use Paylod\Exceptions\PaylodTimeoutError;
 use Paylod\Paylod;
-use Paylod\Tests\Support\MockTransport;
+use Paylod\Tests\Support\MockHttpClient;
 use PHPUnit\Framework\TestCase;
 
 final class PaylodClientTest extends TestCase
@@ -26,8 +26,8 @@ final class PaylodClientTest extends TestCase
      */
     private function client(array $steps, array $options = []): array
     {
-        $transport = new MockTransport($steps);
-        $paylod = new Paylod('mp_test_x', array_merge(['transport' => $transport], $options));
+        $transport = new MockHttpClient($steps);
+        $paylod = new Paylod('mp_test_x', array_merge(['httpClient' => $transport, 'allowCustomHttpClient' => true], $options));
 
         return [$paylod, $transport];
     }
@@ -38,7 +38,7 @@ final class PaylodClientTest extends TestCase
         putenv('PAYLOD_API_KEY');
         try {
             $this->expectException(PaylodConfigError::class);
-            new Paylod(null, ['transport' => new MockTransport([])]);
+            new Paylod(null, ['httpClient' => new MockHttpClient([]), 'allowCustomHttpClient' => true]);
         } finally {
             if ($prev !== false) {
                 putenv('PAYLOD_API_KEY=' . $prev);
@@ -255,7 +255,7 @@ final class PaylodClientTest extends TestCase
     {
         $this->expectException(PaylodConfigError::class);
         $this->expectExceptionMessageMatches('/https/');
-        new Paylod('mp_test_x', ['baseUrl' => 'http://paylod.dev/functions/v1', 'transport' => new MockTransport([])]);
+        new Paylod('mp_test_x', ['baseUrl' => 'http://paylod.dev/functions/v1', 'httpClient' => new MockHttpClient([]), 'allowCustomHttpClient' => true]);
     }
 
     public function testConstructorAllowsLoopbackHttpBehindTestFlag(): void
@@ -263,7 +263,7 @@ final class PaylodClientTest extends TestCase
         $paylod = new Paylod('mp_test_x', [
             'baseUrl' => 'http://localhost:9999/v1',
             'allowInsecureBaseUrl' => true,
-            'transport' => new MockTransport([['status' => 202, 'json' => self::ACK]]),
+            'httpClient' =>  new MockHttpClient([['status' => 202, 'json' => self::ACK]]), 'allowCustomHttpClient' => true,
         ]);
         $ack = $paylod->collect(['amount' => 1, 'phone' => '0712345678', 'idempotencyKey' => 'a']);
         $this->assertSame('pay_123', $ack['paymentId']);
@@ -275,7 +275,7 @@ final class PaylodClientTest extends TestCase
         new Paylod('mp_live_secret', [
             'baseUrl' => 'http://localhost:9999/v1',
             'allowInsecureBaseUrl' => true,
-            'transport' => new MockTransport([]),
+            'httpClient' => new MockHttpClient([]), 'allowCustomHttpClient' => true,
         ]);
     }
 
@@ -301,7 +301,7 @@ final class PaylodClientTest extends TestCase
         ];
         foreach ($bad as $url) {
             try {
-                new Paylod('mp_test_x', ['baseUrl' => $url, 'transport' => new MockTransport([])]);
+                new Paylod('mp_test_x', ['baseUrl' => $url, 'httpClient' => new MockHttpClient([]), 'allowCustomHttpClient' => true]);
                 $this->fail("expected {$url} to be rejected");
             } catch (PaylodConfigError $e) {
                 $this->assertNotSame('', $e->getMessage(), $url);
@@ -312,7 +312,7 @@ final class PaylodClientTest extends TestCase
     public function testConstructorAcceptsTheCanonicalPaylodOrigins(): void
     {
         foreach ([Paylod::DEFAULT_BASE_URL, 'https://paylod.dev/functions/v1', 'https://api.paylod.dev/v1', 'https://paylod.dev:443/v1'] as $url) {
-            $paylod = new Paylod('mp_live_key', ['baseUrl' => $url, 'transport' => new MockTransport([])]);
+            $paylod = new Paylod('mp_live_key', ['baseUrl' => $url]);
             $this->assertInstanceOf(Paylod::class, $paylod);
         }
     }
@@ -324,14 +324,14 @@ final class PaylodClientTest extends TestCase
         new Paylod('mp_live_secret', [
             'baseUrl' => 'https://127.0.0.1:9999/v1',
             'allowInsecureBaseUrl' => true,
-            'transport' => new MockTransport([]),
+            'httpClient' => new MockHttpClient([]), 'allowCustomHttpClient' => true,
         ]);
     }
 
     public function testConstructorRefusesLoopbackWithoutTheExplicitFlag(): void
     {
         $this->expectException(PaylodConfigError::class);
-        new Paylod('mp_test_x', ['baseUrl' => 'https://localhost:9999/v1', 'transport' => new MockTransport([])]);
+        new Paylod('mp_test_x', ['baseUrl' => 'https://localhost:9999/v1', 'httpClient' => new MockHttpClient([]), 'allowCustomHttpClient' => true]);
     }
 
     // -- Timeout must be positive and bounded ---------------------------------
@@ -344,7 +344,7 @@ final class PaylodClientTest extends TestCase
     {
         foreach ([0, -1, -30000, 0.0] as $bad) {
             try {
-                new Paylod('mp_test_x', ['timeoutMs' => $bad, 'transport' => new MockTransport([])]);
+                new Paylod('mp_test_x', ['timeoutMs' => $bad, 'httpClient' => new MockHttpClient([]), 'allowCustomHttpClient' => true]);
                 $this->fail('expected timeoutMs ' . var_export($bad, true) . ' to be rejected');
             } catch (PaylodConfigError $e) {
                 $this->assertMatchesRegularExpression('/greater than 0/', $e->getMessage());
@@ -356,7 +356,7 @@ final class PaylodClientTest extends TestCase
     {
         foreach ([600001, 'soon', true, INF, NAN, []] as $bad) {
             try {
-                new Paylod('mp_test_x', ['timeoutMs' => $bad, 'transport' => new MockTransport([])]);
+                new Paylod('mp_test_x', ['timeoutMs' => $bad, 'httpClient' => new MockHttpClient([]), 'allowCustomHttpClient' => true]);
                 $this->fail('expected timeoutMs ' . var_export($bad, true) . ' to be rejected');
             } catch (PaylodConfigError) {
                 $this->addToAssertionCount(1);

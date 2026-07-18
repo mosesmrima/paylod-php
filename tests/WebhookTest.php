@@ -6,7 +6,7 @@ namespace Paylod\Tests;
 
 use Paylod\Exceptions\PaylodSignatureVerificationError;
 use Paylod\Paylod;
-use Paylod\Tests\Support\MockTransport;
+use Paylod\Tests\Support\MockHttpClient;
 use Paylod\Webhook;
 use PHPUnit\Framework\TestCase;
 
@@ -51,7 +51,7 @@ final class WebhookTest extends TestCase
     {
         return new Paylod('mp_test_x', [
             'webhookSecret' => self::SECRET,
-            'transport' => new MockTransport([]),
+            'httpClient' => new MockHttpClient([]), 'allowCustomHttpClient' => true,
         ]);
     }
 

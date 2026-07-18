@@ -6,7 +6,7 @@ namespace Paylod\Tests;
 
 use Paylod\Exceptions\PaylodSandboxOnlyError;
 use Paylod\Paylod;
-use Paylod\Tests\Support\MockTransport;
+use Paylod\Tests\Support\MockHttpClient;
 use PHPUnit\Framework\TestCase;
 
 final class SimulatorTest extends TestCase
@@ -14,19 +14,19 @@ final class SimulatorTest extends TestCase
     public function testSimulateModeRefusesLiveKeyAtConstruction(): void
     {
         $this->expectException(PaylodSandboxOnlyError::class);
-        new Paylod('mp_live_x', ['simulate' => true, 'transport' => new MockTransport([])]);
+        new Paylod('mp_live_x', ['simulate' => true]);
     }
 
     public function testSimulatorMethodRefusesLiveKeyLocally(): void
     {
-        $paylod = new Paylod('mp_live_x', ['transport' => new MockTransport([])]);
+        $paylod = new Paylod('mp_live_x');
         $this->expectException(PaylodSandboxOnlyError::class);
         $paylod->simulator->collect(['amount' => 100]);
     }
 
     public function testSimulateCollectHitsSimulateEndpoint(): void
     {
-        $transport = new MockTransport([[
+        $transport = new MockHttpClient([[
             'status' => 202,
             'json' => [
                 'paymentId' => 'pay_sim',
@@ -35,7 +35,7 @@ final class SimulatorTest extends TestCase
                 'outcomes' => [],
             ],
         ]]);
-        $paylod = new Paylod('mp_test_x', ['transport' => $transport]);
+        $paylod = new Paylod('mp_test_x', ['httpClient' => $transport, 'allowCustomHttpClient' => true]);
 
         $created = $paylod->simulator->collect(['amount' => 250, 'idempotencyKey' => 'k1']);
         $this->assertSame('pay_sim', $created['paymentId']);
@@ -45,7 +45,7 @@ final class SimulatorTest extends TestCase
 
     public function testSimulateOutcomeReturnsDecodedOutcome(): void
     {
-        $transport = new MockTransport([[
+        $transport = new MockHttpClient([[
             'status' => 200,
             'json' => [
                 'paymentId' => 'pay_sim',
@@ -56,7 +56,7 @@ final class SimulatorTest extends TestCase
                 'webhookQueued' => true,
             ],
         ]]);
-        $paylod = new Paylod('mp_test_x', ['transport' => $transport]);
+        $paylod = new Paylod('mp_test_x', ['httpClient' => $transport, 'allowCustomHttpClient' => true]);
 
         $result = $paylod->simulator->outcome('pay_sim', 'wrong_pin');
         $this->assertSame('failed', $result['outcome']->status);
@@ -67,11 +67,11 @@ final class SimulatorTest extends TestCase
 
     public function testSimulatePayApproveSucceeds(): void
     {
-        $transport = new MockTransport([
+        $transport = new MockHttpClient([
             ['status' => 202, 'json' => ['paymentId' => 'pay_sim', 'checkoutRequestId' => 'ws', 'status' => 'pending', 'outcomes' => []]],
             ['status' => 200, 'json' => ['paymentId' => 'pay_sim', 'status' => 'success', 'resultCode' => 0, 'resultDesc' => 'ok', 'mpesaReceipt' => 'SFF6XYZ123', 'webhookQueued' => true]],
         ]);
-        $paylod = new Paylod('mp_test_x', ['transport' => $transport]);
+        $paylod = new Paylod('mp_test_x', ['httpClient' => $transport, 'allowCustomHttpClient' => true]);
 
         $result = $paylod->simulator->pay(['outcome' => 'approve', 'amount' => 100]);
         $this->assertSame('succeeded', $result['outcome']->status);
@@ -81,10 +81,10 @@ final class SimulatorTest extends TestCase
 
     public function testClientSimulateModeRoutesCollectThroughSimulator(): void
     {
-        $transport = new MockTransport([
+        $transport = new MockHttpClient([
             ['status' => 202, 'json' => ['paymentId' => 'pay_sim', 'checkoutRequestId' => 'ws', 'status' => 'pending', 'outcomes' => []]],
         ]);
-        $paylod = new Paylod('mp_test_x', ['simulate' => true, 'transport' => $transport]);
+        $paylod = new Paylod('mp_test_x', ['simulate' => true, 'httpClient' => $transport, 'allowCustomHttpClient' => true]);
 
         $ack = $paylod->collect(['amount' => 100, 'phone' => '0712345678', 'idempotencyKey' => 'k']);
         $this->assertSame('pay_sim', $ack['paymentId']);
@@ -94,7 +94,7 @@ final class SimulatorTest extends TestCase
 
     public function testOutcomesListIsTheFive(): void
     {
-        $paylod = new Paylod('mp_test_x', ['transport' => new MockTransport([])]);
+        $paylod = new Paylod('mp_test_x', ['httpClient' => new MockHttpClient([]), 'allowCustomHttpClient' => true]);
         $this->assertSame(
             ['approve', 'wrong_pin', 'insufficient_funds', 'user_cancelled', 'timeout'],
             $paylod->simulator->outcomes()

@@ -4,12 +4,13 @@ declare(strict_types=1);
 
 namespace Paylod;
 
+use Closure;
 use Paylod\Exceptions\PaylodApiError;
 use Paylod\Exceptions\PaylodConfigError;
 use Paylod\Exceptions\PaylodConnectionError;
 use Paylod\Exceptions\PaylodInvalidRequestError;
 use Paylod\Exceptions\PaylodTimeoutError;
-use Paylod\Http\CurlTransport;
+use Paylod\Http\HttpClient;
 use Paylod\Http\Transport;
 use Paylod\Support\Redact;
 use Paylod\Support\Uuid;
@@ -47,12 +48,38 @@ final class Paylod
 
     private const MAX_AMOUNT = 150000;
 
-    private string $apiKey;
+    /**
+     * The secrets, held behind CLOSURES rather than in string properties.
+     *
+     * __debugInfo() already covered print_r() and var_dump(). It does NOT cover var_export(), which
+     * ignores the magic method entirely and walks the object's REAL properties - so
+     * `var_export($paylod)` printed the live API key and the webhook secret verbatim, and
+     * var_export() is exactly what config dumpers, cache warmers and "export this to a PHP file"
+     * tooling call. A property that is not a string cannot be exported as one: var_export renders a
+     * Closure as `\Closure::__set_state(array())`, with no access to its bound scope.
+     *
+     * @var Closure():string
+     */
+    private Closure $apiKey;
+
+    /** @var Closure():?string */
+    private Closure $webhookSecret;
+
+    /** The masked prefix of the key, safe to print. Precomputed so no debug path touches the real one. */
+    private ?string $apiKeyMasked;
+
+    /** The masked prefix of the webhook secret, safe to print. */
+    private ?string $webhookSecretMasked;
+
     private string $baseUrl;
-    private ?string $webhookSecret;
     private int $timeoutMs;
     private int $maxRetries;
     private bool $simulate;
+
+    /**
+     * The credentialed transport. NOT replaceable: the API key lives INSIDE it, and this class
+     * passes it a method, a path and a body - never headers, never a URL, never the credential.
+     */
     private Transport $transport;
 
     /** The sandbox simulator: drive a payment to any of the five outcomes with no phone. */
@@ -69,8 +96,9 @@ final class Paylod
      *   prints a live money-moving key into the application log (PHP records call arguments in
      *   traces whenever zend.exception_ignore_args=0, which is the default in development).
      * @param array<string,mixed> $options Escape hatches: baseUrl, webhookSecret, timeoutMs,
-     *   maxRetries, simulate, transport. Also sensitive: it carries webhookSecret (and apiKey, in
-     *   the object form).
+     *   maxRetries, simulate, allowInsecureBaseUrl, and the TEST-ONLY pair httpClient +
+     *   allowCustomHttpClient. Also sensitive: it carries webhookSecret (and apiKey, in the object
+     *   form).
      */
     public function __construct(
         #[\SensitiveParameter] string|array|null $apiKey = null,
@@ -92,7 +120,9 @@ final class Paylod
                 . 'and never ship it to a browser.'
             );
         }
-        $this->apiKey = trim($key);
+        $apiKeyValue = trim($key);
+        $this->apiKey = static fn (): string => $apiKeyValue;
+        $this->apiKeyMasked = Redact::mask($apiKeyValue);
 
         // Baked in. PAYLOD_BASE_URL / baseUrl remain as escape hatches for self-hosting and tests.
         $base = $options['baseUrl'] ?? (getenv('PAYLOD_BASE_URL') ?: null) ?? self::DEFAULT_BASE_URL;
@@ -100,19 +130,39 @@ final class Paylod
 
         // Reject a plaintext / non-canonical origin BEFORE any key can leave the process. Loopback
         // HTTP is allowed only behind an explicit test-only flag, and never with a live key.
-        self::assertSecureBaseUrl($this->baseUrl, $this->apiKey, ($options['allowInsecureBaseUrl'] ?? false) === true);
+        Transport::assertSecureBaseUrl(
+            $this->baseUrl,
+            $apiKeyValue,
+            ($options['allowInsecureBaseUrl'] ?? false) === true,
+        );
 
-        $this->webhookSecret = $options['webhookSecret'] ?? (getenv('PAYLOD_WEBHOOK_SECRET') ?: null);
+        $secretValue = $options['webhookSecret'] ?? (getenv('PAYLOD_WEBHOOK_SECRET') ?: null);
+        $secretValue = is_string($secretValue) ? $secretValue : null;
+        $this->webhookSecret = static fn (): ?string => $secretValue;
+        $this->webhookSecretMasked = Redact::mask($secretValue);
+
         // A zero/negative timeout would DISABLE cURL's timeout - reject it rather than ship a client
         // that can hang forever.
         $this->timeoutMs = self::assertPositiveTimeoutMs($options['timeoutMs'] ?? self::DEFAULT_TIMEOUT_MS, 'timeoutMs');
         $this->maxRetries = self::assertMaxRetries($options['maxRetries'] ?? self::DEFAULT_MAX_RETRIES);
-        $this->transport = $options['transport'] ?? new CurlTransport();
+
+        // ROOT 1. A custom HTTP client is a GATED TEST SEAM, not a general extension point: it
+        // receives the Authorization header on every request, so it is refused unless the caller
+        // explicitly opts in AND is using a sandbox key. Both rules are re-asserted inside Transport
+        // so the transport holds the line on its own terms.
+        $httpClient = self::assertCustomHttpClient($options, $apiKeyValue);
+
+        $this->transport = new Transport(
+            $this->apiKey,
+            $this->baseUrl,
+            fn (string $s): string => (string) $this->redact($s),
+            $httpClient,
+        );
 
         // Simulator mode is a TEST posture, so it is fenced off from production at CONSTRUCTION time.
         $this->simulate = ($options['simulate'] ?? false) === true;
         if ($this->simulate) {
-            Simulator::assertSandboxKey($this->apiKey, 'new Paylod(..., ["simulate" => true])');
+            Simulator::assertSandboxKey($apiKeyValue, 'new Paylod(..., ["simulate" => true])');
         }
 
         $this->simulator = new Simulator(
@@ -122,8 +172,54 @@ final class Paylod
                 (string) $opts['path'],
                 $opts['body'] ?? null,
                 $opts['idempotencyKey'] ?? null,
+                null,
+                $opts['validate'] ?? null,
             ),
         );
+    }
+
+    /**
+     * The gate on the test-only HTTP client seam. Mirrors `allowInsecureBaseUrl`: an explicit
+     * opt-in, and NEVER with a live key.
+     *
+     * @param array<string,mixed> $options
+     */
+    private static function assertCustomHttpClient(array $options, #[\SensitiveParameter] string $apiKey): ?HttpClient
+    {
+        if (array_key_exists('transport', $options)) {
+            throw new PaylodConfigError(
+                'The `transport` option was removed in 0.5.0. The API key now lives INSIDE the SDK\'s '
+                . 'own transport, which builds its own headers and URL and refuses redirects, so an '
+                . 'injectable transport can no longer receive the credential. For tests, pass '
+                . "['httpClient' => \$client, 'allowCustomHttpClient' => true] with an mp_test_ key."
+            );
+        }
+
+        $client = $options['httpClient'] ?? null;
+        if ($client === null) {
+            return null;
+        }
+        if (!$client instanceof HttpClient) {
+            throw new PaylodConfigError('httpClient must implement ' . HttpClient::class . '.');
+        }
+        if (($options['allowCustomHttpClient'] ?? false) !== true) {
+            throw new PaylodConfigError(
+                'Passing `httpClient` also requires `allowCustomHttpClient => true`. A custom HTTP '
+                . 'client receives your Authorization header - i.e. a bearer credential that can move '
+                . 'money - on every request, and it controls whether a redirect is followed. That is '
+                . 'a test seam and must be opted into deliberately.'
+            );
+        }
+        if (str_starts_with($apiKey, 'mp_live_')) {
+            throw new PaylodConfigError(
+                '`httpClient` may never be used with an mp_live_ key, with or without '
+                . '`allowCustomHttpClient`. The API key is a bearer credential and the client '
+                . 'receives it on every request. Use an mp_test_ key for tests that need to stub the '
+                . 'transport.'
+            );
+        }
+
+        return $client;
     }
 
     // -- HTTP -----------------------------------------------------------------
@@ -160,7 +256,6 @@ final class Paylod
         ?int $deadlineMs = null,
         ?\Closure $validate = null,
     ): array {
-        $url = $this->baseUrl . $path;
         $lastError = null;
 
         for ($attempt = 0; $attempt <= $this->maxRetries; $attempt++) {
@@ -183,22 +278,11 @@ final class Paylod
                 $perRequestTimeout = max(1, min($perRequestTimeout, $remaining));
             }
 
-            $headers = [
-                'Authorization' => 'Bearer ' . $this->apiKey,
-                'Accept' => 'application/json',
-            ];
-            $payload = null;
-            if ($body !== null) {
-                $headers['Content-Type'] = 'application/json';
-                $payload = json_encode($body, JSON_THROW_ON_ERROR);
-            }
-            // Sent on every mutating call - this is what makes a retry safe.
-            if ($idempotencyKey !== null) {
-                $headers['Idempotency-Key'] = $idempotencyKey;
-            }
-
             try {
-                $res = $this->transport->send($method, $url, $headers, $payload, $perRequestTimeout);
+                // THE DISPATCH. Method, path, body, idempotency key - no headers, no URL, no
+                // credential. The transport builds all three from state this class cannot reach into,
+                // pins the origin and refuses redirects on every call.
+                $res = $this->transport->send($method, $path, $body, $idempotencyKey, $perRequestTimeout);
             } catch (PaylodConnectionError $e) {
                 $lastError = $e;
                 continue; // network blip -> retry
@@ -249,7 +333,7 @@ final class Paylod
             }
         }
 
-        throw $lastError ?? new PaylodConnectionError("Request to {$url} failed");
+        throw $lastError ?? new PaylodConnectionError("Request to {$this->baseUrl}{$path} failed");
     }
 
     // -- Validation -----------------------------------------------------------
@@ -370,8 +454,28 @@ final class Paylod
             // recover the effective key and retry with the SAME one - a fresh key would double-charge.
             if ($e instanceof \Paylod\Exceptions\PaylodException) {
                 $e->attachIdempotencyKey($idempotencyKey);
+                throw $e;
             }
-            throw $e;
+
+            // A NON-PAYLOD throwable (a stubbed HTTP client's own exception, a JsonException, a
+            // TypeError from somewhere below) used to escape BARE. It carried no idempotency key and
+            // no indeterminate classification, so the caller's natural reaction - retry the call -
+            // minted a FRESH key and charged the customer a second time. The charge state at this
+            // point is genuinely unknown: the request may have reached the API. Wrap it in an error
+            // that says so and carries the key.
+            $wrapped = new PaylodApiError(
+                'collect() failed with an unexpected error: ' . $this->redact($e->getMessage())
+                . ' - the charge state is INDETERMINATE, the STK prompt may already be on the phone. '
+                . 'Read the payment with this idempotencyKey before starting any new attempt; do NOT '
+                . 'mint a fresh key (that risks a second charge).',
+                0,
+                null,
+                $idempotencyKey,
+                true,
+                $e,
+            );
+
+            throw $wrapped;
         }
     }
 
@@ -386,11 +490,11 @@ final class Paylod
             throw new PaylodInvalidRequestError('paymentId is required.');
         }
 
-        $p = $this->request('GET', '/status/' . rawurlencode($paymentId), null, null, $deadlineMs, function (array $parsed, int $status): void {
-            // The FULL payment schema, including the rule that a `success` must carry evidence (a
-            // receipt or result code 0) - the status string on its own is a claim, not a proof, and
-            // shipping goods against an evidence-free claim loses real money.
-            Validate::paymentBody($parsed, $status, $this->redactor());
+        $p = $this->request('GET', '/status/' . rawurlencode($paymentId), null, null, $deadlineMs, function (array $parsed, int $status) use ($paymentId): void {
+            // The FULL payment schema, and - law L1 - the BINDING check: the body must describe the
+            // payment that was ASKED ABOUT. A response that answers a different question is not a
+            // malformed response, it is a WRONG one, and no field-level shape check can find it.
+            Validate::paymentBody($parsed, $status, $this->redactor(), $paymentId);
         });
 
         return [
@@ -522,7 +626,7 @@ final class Paylod
         #[\SensitiveParameter] ?string $secret = null,
         int|float $toleranceSec = Webhook::DEFAULT_TOLERANCE_SEC,
     ): bool {
-        return Webhook::isValid($rawBody, $signatureHeader, $secret ?? $this->webhookSecret ?? '', $toleranceSec);
+        return Webhook::isValid($rawBody, $signatureHeader, $secret ?? ($this->webhookSecret)() ?? '', $toleranceSec);
     }
 
     /**
@@ -537,38 +641,57 @@ final class Paylod
         #[\SensitiveParameter] ?string $secret = null,
         int|float $toleranceSec = Webhook::DEFAULT_TOLERANCE_SEC,
     ): array {
-        return Webhook::verify($rawBody, $signatureHeader, $secret ?? $this->webhookSecret ?? '', $toleranceSec);
+        return Webhook::verify($rawBody, $signatureHeader, $secret ?? ($this->webhookSecret)() ?? '', $toleranceSec);
     }
 
     // -- Internals ------------------------------------------------------------
 
     /**
-     * What print_r()/var_dump()/var_export-style debugging actually shows for this object.
+     * What print_r() / var_dump() actually show for this object.
      *
      * PHP dumps PRIVATE properties too, so without this a single `print_r($paylod)` in a debug
      * branch - or a framework's exception page, or a queue worker logging its job payload - prints
      * the live API key and the webhook secret verbatim. Only masked prefixes are exposed here:
      * enough to tell "wrong environment" at a glance, never enough to use.
      *
+     * NOTE: this method is NOT what protects var_export(). var_export() ignores __debugInfo()
+     * entirely and walks the real properties, which is why the two secrets are held in closures
+     * (see $apiKey / $webhookSecret) rather than in string properties. Both defences are needed:
+     * this one for the dump functions, the closures for var_export().
+     *
      * @return array<string,mixed>
      */
     public function __debugInfo(): array
     {
         return [
-            'apiKey' => Redact::mask($this->apiKey),
-            'webhookSecret' => Redact::mask($this->webhookSecret),
+            'apiKey' => $this->apiKeyMasked,
+            'webhookSecret' => $this->webhookSecretMasked,
             'baseUrl' => $this->baseUrl,
             'timeoutMs' => $this->timeoutMs,
             'maxRetries' => $this->maxRetries,
             'simulate' => $this->simulate,
-            'transport' => get_class($this->transport),
+            'transport' => $this->transport->clientClass(),
         ];
+    }
+
+    /**
+     * Serialising a client would put a live money-moving key into whatever sink the serialised blob
+     * lands in - a session, a cache entry, a queue payload, a debug log. Refuse it loudly and name
+     * the fix, rather than letting it fail obscurely inside the Closure or, worse, succeed.
+     */
+    public function __serialize(): array
+    {
+        throw new PaylodConfigError(
+            'A Paylod client cannot be serialised: it holds a live API key, and a serialised copy '
+            . 'would carry that key into a cache, a session or a queue payload. Construct the client '
+            . 'where you need it (from the environment) instead of passing one around serialised.'
+        );
     }
 
     /** The secrets this client holds, for scrubbing out of anything about to be thrown or logged. */
     private function redact(mixed $value): mixed
     {
-        return Redact::apply($value, [$this->apiKey, $this->webhookSecret]);
+        return Redact::apply($value, [($this->apiKey)(), ($this->webhookSecret)()]);
     }
 
     /** The same scrubbing, as a callable the validators can apply to an error body. */
@@ -616,101 +739,6 @@ final class Paylod
             . 'persist on that attempt. See https://paylod.dev/docs/sdk#idempotency',
             E_USER_WARNING
         );
-    }
-
-    /**
-     * The ONLY origins a live bearer key may be sent to. HTTPS alone is not enough: any
-     * attacker-controlled https:// host would happily accept the Authorization header and replay it.
-     *
-     * @var list<string>
-     */
-    private const ALLOWED_HOSTS = ['paylod.dev', 'api.paylod.dev'];
-
-    /** Hosts that may be used with the explicit, test-only insecure opt-in. */
-    private const LOOPBACK_HOSTS = ['localhost', '127.0.0.1', '::1', '[::1]'];
-
-    /**
-     * Enforce a secure, ALLOWLISTED origin for baseUrl before the API key can leave the process.
-     *
-     * HTTPS is necessary but nowhere near sufficient - a bearer key posted to https://evil.example is
-     * just as stolen as one posted over plaintext. So the host itself must be the canonical paylod
-     * production origin. We additionally reject anything that smuggles a different effective target
-     * past a naive eyeball check: userinfo (https://paylod.dev@evil.example), a missing host, a
-     * non-default port, a query string or fragment, and private / loopback / link-local IPs.
-     *
-     * Loopback is permitted ONLY behind the explicit test-only opt-in, and NEVER with a live
-     * (mp_live_) key.
-     */
-    private static function assertSecureBaseUrl(string $baseUrl, string $apiKey, bool $allowInsecure): void
-    {
-        $parts = parse_url($baseUrl);
-        if ($parts === false || !isset($parts['scheme']) || !isset($parts['host']) || $parts['host'] === '') {
-            throw new PaylodConfigError("baseUrl is not a valid absolute URL: \"{$baseUrl}\".");
-        }
-
-        $scheme = strtolower((string) $parts['scheme']);
-        $host = strtolower(trim((string) $parts['host'], '[]'));
-        $port = $parts['port'] ?? null;
-        $isLive = str_starts_with($apiKey, 'mp_live_');
-
-        // Credentials in the URL are never legitimate here, and `https://paylod.dev@evil.example`
-        // reads as the real origin while resolving to the attacker's.
-        if (isset($parts['user']) || isset($parts['pass'])) {
-            throw new PaylodConfigError(
-                "baseUrl must not contain credentials (got \"{$baseUrl}\"). A userinfo section makes the "
-                . 'URL read like the paylod origin while pointing somewhere else entirely.'
-            );
-        }
-        // The base URL is a prefix we concatenate paths onto - a query or fragment would be silently
-        // relocated into the middle of the request line.
-        if (isset($parts['query']) || isset($parts['fragment'])) {
-            throw new PaylodConfigError(
-                "baseUrl must not contain a query string or fragment (got \"{$baseUrl}\")."
-            );
-        }
-
-        $isLoopbackHost = in_array($host, ['localhost', '127.0.0.1', '::1'], true)
-            || in_array($host, self::LOOPBACK_HOSTS, true);
-
-        // The sanctioned test escape hatch: an explicit opt-in, a loopback host, and never a live key.
-        if ($isLoopbackHost) {
-            if ($allowInsecure && !$isLive && ($scheme === 'http' || $scheme === 'https')) {
-                return;
-            }
-            throw new PaylodConfigError(
-                "baseUrl points at loopback (\"{$baseUrl}\"). That is allowed ONLY with "
-                . "['allowInsecureBaseUrl' => true] and NEVER with an mp_live_ key."
-            );
-        }
-
-        if ($scheme !== 'https') {
-            throw new PaylodConfigError(
-                "baseUrl must use https:// (got \"{$baseUrl}\"). Plaintext HTTP would transmit your API "
-                . 'key in the clear and opens you to SSRF / redirection.'
-            );
-        }
-
-        // A bare IP literal is never the paylod origin, and private / link-local ranges are the classic
-        // SSRF pivot (169.254.169.254 and friends).
-        if (filter_var($host, FILTER_VALIDATE_IP) !== false) {
-            throw new PaylodConfigError(
-                "baseUrl must name the paylod host, not a raw IP address (got \"{$baseUrl}\")."
-            );
-        }
-
-        if (!in_array($host, self::ALLOWED_HOSTS, true)) {
-            throw new PaylodConfigError(
-                "baseUrl origin \"{$host}\" is not a paylod origin. Your API key can move money, so it is "
-                . 'only ever sent to ' . implode(' or ', self::ALLOWED_HOSTS) . '. Remove the custom '
-                . 'baseUrl / PAYLOD_BASE_URL override.'
-            );
-        }
-
-        if ($port !== null && (int) $port !== 443) {
-            throw new PaylodConfigError(
-                "baseUrl must use the default https port (got port {$port} in \"{$baseUrl}\")."
-            );
-        }
     }
 
     /**

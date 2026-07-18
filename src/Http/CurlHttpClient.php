@@ -7,21 +7,28 @@ namespace Paylod\Http;
 use Paylod\Exceptions\PaylodConnectionError;
 
 /**
- * The default transport: a thin wrapper over ext-curl. No third-party HTTP client required.
+ * The SDK's own byte mover: a thin wrapper over ext-curl, and the only implementation that runs in
+ * production. No third-party HTTP client required.
  *
- * Retries, idempotency, backoff and error mapping all live in the client; this class does exactly
- * one thing - send the bytes and hand back status + headers + body, or throw a
- * {@see PaylodConnectionError} if the socket never got that far.
+ * Redirects are DISABLED here (CURLOPT_FOLLOWLOCATION => false) rather than merely inspected
+ * afterwards. Following a cross-origin 3xx would replay the Authorization header to another host,
+ * and a check performed after the replay is a post-mortem, not a control. The redirect count and
+ * the effective URL are reported back so {@see Transport} can additionally prove none was followed.
  */
-final class CurlTransport implements Transport
+final class CurlHttpClient implements HttpClient
 {
     /**
      * @param array<string,string> $headers marked #[\SensitiveParameter] so the Authorization
      *   Bearer key is scrubbed from any stack trace this frame appears in - PHP renders a sensitive
      *   argument as an opaque placeholder rather than dumping the secret into exception traces/logs.
      */
-    public function send(string $method, string $url, #[\SensitiveParameter] array $headers, ?string $body, int $timeoutMs): array
-    {
+    public function send(
+        string $method,
+        string $url,
+        #[\SensitiveParameter] array $headers,
+        ?string $body,
+        int $timeoutMs,
+    ): array {
         $ch = curl_init();
         if ($ch === false) {
             throw new PaylodConnectionError('Could not initialise a cURL handle.');
@@ -44,12 +51,20 @@ final class CurlTransport implements Transport
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_TIMEOUT_MS => $timeoutMs,
             CURLOPT_CONNECTTIMEOUT_MS => $timeoutMs,
+            // NEVER auto-follow. A 3xx to another host would put the bearer key on that host.
+            CURLOPT_FOLLOWLOCATION => false,
+            CURLOPT_MAXREDIRS => 0,
+            // Certificate and hostname verification are cURL's defaults; pinned explicitly so a
+            // php.ini or a distro build with laxer defaults cannot silently downgrade TLS.
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_SSL_VERIFYHOST => 2,
             CURLOPT_HEADERFUNCTION => function ($curl, string $line) use (&$responseHeaders): int {
                 $idx = strpos($line, ':');
                 if ($idx !== false) {
                     $key = strtolower(trim(substr($line, 0, $idx)));
                     $responseHeaders[$key] = trim(substr($line, $idx + 1));
                 }
+
                 return strlen($line);
             },
         ]);
@@ -67,12 +82,17 @@ final class CurlTransport implements Transport
             throw new PaylodConnectionError(self::redact("Could not reach paylod at {$url}: {$err}", $bearer));
         }
 
-        $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+        $effectiveUrl = curl_getinfo($ch, CURLINFO_EFFECTIVE_URL);
+        $redirectCount = curl_getinfo($ch, CURLINFO_REDIRECT_COUNT);
 
         return [
-            'status' => $status,
+            'status' => (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE),
             'headers' => $responseHeaders,
             'body' => (string) $raw,
+            // Reported so Transport can prove, independently of this class, that nothing was
+            // followed - see Transport::assertNotRedirected().
+            'effectiveUrl' => is_string($effectiveUrl) && $effectiveUrl !== '' ? $effectiveUrl : null,
+            'redirectCount' => is_int($redirectCount) ? $redirectCount : null,
         ];
     }
 

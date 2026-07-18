@@ -80,9 +80,22 @@ final class PaymentOutcome
     }
 
     /**
-     * Build a renderable outcome from a payment record. Classification is delegated to the
-     * canonical classifier the payment engine itself uses, so the SDK cannot disagree with the
-     * backend about whether 4999 is a failure.
+     * Build a renderable outcome from a payment record.
+     *
+     * -- This method no longer DECIDES anything; it RENDERS -----------------------------------
+     * It used to carry its own copy of the rules: a `contradictory` boolean, a
+     * `$classified ?? $rawStatus` fallback chain, and an evidence check nested inside the success
+     * branch. The GAPS BETWEEN those three were the whole problem. `['status' => 'pending',
+     * 'resultCode' => 0]` fell through the contradiction test (which only compared two TERMINAL
+     * signals), landed on `$classified === 'success'`, and came back PAID with a null receipt. A
+     * receipt on a `failed` row came back `cancelled, retryable: true` - the SDK telling a merchant
+     * it was safe to charge a second time for a payment carrying an M-Pesa confirmation code.
+     *
+     * Every one of those decisions now comes from {@see Semantics::judge()}, a single total table.
+     * That is also what closes the "fromPayment() bypasses validation" hole: law L2 (`paid` requires
+     * a receipt or result code 0) is enforced INSIDE this method now, by construction, so an
+     * evidence-free `status: "success"` can no longer be marked paid no matter which surface built
+     * the array or whether any validator ran first.
      *
      * @param array<string,mixed> $payment shape: {id, status, mpesaReceipt, resultCode, resultDesc}
      */
@@ -91,7 +104,6 @@ final class PaymentOutcome
         $resultCode = $payment['resultCode'] ?? null;
         $resultDesc = $payment['resultDesc'] ?? null;
         $paymentId = (string) ($payment['id'] ?? '');
-        $rawStatus = (string) ($payment['status'] ?? 'pending');
         $mpesaReceipt = $payment['mpesaReceipt'] ?? null;
 
         $hasCode = $resultCode !== null;
@@ -99,45 +111,10 @@ final class PaymentOutcome
         $detail = $hasCode ? DarajaCatalog::decode($resultCode, $desc) : null;
         $code = $detail['code'] ?? null;
 
-        // When M-Pesa has given us a code, the CLASSIFIER is authoritative and the raw `status` field
-        // must NOT override it. A row marked status:"success" that carries a pending code (4999) or a
-        // failure code (1032) must never be reported as paid. Before there is a code, the API's own
-        // status is all we have.
-        $classified = $hasCode ? DarajaCatalog::classifyStkResult($resultCode, $desc) : null;
+        // THE WHOLE DECISION, IN ONE CALL.
+        $verdict = Semantics::judge($payment)->verdict;
 
-        // A genuine contradiction between two TERMINAL signals - the raw status says success while
-        // the code classifies as a failure, or vice versa. Neither can be trusted, so the payment is
-        // INDETERMINATE: not paid, not safe to charge again. (A `pending` classification is NOT a
-        // contradiction - it just means "still in flight, keep polling".)
-        $contradictory = $classified !== null
-            && (($classified === 'success' && $rawStatus === 'failed')
-                || ($classified === 'failed' && $rawStatus === 'success'));
-
-        if ($contradictory) {
-            return new self(
-                status: 'pending',
-                message: self::INDETERMINATE,
-                retryable: false,
-                paid: false,
-                paymentId: $paymentId,
-                receipt: null,
-                code: $code,
-                detail: $detail,
-                payment: $payment,
-            );
-        }
-
-        if ($classified !== null) {
-            $outcome = $classified;
-        } elseif ($rawStatus === 'success') {
-            $outcome = 'success';
-        } elseif ($rawStatus === 'failed') {
-            $outcome = 'failed';
-        } else {
-            $outcome = 'pending';
-        }
-
-        if ($outcome === 'success') {
+        if ($verdict === Semantics::VERDICT_PAID) {
             return new self(
                 status: 'succeeded',
                 message: $detail['customerMessage'] ?? 'Payment received - thank you!',
@@ -151,9 +128,28 @@ final class PaymentOutcome
             );
         }
 
-        if ($outcome === 'pending') {
+        if ($verdict === Semantics::VERDICT_INDETERMINATE) {
+            // Rendered as `pending` so wait() keeps polling and lets the webhook settle it, rather
+            // than reporting a false success (goods shipped for nothing) or a false retryable failure
+            // (the customer charged twice). Never paid, never retryable - both unconditional.
             return new self(
                 status: 'pending',
+                message: self::INDETERMINATE,
+                retryable: false,
+                paid: false,
+                paymentId: $paymentId,
+                receipt: null,
+                code: $code,
+                detail: $detail,
+                payment: $payment,
+            );
+        }
+
+        if ($verdict === Semantics::VERDICT_IN_FLIGHT) {
+            return new self(
+                status: 'pending',
+                // `detail` is only useful here if it is genuinely a pending code (4999 /
+                // 500.001.1001); anything else that classified as pending has no useful message.
                 message: ($detail !== null && $detail['category'] === 'pending')
                     ? $detail['customerMessage']
                     : self::WAITING,
@@ -167,7 +163,8 @@ final class PaymentOutcome
             );
         }
 
-        // Terminal failure. Cancellation gets its own word.
+        // Terminal failure. Cancellation gets its own word: the customer chose this, it is not an
+        // error, and a UI usually wants to say so more gently.
         return new self(
             status: $code === self::CANCELLED_CODE ? 'cancelled' : 'failed',
             message: $detail['customerMessage'] ?? 'The payment didn\'t go through. Please try again.',

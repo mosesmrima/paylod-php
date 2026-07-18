@@ -21,11 +21,28 @@ final class Validate
     public const PAYMENT_STATUSES = ['pending', 'success', 'failed', 'cancelled'];
 
     /**
-     * States an ACKNOWLEDGEMENT may carry. `success` is deliberately absent: an ack carries no
-     * receipt and no result code, so a 2xx claiming the money already moved has no evidence behind
-     * it and must not be believed.
+     * The ONLY status an acknowledgement may carry, and the ONLY HTTP status a dispatched collect
+     * answers with.
+     *
+     * `status` is a HARDCODED LITERAL "pending" on the backend, present on every 202 - including an
+     * idempotent REPLAY, which returns the stored original ack rather than the current settled
+     * state. So there is no legitimate ack carrying a settled status, and no legitimate ack missing
+     * the field either: both are malformed, and requiring the literal cannot break replay.
+     *
+     * Note the asymmetry with a STATUS read, which legitimately carries terminal states. There,
+     * `success` is not trusted from the string - it must be backed by a receipt or result code 0.
      */
-    public const ACK_STATUSES = ['pending', 'failed', 'cancelled'];
+    public const ACK_STATUS = 'pending';
+
+    /**
+     * POST /collect answers 202 Accepted and nothing else: the STK push has been handed to Daraja
+     * and the payment is pending. Accepting ANY 2xx meant a bare 200 - the shape a cache, a proxy, a
+     * captive portal, a stubbed endpoint or a rewritten route produces - was read as a successfully
+     * dispatched charge. A 200 here is not a successful collect; it is a response from something
+     * that is not the collect endpoint, and treating it as an ack invents a payment that may not
+     * exist (or hides one that does).
+     */
+    public const ACK_HTTP_STATUS = 202;
 
     /**
      * Reject an idempotency key that would silently drop double-charge protection: blank/whitespace
@@ -102,7 +119,7 @@ final class Validate
         ?string $idempotencyKey = null,
         ?callable $redact = null,
     ): void {
-        $problem = self::ackProblem($parsed);
+        $problem = self::ackProblem($parsed, $status);
         if ($problem === null) {
             return;
         }
@@ -122,17 +139,36 @@ final class Validate
     /**
      * Validate the COMPLETE payment schema of a 2xx status body.
      *
-     * The critical rule here is the LAST one: a `status: "success"` is only believed when the body
-     * carries actual evidence - an M-Pesa receipt, or result code 0. The status string alone is a
-     * claim, not a proof, and treating an evidence-free claim as paid is how goods get shipped for
-     * a payment that never settled.
+     * This is a SHAPE check plus the binding check below. It deliberately says nothing about
+     * whether the payment is paid: that question has exactly one home, {@see \Paylod\Semantics}.
+     *
+     * -- The binding check (law L1) ------------------------------------------------------------
+     * This is the highest-value single check in the SDK. Nothing previously compared the `id` in the
+     * response to the id in the request, so ANY mechanism that returned a DIFFERENT payment's record
+     * - a cache keyed on the wrong thing, a proxy collapsing concurrent requests, an off-by-one in a
+     * routing or authorization layer, a server-side bug, a deliberately crafted response - produced
+     * a body the SDK validated happily and then classified on its own merits. If that other payment
+     * happened to be settled and paid, the caller was told THEIR payment was paid, and shipped goods
+     * for an order nobody had paid for.
+     *
+     * A response that answers a different question is not a MALFORMED response, it is a WRONG one,
+     * and no amount of field-level shape checking can find it - every field is perfectly valid. The
+     * request knows which payment it asked about; the answer has to say the same thing, or it is not
+     * an answer at all. A mismatch is INDETERMINATE, because that is the honest reading: we now know
+     * nothing about the payment we asked about, and "I do not know" must never collapse to "failed"
+     * (reported as retryable, so the customer is charged twice) or to "paid".
      *
      * @param array<string,mixed> $parsed
      * @param ?callable(mixed):mixed $redact
+     * @param ?string $expectedId the id that was REQUESTED. The body must agree with it.
      */
-    public static function paymentBody(array $parsed, int $status, ?callable $redact = null): void
-    {
-        $problem = self::paymentProblem($parsed);
+    public static function paymentBody(
+        array $parsed,
+        int $status,
+        ?callable $redact = null,
+        ?string $expectedId = null,
+    ): void {
+        $problem = self::paymentProblem($parsed, $expectedId);
         if ($problem === null) {
             return;
         }
@@ -149,8 +185,14 @@ final class Validate
     }
 
     /** @param array<string,mixed> $parsed */
-    private static function ackProblem(array $parsed): ?string
+    private static function ackProblem(array $parsed, int $httpStatus): ?string
     {
+        // THE HTTP STATUS IS PART OF THE CONTRACT, and it is checked FIRST - before any field - so a
+        // well-shaped body served by something that is not the collect endpoint cannot pass.
+        if ($httpStatus !== self::ACK_HTTP_STATUS) {
+            return "HTTP {$httpStatus}, expected " . self::ACK_HTTP_STATUS . ' Accepted - a collect '
+                . 'that was genuinely dispatched always answers 202';
+        }
         if (!self::isNonBlankString($parsed['paymentId'] ?? null)) {
             return 'no usable paymentId';
         }
@@ -158,22 +200,30 @@ final class Validate
             return 'no usable checkoutRequestId';
         }
         $status = $parsed['status'] ?? null;
-        if (!is_string($status)) {
-            return 'status is missing or not a string';
-        }
-        if (!in_array($status, self::ACK_STATUSES, true)) {
-            return "status \"{$status}\" is not a valid acknowledgement state";
+        if ($status !== self::ACK_STATUS) {
+            return 'status was ' . json_encode($status) . ', expected the literal "'
+                . self::ACK_STATUS . '"';
         }
 
         return null;
     }
 
     /** @param array<string,mixed> $parsed */
-    private static function paymentProblem(array $parsed): ?string
+    private static function paymentProblem(array $parsed, ?string $expectedId = null): ?string
     {
         if (!self::isNonBlankString($parsed['id'] ?? null)) {
             return 'no usable payment id';
         }
+
+        // L1 BINDING. Checked before anything else about the record's CONTENTS, because if this
+        // fails then every remaining field describes some OTHER payment, and reasoning about them is
+        // not merely useless but actively misleading.
+        if ($expectedId !== null && $parsed['id'] !== $expectedId) {
+            return 'the body describes payment ' . json_encode($parsed['id']) . ' but '
+                . json_encode($expectedId) . ' was requested - this response answers a different '
+                . 'question, so it tells you NOTHING about the payment you asked about';
+        }
+
         $status = $parsed['status'] ?? null;
         if (!is_string($status)) {
             return 'status is missing or not a string';
@@ -195,15 +245,13 @@ final class Validate
             return 'resultDesc is present but not a string';
         }
 
-        // A success claim needs EVIDENCE. `status: "success"` with no receipt and no result code is
-        // an assertion with nothing behind it - a truncated body, a stubbed response, a proxy's idea
-        // of a default - and shipping goods on it is a real loss.
-        if ($status === 'success'
-            && !self::isNonBlankString($receipt)
-            && !self::isSuccessCode($code)) {
-            return 'status is "success" but the body carries no evidence of it - no mpesaReceipt and '
-                . 'no result code 0';
-        }
+        // NOTE: the "a success claim needs EVIDENCE" rule (law L2) deliberately does NOT live here
+        // any more. It is a SEMANTIC rule, not a shape rule, and it belongs in exactly one place -
+        // {@see \Paylod\Semantics::judge()} - so the status-read path, the webhook path and the
+        // simulator cannot drift into disagreeing about what proves a payment. Enforcing it here as
+        // well would also be actively wrong on the polling path: an evidence-free `success` is
+        // INDETERMINATE, and an indeterminate payment must keep being polled so a webhook can settle
+        // it, not abort wait() with a throw.
 
         return null;
     }
@@ -211,11 +259,5 @@ final class Validate
     private static function isNonBlankString(mixed $value): bool
     {
         return is_string($value) && trim($value) !== '';
-    }
-
-    /** Daraja's success code is 0 - as a JSON number or, on some gateways, the string "0". */
-    private static function isSuccessCode(mixed $code): bool
-    {
-        return $code === 0 || (is_string($code) && trim($code) === '0');
     }
 }
