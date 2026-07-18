@@ -220,6 +220,29 @@ final class Simulator
             throw new PaylodInvalidRequestError('simulate.outcome(): paymentId is required.');
         }
 
+        // THE DERIVED KEY IS BUILT FROM CALLER INPUT, so its inputs are checked before it is built.
+        //
+        // `sim-outcome-{$paymentId}-{$outcome}` interpolates two unvalidated strings into a value
+        // that goes out as an `Idempotency-Key` HTTP HEADER. Neither was checked: `$outcome` was
+        // forwarded to the API to be rejected there, and `$paymentId` only had to be non-empty. So a
+        // newline, a NUL, a non-ASCII character or a megabyte of text landed in a header value -
+        // the exact class of input {@see Validate::idempotencyKey()} exists to refuse on the
+        // production path, bypassed on the simulator path because the key was DERIVED rather than
+        // supplied. "The SDK generated it" is not a reason to trust a string the caller wrote most
+        // of, and a simulator that accepts a request production would reject teaches the wrong
+        // lesson about the path it stands in for.
+        if (!in_array($outcome, self::OUTCOMES, true)) {
+            throw new PaylodInvalidRequestError(
+                'simulate.outcome(): outcome must be one of ' . implode(', ', self::OUTCOMES)
+                . ' (got ' . json_encode($outcome) . ').'
+            );
+        }
+
+        $idempotencyKey = "sim-outcome-{$paymentId}-{$outcome}";
+        // Run the PRODUCTION key rules over the derived value. With `$outcome` now closed, this is
+        // effectively a check on `$paymentId` - which is exactly the point: the id is caller input.
+        Validate::idempotencyKey($idempotencyKey);
+
         $redact = $this->redactor();
 
         $ack = ($this->request)([
@@ -231,7 +254,7 @@ final class Simulator
             // operation, which is exactly the right shape here: retrying "settle THIS payment as
             // THIS outcome" is the same operation and must replay, while settling it as a different
             // outcome is a different operation.
-            'idempotencyKey' => "sim-outcome-{$paymentId}-{$outcome}",
+            'idempotencyKey' => $idempotencyKey,
             // The settle response describes a PAYMENT, so it runs the payment validator - the same
             // one status() runs, ID BINDING (law L1) INCLUDED. This surface previously validated
             // against a hardcoded 200 and did not bind at all, so a body describing a DIFFERENT
