@@ -447,6 +447,37 @@ final class PaylodClientTest extends TestCase
         }
     }
 
+    /**
+     * PRINTABLE non-ASCII is the subtle one: "ordr-cafe-1" with an accented e is not blank, not a
+     * control char and not invisible whitespace, so every other rule passes it - but HTTP header
+     * values are ASCII on the wire (RFC 9110). It either fails in the transport as an opaque encoding
+     * error, or gets silently re-encoded, so a retry meant to reuse ONE key no longer matches and the
+     * duplicate-charge guard disappears without a sound. Must be rejected BEFORE dispatch.
+     */
+    public function testCollectRejectsPrintableNonAsciiIdempotencyKey(): void
+    {
+        $bad = [
+            "ordr-caf\u{00e9}-1",   // Latin-1 accented e - the realistic case
+            "ordre\u{0301}-1",      // combining acute accent
+            "order-\u{00df}-1",     // sharp s
+            "\u{6ce8}\u{6587}-1",   // CJK
+            "order-\u{0645}-1",     // Arabic
+            "order-\u{2013}1",      // en dash (a copy-paste hazard)
+            "order-\u{00a3}1",      // pound sign
+        ];
+        foreach ($bad as $key) {
+            [$paylod, $transport] = $this->client([['status' => 202, 'json' => self::ACK]]);
+            try {
+                $paylod->collect(['amount' => 100, 'phone' => '0712345678', 'idempotencyKey' => $key]);
+                $this->fail('expected ' . bin2hex($key) . ' to be rejected');
+            } catch (PaylodInvalidRequestError $e) {
+                $this->assertMatchesRegularExpression('/printable ASCII/', $e->getMessage());
+                // Rejected locally - the request must never have gone out.
+                $this->assertSame([], $transport->calls, 'key was dispatched instead of rejected');
+            }
+        }
+    }
+
     public function testCollectAcceptsAnOrdinaryKeyWithAnAsciiSpace(): void
     {
         // A plain ASCII space is legal in an HTTP header value - the rule targets INVISIBLE and

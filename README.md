@@ -277,6 +277,8 @@ $attempt = $db->attempts()->create(['order_id' => $order->id]); // a row per pre
 $paylod->collectAndWait(['amount' => $amount, 'phone' => $phone, 'idempotencyKey' => $attempt->id]);
 ```
 
+**Key format:** printable ASCII (`0x20-0x7E`), 1-255 bytes. The key travels as an HTTP header, and header values are ASCII on the wire - a key containing an accented letter, a CJK character or a pasted en dash is rejected locally rather than silently re-encoded into a *different* key that no longer deduplicates. Use a UUID, or slug your order id to ASCII.
+
 | Key you pass | What happens |
 | --- | --- |
 | An id minted per **payment attempt** | Correct. Duplicates collapse; a new attempt is a new charge. |

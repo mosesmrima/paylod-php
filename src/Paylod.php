@@ -689,6 +689,20 @@ final class Paylod
                 . 'ideographic space, BOM, line/paragraph separators). Use plain ASCII.'
             );
         }
+        // Finally: PRINTABLE ASCII only (0x20-0x7E). HTTP header values are ASCII on the wire
+        // (RFC 9110), so a printable non-ASCII character like the accented e in "ordr-cafe-1" is not
+        // merely exotic - it is unrepresentable. It either blows up in the transport as an opaque
+        // encoding error, or (worse, on a laxer stack) gets silently re-encoded, so two requests that
+        // were meant to carry ONE key no longer do and the duplicate-charge guard quietly vanishes.
+        if (preg_match('/[^\x20-\x7e]/', $key) === 1) {
+            throw new PaylodInvalidRequestError(
+                'idempotencyKey must be printable ASCII only (letters, digits and punctuation in the '
+                . 'range 0x20-0x7E). HTTP header values are ASCII on the wire, so an accented or '
+                . 'non-Latin character cannot be sent reliably - and a silently re-encoded key stops '
+                . 'matching the retry it was meant to deduplicate. Derive the key from an id you '
+                . 'control (a UUID, or your order id slugged to ASCII).'
+            );
+        }
     }
 
     /**

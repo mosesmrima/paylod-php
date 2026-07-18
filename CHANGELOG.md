@@ -24,6 +24,14 @@ golden webhook vector (`whsec_golden_vector_v1` -> `3afe38e4...2c2eb7`) still pa
   passed straight through to `CURLOPT_TIMEOUT_MS`, where **0 disables the timeout entirely** - a hung
   request would never return and a `wait()` would never settle. Applies to both the constructor
   option and `wait(['timeoutMs' => ...])`.
+- **`idempotencyKey` must be printable ASCII (0x20-0x7E).** HTTP header values are ASCII on the wire
+  (RFC 9110), but a printable non-ASCII key - `ordr-cafe-1` with an accented `e`, a CJK order id, an
+  en dash pasted from a document - passed every other rule: it is not blank, not a control character
+  and not invisible whitespace. Such a key either fails in the transport as an unactionable encoding
+  error, or on a laxer stack is silently re-encoded, so two requests meant to carry **one** key stop
+  matching and the duplicate-charge guard vanishes without a sound. Rejected locally, before dispatch,
+  with an error that says what to use instead: derive keys from an id you control (a UUID, or an order
+  id slugged to ASCII).
 - **A non-positive webhook tolerance is now refused UNCONDITIONALLY.** 0.2.0 still allowed
   `toleranceSec: 0` when a fixed `$nowSec` was injected, which meant the public verifier could be
   called with freshness effectively disabled. `toleranceSec` must be a finite, whole, positive number
