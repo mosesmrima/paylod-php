@@ -6,6 +6,87 @@ All notable changes to `paylod/paylod` are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-07-19
+
+**Breaking.** An eighth independent review found ONE CRITICAL - a forged-success bypass that
+defeated the round-6 impostor-zero guard by attacking its assumption rather than its logic - plus
+three highs, five mediums and a low. Every protection below is verified NON-VACUOUS by
+`scripts/non-vacuity.php`: **68/68 mutations caught** (up from 48/48). The golden webhook vector
+(`whsec_golden_vector_v1` -> `3afe38e4...2c2eb7`) still signs byte-for-byte identically.
+
+The theme of this round is ASSUMPTIONS ABOUT INPUT. The raw result-code guard was correct about
+what a non-canonical zero looks like and wrong about how a JSON key can be spelled. The webhook
+reconstruction removed the bad fields it knew the names of and forwarded everything else. Both are
+the same mistake: a rule written against the shapes the author imagined, on input an attacker
+chooses.
+
+### Security - CRITICAL
+
+- **The raw result-code guard is now a JSON PARSER, not a regex.** It matched the literal bytes
+  `"resultCode"`. JSON permits `\uXXXX` escapes in member names, so the identical key spelled
+  `"result\u0043ode"` bypassed the scan entirely, decoded to the PHP integer `0`, and was accepted
+  as PAID on **both** the status path and the signed-webhook path - a forged success, reachable by
+  anyone who could shape a response body. `Support\JsonLexeme` now walks the document as an
+  incremental scanner: it DECODES every member name and associates it with the ORIGINAL bytes of
+  the value beside it, at every nesting depth, for every duplicate key. When the scan cannot read a
+  body that `json_decode()` can, the body is REFUSED rather than waved through.
+
+### Breaking
+
+- **`Webhook::verify()` rebuilds the event from an exact ALLOWLIST**, replacing the previous
+  strip-four-known-names approach. Arbitrary root and `data` fields no longer survive verification.
+  This closes nested retryability: `data.details.retryable = true` and `data.extra.deep.retryable
+  = true` reached handlers verbatim on events the SDK had just judged NON-retryable. An unknown
+  event type is now represented MINIMALLY - the envelope plus the scalar members of `data` - so
+  forward compatibility cannot be a channel for a claim this version cannot check.
+- **`Webhook::verify()` refuses a non-string payload.** The byte ceiling was checked on
+  `strlen((string) $payload)`, i.e. AFTER a `\Stringable`/PSR-7 stream had been materialised in
+  full - on an unauthenticated endpoint, where that read IS the denial of service. Pass the raw
+  body string your framework already read under its own limit.
+- **`Simulator::collect()` requires an idempotency key**, like production. It silently generated
+  one, which made the surface developers use to prove "this cannot charge twice" the one surface on
+  which it could. Pass `idempotencyKey`, or `unsafeGeneratedIdempotencyKey => true` to opt in and be
+  warned.
+
+### Security
+
+- Malformed-2xx diagnostics run the COMPLETE message through the redactor. Several branches quoted
+  server-controlled values (`status` via `json_encode`, a mismatched id) verbatim, so a gateway
+  echoing the bearer token put a live key into the exception message and the application's log.
+- The decoded webhook event is redacted with the EXACT supplied secret, not only credential SHAPES.
+- Every webhook payload parameter is `#[\SensitiveParameter]` at every public and private wrapper.
+- `sanitizedCause()` marks both parameters sensitive. It dropped the credential-bearing original
+  from the `previous` chain and then handed it straight back through the surrogate's OWN structured
+  trace, because PHP records call arguments in every frame.
+- The signature header is bounded in bytes and segments BEFORE it is exploded.
+- `Simulator` acknowledgement `outcomes` are rebuilt from the closed five-value set. They were
+  forwarded from the server unvalidated and unredacted into ordinary, logged output.
+- `Phone::INPUT_RE` anchors with `\z`, not `$`, which accepted a trailing newline.
+
+### Fixed
+
+- The simulator runs the PRODUCTION collect rules: `Validate::collectAmount()` and
+  `Validate::collectIdempotencyKey()` are now shared, so the 150,000 KES ceiling and the key
+  requirement apply to both dispatch surfaces from one implementation.
+- `Simulator::pay()` validates its outcome BEFORE `collect()` creates a payment. A typo'd outcome
+  left a stranded pending payment behind.
+- A simulator dispatch failure carries the effective idempotency key, so a caller retries with the
+  same one instead of minting a fresh key and double-charging.
+
+### Testing
+
+- The mutation harness treated ANY nonzero PHPUnit exit as CAUGHT, so a warning, a runtime error or
+  a crashed selected test was indistinguishable from a protection working. A catch now requires a
+  genuine assertion FAILURE with zero errors, risky, skipped or incomplete tests, and the
+  pre-mutation run must be spotless. Enabling this immediately exposed three tests that ERRORED
+  rather than failed under mutation, two stale anchors, and one vacuous assertion.
+- Every `nv:<id>` tag in a test must correspond to a registered mutation case, so a protection
+  cannot have a test but no proof that the test is load-bearing.
+- The full `retryable` cross-product is covered at BOTH published levels. The dangerous cell - an
+  INDETERMINATE record whose code is retryable in the catalog - had no test.
+- The transport's refusal to request automatic decompression is pinned, so a response-size ceiling
+  can never be applied to a body that expanded past it after arriving.
+
 ## [0.7.0] - 2026-07-18
 
 **Breaking.** A sixth independent review found no criticals - the first round with none - but five
@@ -576,7 +657,8 @@ v0.3.x) to idiomatic PHP 8.1+, with first-class Laravel support.
 - Injectable HTTP transport (`Paylod\Http\Transport`), defaulting to `CurlTransport`, so the
   whole test suite runs with no network.
 
-[Unreleased]: https://github.com/mosesmrima/paylod-php/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/mosesmrima/paylod-php/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/mosesmrima/paylod-php/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/mosesmrima/paylod-php/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/mosesmrima/paylod-php/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/mosesmrima/paylod-php/compare/v0.4.0...v0.5.0

@@ -858,6 +858,41 @@ $CASES = [
         self::assertKnownOutcome($outcome);', '        $outcome = $params[\'outcome\'] ?? null;'],
         ],
     ],
+    [
+        'id' => 'r8-retryable-cross-product',
+        'what' => 'the nested detail keeps the raw catalog retryable on an INDETERMINATE record, '
+            . 'so a handler reading the decoded block re-charges a customer holding a receipt',
+        'test' => 'testEveryExposedRetryableFieldAgreesAcrossTheCrossProduct',
+        'edits' => [
+            ['src/PaymentOutcome.php', '            return new self(
+                status: \'pending\',
+                message: self::INDETERMINATE,
+                retryable: false,
+                paid: false,
+                paymentId: $paymentId,
+                receipt: null,
+                code: $code,
+                detail: self::nonRetryableDetail($detail),', '            return new self(
+                status: \'pending\',
+                message: self::INDETERMINATE,
+                retryable: false,
+                paid: false,
+                paymentId: $paymentId,
+                receipt: null,
+                code: $code,
+                detail: $detail,'],
+        ],
+    ],
+    [
+        'id' => 'r8-no-decompression-before-cap',
+        'what' => 'the transport asks cURL for automatic decompression, so the byte ceiling is '
+            . 'applied to the EXPANDED body instead of the wire bytes',
+        'test' => 'testTheTransportNeverAsksForAutomaticDecompression',
+        'edits' => [
+            ['src/Http/CurlHttpClient.php', '            CURLOPT_RETURNTRANSFER => true,', '            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_ENCODING => \'\','],
+        ],
+    ],
 ];
 
 /**

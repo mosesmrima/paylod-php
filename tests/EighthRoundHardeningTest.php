@@ -659,6 +659,107 @@ final class EighthRoundHardeningTest extends TestCase
         }
     }
 
+    // == The cross-SDK checks =====================================================================
+
+    /**
+     * EVERY EXPOSED `retryable`, ACROSS THE WHOLE SEMANTIC CROSS-PRODUCT.
+     *
+     * `retryable` means SAFE TO CHARGE AGAIN and this object publishes it TWICE - as
+     * `$outcome->retryable` and as `$outcome->detail['retryable']`. A guarantee that holds at only
+     * one of the two places it is published is not a guarantee, and the dangerous cell is the one
+     * nothing covered: an INDETERMINATE record whose CODE is retryable in the catalog. A handler
+     * reading the decoded block - where the title, cause and fix live, so a natural thing to read -
+     * would be told to re-charge a customer who is holding an M-Pesa receipt.
+     *
+     * @dataProvider retryableCrossProduct
+     * nv:r8-retryable-cross-product
+     */
+    public function testEveryExposedRetryableFieldAgreesAcrossTheCrossProduct(
+        array $payment,
+        string $expectedStatus,
+        bool $expectedRetryable,
+    ): void {
+        $outcome = \Paylod\PaymentOutcome::fromPayment($payment);
+
+        $this->assertSame($expectedStatus, $outcome->status);
+        $this->assertSame($expectedRetryable, $outcome->retryable);
+
+        if ($outcome->detail !== null) {
+            // The nested flag is the SAME value, never an independent second reading.
+            $this->assertSame(
+                $expectedRetryable,
+                $outcome->detail['retryable'],
+                'the nested detail disagrees with the top-level verdict'
+            );
+        }
+
+        // And nothing anywhere in the rendered object claims retryability when the verdict does not.
+        if (!$expectedRetryable) {
+            $this->assertStringNotContainsString('"retryable":true', json_encode($outcome->toArray()));
+        }
+    }
+
+    /** @return array<string,array{0:array<string,mixed>,1:string,2:bool}> */
+    public static function retryableCrossProduct(): array
+    {
+        $record = static fn (string $status, ?string $receipt, mixed $code): array => [
+            'id' => 'pay_1',
+            'status' => $status,
+            'mpesaReceipt' => $receipt,
+            'resultCode' => $code,
+            'resultDesc' => 'x',
+        ];
+
+        return [
+            // PAID - never retryable, charging again is a second charge.
+            'paid' => [$record('success', 'SFF6XYZ123', 0), 'succeeded', false],
+            // INDETERMINATE with a catalog-RETRYABLE code. THE cell the round-7 audit named.
+            'indeterminate, retryable code' => [$record('failed', 'SFF6XYZ123', 1032), 'pending', false],
+            'indeterminate, cancelled+receipt' => [$record('cancelled', 'SFF6XYZ123', 1032), 'pending', false],
+            // IN FLIGHT - a live prompt is never safe to re-charge.
+            'in flight, pending code' => [$record('pending', null, '500.001.1001'), 'pending', false],
+            'in flight, no code' => [$record('pending', null, null), 'pending', false],
+            'in flight, code 4999' => [$record('pending', null, 4999), 'pending', false],
+            // TERMINAL FAILURE - the ONE place the nested flag may be true, and only in step.
+            'terminal, retryable code' => [$record('failed', null, 1032), 'cancelled', true],
+            'terminal, non-retryable code 17' => [$record('failed', null, 17), 'failed', false],
+            'terminal, non-retryable code 26' => [$record('failed', null, 26), 'failed', false],
+            'terminal, non-retryable code 1025' => [$record('failed', null, 1025), 'failed', false],
+            'terminal, non-retryable code 9999' => [$record('failed', null, 9999), 'failed', false],
+        ];
+    }
+
+    /**
+     * THE DECOMPRESSION-BEFORE-CAP TRAP, pinned shut.
+     *
+     * A response-size ceiling applied AFTER automatic decompression is no ceiling: a few kilobytes
+     * of gzip expand to gigabytes in memory before the check ever runs. cURL only decompresses when
+     * it was asked to - via CURLOPT_ENCODING / CURLOPT_ACCEPT_ENCODING, or an explicit
+     * Accept-Encoding request header - and this client sets neither, so its WRITEFUNCTION ceiling
+     * counts bytes as they arrive on the wire.
+     *
+     * That is a property of what the transport does NOT do, which is exactly the kind of thing that
+     * gets undone by a well-meaning "let's enable compression" patch. Pinned here so it cannot be.
+     *
+     * nv:r8-no-decompression-before-cap
+     */
+    public function testTheTransportNeverAsksForAutomaticDecompression(): void
+    {
+        $source = (string) file_get_contents(dirname(__DIR__) . '/src/Http/CurlHttpClient.php');
+
+        $this->assertStringNotContainsString('CURLOPT_ENCODING', $source);
+        $this->assertStringNotContainsString('CURLOPT_ACCEPT_ENCODING', $source);
+
+        // And no layer above it asks for compression in the request headers either.
+        foreach (['src/Http/Transport.php', 'src/Paylod.php'] as $file) {
+            $this->assertStringNotContainsStringIgnoringCase(
+                'Accept-Encoding',
+                (string) file_get_contents(dirname(__DIR__) . '/' . $file),
+                $file
+            );
+        }
+    }
+
     /** A genuine signed settlement still verifies - the guard must not break real webhooks. */
     public function testAGenuineSignedSettlementStillVerifies(): void
     {
