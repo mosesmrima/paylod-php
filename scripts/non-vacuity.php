@@ -1131,6 +1131,26 @@ $CASES = [
             ['src/Support/Uuid.php', 'namespace Paylod\\Support;', "namespace Paylod\\Support;\n// \x00"],
         ],
     ],
+
+    // == ROUND 10 - requirement 2.6: no replacement semantics on a money path =====================
+    [
+        'id' => 'r10-invalid-utf8-is-refused',
+        'what' => 'the webhook parser is given JSON_INVALID_UTF8_SUBSTITUTE, so invalid UTF-8 in a '
+            . 'receipt is silently normalized into U+FFFD instead of being refused',
+        'test' => 'testInvalidUtf8OnAMoneyPathIsRefusedRatherThanNormalized',
+        'edits' => [
+            ['src/Webhook.php', '        $event = json_decode($raw, true, JsonLexeme::MAX_DEPTH, JSON_BIGINT_AS_STRING);', '        $event = json_decode($raw, true, JsonLexeme::MAX_DEPTH, JSON_BIGINT_AS_STRING | JSON_INVALID_UTF8_SUBSTITUTE);'],
+        ],
+    ],
+    [
+        'id' => 'r10-replacement-char-is-never-evidence',
+        'what' => 'the receipt grammar is widened to any ten characters, so ten U+FFFD replacement '
+            . 'characters become proof that money moved',
+        'test' => 'testTheReplacementCharacterSatisfiesNoEvidenceOrIdentifierCheck',
+        'edits' => [
+            ['src/Semantics.php', '        return preg_match(self::RECEIPT_RE, $receipt) === 1;', "        return preg_match('/^.{10}\\z/u', \$receipt) === 1;"],
+        ],
+    ],
 ];
 
 /**

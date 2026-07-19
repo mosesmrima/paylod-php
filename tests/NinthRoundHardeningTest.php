@@ -530,8 +530,20 @@ final class NinthRoundHardeningTest extends TestCase
 
         $sinks = [];
 
+        // REQUIREMENT 8.6 - THE SELF-CHECK. Every public object the sweep constructs is recorded
+        // here, parent classes included, and the list is asserted against the SDK's public surface
+        // at the end. Without it "the sweep covers every public type" is a claim in a comment.
+        $constructed = [];
+        $note = static function (object $o) use (&$constructed): object {
+            for ($c = get_class($o); $c !== false; $c = get_parent_class($c)) {
+                $constructed[$c] = true;
+            }
+
+            return $o;
+        };
+
         // 1. PaymentOutcome, from a hostile record.
-        $outcome = PaymentOutcome::fromPayment($hostilePayment);
+        $outcome = $note(PaymentOutcome::fromPayment($hostilePayment));
         $sinks['PaymentOutcome json'] = json_encode($outcome);
         $sinks['PaymentOutcome print_r'] = print_r($outcome, true);
         $sinks['PaymentOutcome var_export'] = var_export($outcome, true);
@@ -541,10 +553,11 @@ final class NinthRoundHardeningTest extends TestCase
         $sinks['decode int code'] = json_encode(DarajaCatalog::decode(87654, $poison));
 
         // 3. The judgement and its reason string.
-        $sinks['Judgement'] = json_encode(Semantics::judge($hostilePayment));
+        $sinks['Judgement'] = json_encode($note(Semantics::judge($hostilePayment)));
 
         // 4. The client itself, in every dump form.
-        $client = new Paylod($key, ['webhookSecret' => $secret]);
+        $client = $note(new Paylod($key, ['webhookSecret' => $secret]));
+        $note($client->simulator);
         $sinks['client print_r'] = print_r($client, true);
         $sinks['client var_export'] = var_export($client, true);
         $sinks['client var_dump'] = self::varDump($client);
@@ -563,6 +576,7 @@ final class NinthRoundHardeningTest extends TestCase
                 $c->collect(['amount' => 100, 'phone' => '0712345678', 'idempotencyKey' => 'sweep-1']);
                 $this->fail("hostile response {$label} was not refused");
             } catch (\Throwable $e) {
+                $note($e);
                 $sinks["collect {$label} message"] = $e->getMessage();
                 $sinks["collect {$label} string"] = (string) $e;
                 $sinks["collect {$label} trace"] = print_r($e->getTrace(), true);
@@ -582,32 +596,137 @@ final class NinthRoundHardeningTest extends TestCase
                 'resultDesc' => $poison,
             ],
         ], JSON_THROW_ON_ERROR);
+        // EVERY BRANCH IS REQUIRED TO BE REACHED, and a SUCCESSFUL return is a sink too.
+        //
+        // Round 10 found this section unable to detect the very defect it was meant to cover. It
+        // caught \Throwable and treated ANY exception as adequate, so a body refused for the wrong
+        // reason - or refused before the interesting code ran - counted as a pass. It DISCARDED
+        // successful parseWebhook() results, which is the single most important sink on this path:
+        // a delivered event is a value the handler reads. And it took no sink at all from the
+        // BOOLEAN surface, so verifyWebhook() returning `true` about a compromised body was
+        // invisible. `$reached` records which arms actually ran and is asserted below.
+        $reached = [];
+
+        $poisonSig = Webhook::sign($rawPoison, $secret, $now);
+
         try {
-            $event = Webhook::verify($rawPoison, Webhook::sign($rawPoison, $secret, $now), $secret, 300, $now);
+            $event = Webhook::verify($rawPoison, $poisonSig, $secret, 300, $now);
             $sinks['webhook event'] = json_encode($event);
+            $reached['webhook delivered'] = true;
         } catch (\Throwable $e) {
+            $note($e);
             $sinks['webhook message'] = $e->getMessage();
             $sinks['webhook trace'] = print_r($e->getTrace(), true);
             $sinks['webhook string'] = (string) $e;
+            $reached['webhook refused'] = true;
         }
         try {
-            $client->parseWebhook($rawPoison, Webhook::sign($rawPoison, $secret, $now), $secret, 300);
+            // THE RETURN VALUE IS CAPTURED. It used to be thrown away.
+            $sinks['parseWebhook event'] = json_encode($client->parseWebhook($rawPoison, $poisonSig, $secret, 300));
+            $reached['parseWebhook delivered'] = true;
         } catch (\Throwable $e) {
+            $note($e);
             $sinks['parseWebhook message'] = $e->getMessage();
             $sinks['parseWebhook trace'] = print_r($e->getTrace(), true);
+            $sinks['parseWebhook string'] = (string) $e;
+            $reached['parseWebhook refused'] = true;
         }
         try {
             $client->parseWebhook($rawPoison, 'garbage', $secret, 300);
+            $this->fail('a garbage signature was accepted');
         } catch (\Throwable $e) {
+            $note($e);
             $sinks['parseWebhook bad sig trace'] = print_r($e->getTrace(), true);
             $sinks['parseWebhook bad sig string'] = (string) $e;
+            $reached['bad signature refused'] = true;
         }
 
-        // 7. A signature verification error raised through the SIMULATOR-adjacent surfaces.
+        // 7. THE BOOLEAN SURFACE. A `true` about a body echoing a credential is itself the leak -
+        //    the credential does not have to appear in a string for the answer to be wrong - so the
+        //    boolean is recorded AND asserted, not merely rendered into a sink.
+        try {
+            $verdict = $client->verifyWebhook($rawPoison, $poisonSig, $secret);
+            $sinks['verifyWebhook verdict'] = var_export($verdict, true);
+            $reached['verifyWebhook returned'] = true;
+            $this->assertFalse(
+                $verdict,
+                'verifyWebhook() answered TRUE about a body echoing a configured credential'
+            );
+        } catch (PaylodCredentialCompromiseError $e) {
+            // Refusing outright is the stronger answer and is equally acceptable.
+            $note($e);
+            $sinks['verifyWebhook refusal'] = (string) $e;
+            $reached['verifyWebhook refused'] = true;
+        }
         try {
             $client->verifyWebhook($rawPoison, 'garbage', $secret);
+            $reached['verifyWebhook bad sig returned'] = true;
         } catch (\Throwable $e) {
+            $note($e);
             $sinks['verifyWebhook trace'] = print_r($e->getTrace(), true);
+            $reached['verifyWebhook bad sig threw'] = true;
+        }
+
+        // 8. THE EXACT CREDENTIAL, SPELLED WITH JSON ESCAPES. A literal-bytes fixture cannot detect
+        //    the escaped-credential delivery defect: the value is absent from the raw body and
+        //    present in the decoded event. Both spellings are swept.
+        $escaped = '';
+        foreach (str_split($secret) as $ch) {
+            $escaped .= sprintf('\u%04x', ord($ch));
+        }
+        $rawEscaped = '{"type":"payment.failed","created":' . $now . ',"data":{"paymentId":"pay_123",'
+            . '"status":"failed","resultCode":1032,"resultDesc":"' . $escaped . '"}}';
+        $this->assertStringNotContainsString($secret, $rawEscaped, 'the escaped fixture is not escaped');
+        try {
+            $sinks['escaped webhook event'] = json_encode(
+                Webhook::verify($rawEscaped, Webhook::sign($rawEscaped, $secret, $now), $secret, 300, $now)
+            );
+            $reached['escaped delivered'] = true;
+        } catch (\Throwable $e) {
+            $note($e);
+            $sinks['escaped webhook message'] = $e->getMessage();
+            $sinks['escaped webhook string'] = (string) $e;
+            $reached['escaped refused'] = true;
+        }
+        $this->assertArrayHasKey(
+            'escaped refused',
+            $reached,
+            'a signed body echoing the webhook secret in JSON-escaped form was DELIVERED'
+        );
+
+        // 9. A NONSTANDARD ACCEPTED KEY - one the credential SHAPE rules cannot match, so only the
+        //    exact-secret layer can catch it. A sweep built entirely on mp_/whsec_-shaped values
+        //    proves the shape layer works and says nothing about the exact layer.
+        $plainSecret = 'plain-secret-with-no-recognisable-shape';
+        $plainClient = new Paylod($key, ['webhookSecret' => $plainSecret]);
+        $rawPlain = json_encode([
+            'type' => 'payment.failed',
+            'created' => $now,
+            'data' => [
+                'paymentId' => 'pay_123',
+                'status' => 'failed',
+                'resultCode' => 1032,
+                'resultDesc' => $plainSecret,
+            ],
+        ], JSON_THROW_ON_ERROR);
+        try {
+            $sinks['plain secret event'] = json_encode(
+                $plainClient->parseWebhook($rawPlain, Webhook::sign($rawPlain, $plainSecret, $now), $plainSecret, 300)
+            );
+            $reached['plain secret delivered'] = true;
+        } catch (\Throwable $e) {
+            $note($e);
+            $sinks['plain secret message'] = $e->getMessage();
+            $sinks['plain secret string'] = (string) $e;
+            $reached['plain secret refused'] = true;
+        }
+        $this->assertArrayHasKey(
+            'plain secret refused',
+            $reached,
+            'a body echoing a NON-credential-shaped configured secret was delivered'
+        );
+        foreach ($sinks as $label => $text) {
+            $this->assertStringNotContainsString($plainSecret, (string) $text, "PLAIN SECRET leaked in: {$label}");
         }
 
         foreach ($sinks as $label => $text) {
@@ -615,8 +734,86 @@ final class NinthRoundHardeningTest extends TestCase
             $this->assertStringNotContainsString($secret, (string) $text, "WEBHOOK SECRET leaked in: {$label}");
         }
 
-        // The sweep must actually have swept something.
-        $this->assertGreaterThan(20, count($sinks), 'the sweep collected suspiciously few sinks');
+        // 10. THE REMAINING PUBLIC TYPES, constructed from poisoned input so the self-check below
+        //     is satisfied by real coverage rather than by shrinking the list. Each of these is a
+        //     type a caller can be handed, so each is a place a credential could surface.
+        try {
+            new Paylod('   ');
+        } catch (\Throwable $e) {
+            $note($e);
+            $sinks['config error'] = (string) $e;
+        }
+        try {
+            // A live key on the simulator: refused locally, before any dispatch.
+            (new Paylod('mp_live_' . $secret, ['webhookSecret' => $secret]))->simulator->collect([
+                'idempotencyKey' => 'sweep-sandbox',
+            ]);
+        } catch (\Throwable $e) {
+            $note($e);
+            $sinks['sandbox only'] = (string) $e;
+            $sinks['sandbox only trace'] = print_r($e->getTrace(), true);
+        }
+        try {
+            $client->collect(['amount' => $poison, 'phone' => '0712345678', 'idempotencyKey' => 'k']);
+        } catch (\Throwable $e) {
+            $note($e);
+            $sinks['invalid request'] = (string) $e;
+            $sinks['invalid request trace'] = print_r($e->getTrace(), true);
+        }
+        $timeoutError = $note(new \Paylod\Exceptions\PaylodTimeoutError($poison, $hostilePayment, 1));
+        $sinks['timeout error'] = (string) $timeoutError;
+        $sinks['timeout error print_r'] = print_r($timeoutError, true);
+        try {
+            $c = new Paylod($key, [
+                'webhookSecret' => $secret,
+                'allowCustomHttpClient' => true,
+                // A transport-layer failure: the mock raises PaylodConnectionError, which the
+                // client then retries and finally surfaces. `$poison` rides in through the URL the
+                // error quotes and through the retry bookkeeping.
+                'httpClient' => new MockHttpClient([['throw' => true]]),
+                'maxRetries' => 0,
+            ]);
+            $c->collect(['amount' => 100, 'phone' => '0712345678', 'idempotencyKey' => 'sweep-conn']);
+        } catch (\Throwable $e) {
+            $note($e);
+            $sinks['connection error'] = (string) $e;
+            $sinks['connection error trace'] = print_r($e->getTrace(), true);
+        }
+
+        // THE SELF-CHECK (requirement 8.6). "The sweep collected more than twenty sinks" is not the
+        // same claim as "every public type was constructed", and only the second one is what this
+        // test asserts in its own docblock. Every public class this SDK can hand a caller is
+        // enumerated here and each must have been instantiated at least once during the sweep;
+        // adding a new public type without sweeping it is a hard failure, not a silent gap.
+        $publicTypes = [
+            \Paylod\Paylod::class,
+            \Paylod\Simulator::class,
+            \Paylod\PaymentOutcome::class,
+            \Paylod\Judgement::class,
+            \Paylod\Exceptions\PaylodException::class,
+            \Paylod\Exceptions\PaylodApiError::class,
+            \Paylod\Exceptions\PaylodConfigError::class,
+            \Paylod\Exceptions\PaylodConnectionError::class,
+            \Paylod\Exceptions\PaylodCredentialCompromiseError::class,
+            \Paylod\Exceptions\PaylodInvalidRequestError::class,
+            \Paylod\Exceptions\PaylodSandboxOnlyError::class,
+            \Paylod\Exceptions\PaylodSignatureVerificationError::class,
+            \Paylod\Exceptions\PaylodTimeoutError::class,
+        ];
+        foreach ($publicTypes as $type) {
+            $this->assertArrayHasKey(
+                $type,
+                $constructed,
+                "the adversarial sweep never constructed {$type}, so it cannot claim to cover it"
+            );
+        }
+
+        // And every branch the sweep is built around really ran.
+        foreach (['bad signature refused', 'escaped refused', 'plain secret refused'] as $branch) {
+            $this->assertArrayHasKey($branch, $reached, "the sweep never reached: {$branch}");
+        }
+
+        $this->assertGreaterThan(30, count($sinks), 'the sweep collected suspiciously few sinks');
     }
 
     /** @return array<string,list<array<string,mixed>>> */

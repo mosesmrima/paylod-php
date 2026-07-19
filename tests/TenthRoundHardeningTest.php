@@ -763,4 +763,94 @@ final class TenthRoundHardeningTest extends TestCase
 
         $this->assertGreaterThan(20, $checked, 'the sweep inspected almost nothing');
     }
+
+    // == 10. Requirement 2.6 - no replacement semantics on any money path =========================
+
+    /**
+     * REQUIREMENT 2.6. Invalid UTF-8 MUST be refused, never silently normalized into U+FFFD, and
+     * distinct invalid byte sequences MUST NOT collapse into the same string. This was found open
+     * in Node and the JVM; PHP satisfies it because json_decode() rejects malformed UTF-8 outright
+     * (JSON_ERROR_UTF8) and no code path passes JSON_INVALID_UTF8_SUBSTITUTE / _IGNORE.
+     *
+     * Pinned with a test anyway. "It happens to be true of the runtime we use" is exactly the kind
+     * of unstated assumption this specification exists to stop: one added flag, one mb_convert
+     * call, and receipts from two different byte sequences become the same string.
+     *
+     * nv:r10-invalid-utf8-is-refused
+     */
+    public function testInvalidUtf8OnAMoneyPathIsRefusedRatherThanNormalized(): void
+    {
+        $now = 1700000000;
+        $sequences = [
+            'bare continuation bytes' => "\x80\x81",
+            'invalid 0xFE 0xFF' => "\xFE\xFF",
+            'overlong encoding of /' => "\xC0\xAF",
+            'truncated 3-byte sequence' => "\xE2\x82",
+            'lone surrogate, encoded' => "\xED\xA0\x80",
+        ];
+
+        $delivered = [];
+        foreach ($sequences as $label => $bad) {
+            $raw = '{"type":"payment.success","created":' . $now . ',"data":{"paymentId":"pay_1",'
+                . '"status":"success","mpesaReceipt":"SFF6XYZ1' . $bad . '","resultCode":0}}';
+
+            // The fixture really is invalid UTF-8, or this proves nothing.
+            $this->assertNotSame(1, preg_match('//u', $raw), "{$label}: the fixture is valid UTF-8");
+
+            try {
+                $event = Webhook::verify(
+                    $raw,
+                    Webhook::sign($raw, self::SECRET, $now),
+                    self::SECRET,
+                    300,
+                    $now,
+                );
+                $delivered[$label] = $event['data']['mpesaReceipt'];
+            } catch (PaylodSignatureVerificationError $e) {
+                $this->assertSame('invalid_payload', $e->reason, $label);
+            }
+        }
+
+        $this->assertSame(
+            [],
+            $delivered,
+            'invalid UTF-8 was normalized and DELIVERED rather than refused: '
+            . json_encode($delivered)
+        );
+
+        // And a lone surrogate written as a JSON escape - the other spelling of the same attack.
+        $raw = '{"type":"payment.success","created":' . $now . ',"data":{"paymentId":"pay_1",'
+            . '"status":"success","mpesaReceipt":"\ud800XXXXXXXXX","resultCode":0}}';
+        try {
+            Webhook::verify($raw, Webhook::sign($raw, self::SECRET, $now), self::SECRET, 300, $now);
+            $this->fail('a lone surrogate escape in a receipt was accepted');
+        } catch (PaylodSignatureVerificationError $e) {
+            $this->assertSame('invalid_payload', $e->reason);
+        }
+    }
+
+    /**
+     * The structural half of requirement 2.6: even if a decoder somewhere did substitute, U+FFFD
+     * could never satisfy the receipt or identifier grammars, because both are ASCII-only. Two
+     * independent reasons the collapse cannot become evidence.
+     *
+     * nv:r10-replacement-char-is-never-evidence
+     */
+    public function testTheReplacementCharacterSatisfiesNoEvidenceOrIdentifierCheck(): void
+    {
+        $fffd = "\u{FFFD}";
+
+        // Ten characters, so a length-only check would pass it.
+        $this->assertFalse(Semantics::isReceipt(str_repeat($fffd, 10)));
+        $this->assertFalse(Semantics::isReceipt('SFF6XYZ1' . $fffd . $fffd));
+        $this->assertFalse(Semantics::hasReceipt(['mpesaReceipt' => 'SFF6XYZ1' . $fffd . $fffd]));
+
+        // And the shared identifier grammar refuses it too.
+        $this->assertFalse(\Paylod\Support\Validate::identifierIsUsable('id', $fffd . 'pay_1'));
+        $this->assertFalse(\Paylod\Support\Validate::identifierIsUsable('id', 'pay_1' . $fffd));
+
+        // The control: a real receipt and a real id still pass.
+        $this->assertTrue(Semantics::isReceipt('SFF6XYZ123'));
+        $this->assertTrue(\Paylod\Support\Validate::identifierIsUsable('id', 'pay_1'));
+    }
 }
