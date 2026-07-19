@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Paylod;
 
+use Paylod\Support\JsonLexeme;
 use Paylod\Support\Redact;
 
 /**
@@ -52,7 +53,12 @@ final class DarajaCatalog
                 throw new \RuntimeException("Could not read Daraja catalog at {$path}");
             }
             /** @var array{codes: list<array<string,mixed>>} $data */
-            $data = json_decode($json, true, 512, JSON_THROW_ON_ERROR);
+            // JsonLexeme::MAX_DEPTH, not a literal 512. The redaction traversal is pinned to this
+            // constant (Redact::MAX_DEPTH) and a test asserts the two are equal, but the PARSERS still
+            // passed their own literal - so the named constant could be changed and the parsers would
+            // silently keep the old bound, which is the drift the pinning exists to prevent. One
+            // constant, every parser (requirement 4.4).
+            $data = json_decode($json, true, JsonLexeme::MAX_DEPTH, JSON_THROW_ON_ERROR);
             self::$entries = $data['codes'];
         }
 

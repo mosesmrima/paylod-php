@@ -598,7 +598,12 @@ final class Webhook
             );
         }
 
-        $event = json_decode($raw, true, 512, JSON_BIGINT_AS_STRING);
+        // JsonLexeme::MAX_DEPTH, not a literal 512. The redaction traversal is pinned to this
+        // constant (Redact::MAX_DEPTH) and a test asserts the two are equal, but the PARSERS still
+        // passed their own literal - so the named constant could be changed and the parsers would
+        // silently keep the old bound, which is the drift the pinning exists to prevent. One
+        // constant, every parser (requirement 4.4).
+        $event = json_decode($raw, true, JsonLexeme::MAX_DEPTH, JSON_BIGINT_AS_STRING);
         if (!is_array($event)) {
             throw new PaylodSignatureVerificationError(
                 'invalid_payload',

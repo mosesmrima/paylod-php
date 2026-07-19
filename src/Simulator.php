@@ -123,7 +123,7 @@ final class Simulator
      * @param array{phone?:string,amount?:int,accountReference?:string,description?:string,metadata?:array<string,mixed>,idempotencyKey?:string} $params
      * @return array{paymentId:string,status:string,checkoutRequestId:string,outcomes:array<int,mixed>,idempotencyKey:string}
      */
-    public function collect(array $params = []): array
+    public function collect(array $params = [], ?array &$acknowledged = null): array
     {
         self::assertSandboxKey(($this->apiKey)(), 'simulate.collect()');
 
@@ -186,6 +186,21 @@ final class Simulator
         });
         $redact = $this->redactor();
 
+        // THE ACKNOWLEDGED PAYMENT ID IS CAPTURED, exactly as Paylod::collect() captures it.
+        //
+        // The validator below ran Validate::collectAck() and nothing else, so a malformed 202 that
+        // nonetheless carried a perfectly usable `paymentId` threw with the id thrown away - and the
+        // catch attached only the idempotency key. The message tells the caller "a charge may be
+        // live, go and read it" while withholding the id that would let them read it. Captured
+        // BEFORE validation can throw, through the SAME identifier grammar and the SAME credential
+        // check the production path applies (requirements 5.4 and 6.7 - every dispatch surface runs
+        // the same validators).
+        $acknowledgedPaymentId = null;
+        // Published to the caller's scope (requirement 5.4) - see Paylod::collect(). pay()
+        // establishes its recovery scope before calling this method and reads the context back
+        // through here, so a throwable landing after the payment exists is still rebindable.
+        $acknowledged = ['idempotencyKey' => $idempotencyKey, 'paymentId' => null];
+
         try {
             $ack = ($this->request)([
             'method' => 'POST',
@@ -197,7 +212,9 @@ final class Simulator
             // available, so the check was run against a hardcoded 200 and the ack could not be
             // rejected on it. A simulator that tolerates an acknowledgement production would reject
             // teaches the wrong thing about the shape of a real response.
-            'validate' => static function (#[\SensitiveParameter] array $parsed, int $status) use ($idempotencyKey, $redact): void {
+            'validate' => static function (#[\SensitiveParameter] array $parsed, int $status) use ($idempotencyKey, $redact, &$acknowledgedPaymentId, &$acknowledged): void {
+                $acknowledgedPaymentId = Validate::usableIdentifier($parsed, 'paymentId', $redact);
+                $acknowledged['paymentId'] = $acknowledgedPaymentId;
                 Validate::collectAck($parsed, $status, $idempotencyKey, $redact);
             },
             ]);
@@ -208,12 +225,18 @@ final class Simulator
             // dispatch surface dropped it on the floor, so a simulator failure taught the caller the
             // opposite reflex to the one production requires.
             if ($e instanceof \Paylod\Exceptions\PaylodException) {
-                $e->attachIdempotencyKey($idempotencyKey);
+                // BIND BOTH IDENTIFIERS when a usable payment id is known - the key alone lets the
+                // caller retry safely, the key AND the id let them find out what actually happened.
+                if ($acknowledgedPaymentId !== null) {
+                    $e->bindToAcknowledgedPayment($idempotencyKey, $acknowledgedPaymentId);
+                } else {
+                    $e->attachIdempotencyKey($idempotencyKey);
+                }
 
                 throw $e;
             }
 
-            throw new PaylodApiError(
+            $wrapped = new PaylodApiError(
                 'simulate.collect() failed with an unexpected error: '
                 . (string) $redact($e->getMessage()) . ' - the simulated charge state is '
                 . 'INDETERMINATE. Read the payment with this idempotencyKey before starting any new '
@@ -223,6 +246,11 @@ final class Simulator
                 $idempotencyKey,
                 true,
             );
+            if ($acknowledgedPaymentId !== null) {
+                $wrapped->bindToAcknowledgedPayment($idempotencyKey, $acknowledgedPaymentId);
+            }
+
+            throw $wrapped;
         }
 
         return [
@@ -381,17 +409,34 @@ final class Simulator
         $outcome = $params['outcome'] ?? null;
         self::assertKnownOutcome($outcome);
         unset($params['outcome']);
-        $created = $this->collect($params);
+        // THE RECOVERY SCOPE IS ESTABLISHED BEFORE THE PAYMENT IS CREATED (requirement 5.4).
+        //
+        // `$created = $this->collect($params);` used to sit OUTSIDE this try - the same ordering
+        // defect as Paylod::collectAndWait(). Once collect() returns, a real pending payment exists;
+        // a throwable landing between that and entry into the protected block escaped carrying
+        // neither the payment id nor the attempt key, which is precisely the state that invites a
+        // fresh-key retry against a payment that already exists.
+        //
+        // collect() publishes its acknowledgement context through the out-parameter as soon as it
+        // has one, so every throwable from the moment of creation onwards can be rebound.
+        $acknowledged = ['idempotencyKey' => null, 'paymentId' => null];
 
-        // THE ACKNOWLEDGED PAYMENT AND THE ORIGINAL ATTEMPT KEY SURVIVE A SETTLEMENT FAILURE.
-        // collect() has already created a payment by this line, so an exception escaping the settle
-        // leaves a real pending payment behind. outcome() binds the payment id and its own
-        // deterministic settlement key; this rebinds the key the ATTEMPT was made under, which is
-        // the one the caller persisted and the only one that replays the collect safely.
         try {
+            $created = $this->collect($params, $acknowledged);
+
+            // outcome() binds the payment id and its own deterministic settlement key; the catch
+            // rebinds the key the ATTEMPT was made under, which is the one the caller persisted and
+            // the only one that replays the collect safely.
             return $this->outcome($created['paymentId'], $outcome);
-        } catch (\Paylod\Exceptions\PaylodException $e) {
-            $e->bindToAcknowledgedPayment($created['idempotencyKey'], $created['paymentId']);
+        } catch (\Throwable $e) {
+            $key = $acknowledged['idempotencyKey'];
+            $paymentId = $acknowledged['paymentId'];
+            // Before the payment exists there is nothing to bind to, and mislabelling a plain
+            // validation error as "a payment exists" would be its own kind of wrong.
+            if ($key === null || $paymentId === null || !$e instanceof \Paylod\Exceptions\PaylodException) {
+                throw $e;
+            }
+            $e->bindToAcknowledgedPayment($key, $paymentId);
 
             throw $e;
         }

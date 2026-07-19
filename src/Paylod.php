@@ -312,7 +312,12 @@ final class Paylod
                 // JSON_BIGINT_AS_STRING keeps an integer too large for PHP_INT_MAX as its exact
                 // digits instead of collapsing it into a lossy float, so the lexeme survives here
                 // too.
-                $decoded = json_decode($text, true, 512, JSON_BIGINT_AS_STRING);
+                // JsonLexeme::MAX_DEPTH, not a literal 512. The redaction traversal is pinned to this
+                // constant (Redact::MAX_DEPTH) and a test asserts the two are equal, but the PARSERS still
+                // passed their own literal - so the named constant could be changed and the parsers would
+                // silently keep the old bound, which is the drift the pinning exists to prevent. One
+                // constant, every parser (requirement 4.4).
+                $decoded = json_decode($text, true, JsonLexeme::MAX_DEPTH, JSON_BIGINT_AS_STRING);
                 $parsed = $decoded === null && json_last_error() !== JSON_ERROR_NONE ? $text : $decoded;
             }
 
@@ -407,10 +412,26 @@ final class Paylod
      * @param array{amount:int|float,phone:string,accountReference?:string,description?:string,metadata?:array<string,mixed>,idempotencyKey?:string,unsafeGeneratedIdempotencyKey?:bool} $params
      * @return array{paymentId:string,status:string,checkoutRequestId:string,idempotencyKey:string}
      */
-    public function collect(array $params): array
+    public function collect(array $params, ?array &$acknowledged = null): array
     {
         $body = $this->buildCollectBody($params);
         $idempotencyKey = self::resolveIdempotencyKey($params);
+
+        // THE ACKNOWLEDGEMENT STATE IS ESTABLISHED BEFORE ANY DISPATCH CAN HAPPEN.
+        //
+        // `$acknowledgedPaymentId` used to be declared BELOW the simulator branch, inside the try.
+        // So when the simulator branch threw, the catch below read an UNDEFINED variable: a PHP
+        // warning on the ordinary path, and - under a warning-to-exception handler, which plenty of
+        // applications install - a second throwable raised from inside the catch block, destroying
+        // the original exception and with it the idempotency key the caller needs to avoid a second
+        // charge. Declared here, before anything can throw.
+        //
+        // `$acknowledged` is an OUT-PARAMETER (requirement 5.4). collectAndWait() establishes its
+        // recovery scope BEFORE calling this method, and reads the acknowledgement context back
+        // through this reference - so a throwable landing between the ack arriving and this method
+        // returning still leaves the caller holding the key and the payment id.
+        $acknowledgedPaymentId = null;
+        $acknowledged = ['idempotencyKey' => $idempotencyKey, 'paymentId' => null];
 
         try {
             // Simulator mode: same call, same ack, no handset. The key was proven a sandbox key in
@@ -428,6 +449,8 @@ final class Paylod
                     }
                 }
                 $created = $this->simulator->collect($simParams);
+                $acknowledgedPaymentId = $created['paymentId'];
+                $acknowledged['paymentId'] = $acknowledgedPaymentId;
 
                 return [
                     'paymentId' => $created['paymentId'],
@@ -458,9 +481,11 @@ final class Paylod
             // in hand, before validation can throw and before `$ack` is assigned, so the id is
             // already bound no matter where control leaves afterwards. It goes through the SAME
             // identifier grammar and the SAME credential check the success path applies.
-            $acknowledgedPaymentId = null;
-            $ack = $this->request('POST', '/collect', $body, $idempotencyKey, null, function (#[\SensitiveParameter] array $parsed, int $status) use ($idempotencyKey, &$acknowledgedPaymentId): void {
+            $ack = $this->request('POST', '/collect', $body, $idempotencyKey, null, function (#[\SensitiveParameter] array $parsed, int $status) use ($idempotencyKey, &$acknowledgedPaymentId, &$acknowledged): void {
                 $acknowledgedPaymentId = Validate::usableIdentifier($parsed, 'paymentId', $this->redactor());
+                // Published to the caller's scope in the SAME statement sequence that binds it
+                // locally, so the two can never disagree about what was acknowledged.
+                $acknowledged['paymentId'] = $acknowledgedPaymentId;
                 Validate::collectAck($parsed, $status, $idempotencyKey, $this->redactor());
             });
 
@@ -609,11 +634,37 @@ final class Paylod
         // a validation error the caller reads as "nothing happened", when in fact a payment exists.
         self::parseWaitOptions($options);
 
-        $ack = $this->collect($params);
+        // THE RECOVERY SCOPE IS ESTABLISHED BEFORE THE CHARGE IS DISPATCHED (requirement 5.4).
+        //
+        // `$ack = $this->collect($params);` used to sit OUTSIDE this try. The window that opens is
+        // small and it is real: the acknowledgement has arrived, the STK prompt is on the customer's
+        // phone, and control has not yet entered the protected block. A throwable landing there - an
+        // interrupt, a fatal from a shutdown handler, an exotic error from an injected transport -
+        // escapes with NO idempotency key and NO payment id attached. The caller reads that as
+        // "nothing happened", calls collectAndWait() again, the SDK mints a FRESH key, and the
+        // customer is charged twice.
+        //
+        // The try is now entered FIRST and collect() is called from inside it, publishing the
+        // acknowledgement context through an out-parameter as soon as it exists. Every throwable
+        // from the moment of dispatch onwards is therefore rebindable.
+        $acknowledged = ['idempotencyKey' => null, 'paymentId' => null];
 
         try {
+            $ack = $this->collect($params, $acknowledged);
+
             return $this->wait($ack['paymentId'], $options);
         } catch (\Throwable $e) {
+            // BEFORE ACKNOWLEDGEMENT there is no payment to bind to, and claiming otherwise would be
+            // worse than saying nothing: a plain validation error ("amount must be a whole number")
+            // must not be re-reported as "the payment EXISTS, do not retry". collect() has already
+            // attached the key to its own failures. So the rebinding below applies only once an
+            // acknowledged payment id exists.
+            $ackKey = $acknowledged['idempotencyKey'];
+            $ackPaymentId = $acknowledged['paymentId'];
+            if ($ackPaymentId === null || $ackKey === null) {
+                throw $e;
+            }
+            $ack = ['idempotencyKey' => $ackKey, 'paymentId' => $ackPaymentId];
             // EVERYTHING past the acknowledgement is caught here - a timeout, a transport failure, an
             // HTTP error, a malformed poll body. The payment EXISTS by this point, so an error that
             // does not carry the effective idempotency key is a double-charge waiting to happen: the

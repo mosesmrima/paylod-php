@@ -606,8 +606,8 @@ $CASES = [
         'edits' => [
             [
                 'src/Paylod.php',
-                'function (#[\SensitiveParameter] array $parsed, int $status) use ($idempotencyKey, &$acknowledgedPaymentId): void {',
-                'function (array $parsed, int $status) use ($idempotencyKey, &$acknowledgedPaymentId): void {',
+                'function (#[\SensitiveParameter] array $parsed, int $status) use ($idempotencyKey, &$acknowledgedPaymentId, &$acknowledged): void {',
+                'function (array $parsed, int $status) use ($idempotencyKey, &$acknowledgedPaymentId, &$acknowledged): void {',
             ],
         ],
     ],
@@ -1088,6 +1088,47 @@ $CASES = [
         'test' => 'testOrdinaryWebhookPaymentIdsAreStillAccepted',
         'edits' => [
             ['src/Webhook.php', "        if (!Validate::identifierIsUsable(\n            'data.paymentId',\n            \$d['paymentId'],\n            static fn (mixed \$v): mixed => is_string(\$v) ? Redact::text(\$v, []) : \$v,\n        )) {", '        if (true) {'],
+        ],
+    ],
+
+    // == ROUND 10 - requirement 5.4 (post-ack recovery), 4.4 (one depth), 8.7 (greppable) ========
+    [
+        'id' => 'r10-post-ack-recovery-scope',
+        'what' => 'collect() stops publishing the acknowledged payment id to its caller, so a '
+            . 'throwable landing after the STK prompt is on the phone escapes with no key and no id',
+        'test' => 'testAnExoticThrowableAfterAcknowledgementStillCarriesTheKeyAndPaymentId',
+        'edits' => [
+            ['src/Paylod.php', "                \$acknowledged['paymentId'] = \$acknowledgedPaymentId;\n                Validate::collectAck(\$parsed, \$status, \$idempotencyKey, \$this->redactor());", "                Validate::collectAck(\$parsed, \$status, \$idempotencyKey, \$this->redactor());"],
+        ],
+    ],
+    [
+        // The control: a pre-dispatch validation error must NOT be dressed up as an existing
+        // payment. That is what a naive "bind everything" repair produces, and it is its own bug.
+        'id' => 'r10-pre-ack-is-not-rebound',
+        'what' => 'collectAndWait() pretends a payment was acknowledged before dispatch, so a plain '
+            . 'validation error is reported as "the payment EXISTS, do not retry"',
+        'test' => 'testAFailureBeforeAcknowledgementIsNotReportedAsAnExistingPayment',
+        'edits' => [
+            ['src/Paylod.php', "        \$acknowledged = ['idempotencyKey' => null, 'paymentId' => null];\n\n        try {\n            \$ack = \$this->collect(\$params, \$acknowledged);", "        \$acknowledged = ['idempotencyKey' => 'k', 'paymentId' => 'pay_pre_ack'];\n\n        try {\n            \$ack = \$this->collect(\$params, \$acknowledged);"],
+        ],
+    ],
+    [
+        'id' => 'r10-parser-depth-uses-the-constant',
+        'what' => 'a parser goes back to a LITERAL 512 nesting depth, so the parser bound and the '
+            . 'redaction bound can drift apart again despite the equality test between constants',
+        'test' => 'testNoParserPassesALiteralDepthInsteadOfTheSharedConstant',
+        'edits' => [
+            ['src/Webhook.php', '        $event = json_decode($raw, true, JsonLexeme::MAX_DEPTH, JSON_BIGINT_AS_STRING);', '        $event = json_decode($raw, true, 512, JSON_BIGINT_AS_STRING);'],
+        ],
+    ],
+    [
+        // Requirement 8.7. A NUL byte makes a file binary to grep and file(1), so its contents go
+        // invisible to every search - which is how a defect survives nine rounds of review.
+        'id' => 'r10-sources-are-greppable',
+        'what' => 'a raw NUL byte is introduced into a source file, making it non-greppable',
+        'test' => 'testNoSourceFileContainsRawControlBytes',
+        'edits' => [
+            ['src/Support/Uuid.php', 'namespace Paylod\\Support;', "namespace Paylod\\Support;\n// \x00"],
         ],
     ],
 ];

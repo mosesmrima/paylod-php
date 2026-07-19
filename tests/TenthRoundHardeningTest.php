@@ -606,4 +606,161 @@ final class TenthRoundHardeningTest extends TestCase
             $this->assertSame($id, $event['data']['paymentId']);
         }
     }
+
+    // == 7. Requirement 5.4 - the key and the payment id survive EVERY post-ack failure ===========
+
+    /**
+     * THE ORDERING DEFECT. `$ack = $this->collect($params);` sat OUTSIDE collectAndWait()'s
+     * recovery try, and `$created = $this->collect($params);` sat outside Simulator::pay()'s. Once
+     * collect() returns, the STK prompt is on the customer's phone; a throwable landing before
+     * control enters the protected block escaped with NO idempotency key and NO payment id. The
+     * caller reads that as "nothing happened", retries, the SDK mints a FRESH key, and the customer
+     * is charged twice.
+     *
+     * The witness is an EXOTIC throwable raised from the wait() phase - not a PaylodException, so
+     * it exercises the wrapping arm, and a plain \Error so nothing about it is paylod-aware.
+     *
+     * nv:r10-post-ack-recovery-scope
+     */
+    public function testAnExoticThrowableAfterAcknowledgementStillCarriesTheKeyAndPaymentId(): void
+    {
+        $client = new Paylod('mp_test_abc123', [
+            'allowCustomHttpClient' => true,
+            'httpClient' => new \Paylod\Tests\Support\MockHttpClient([
+                ['status' => 202, 'json' => [
+                    'paymentId' => 'pay_ack_1',
+                    'checkoutRequestId' => 'ws_CO_1',
+                    'status' => 'pending',
+                ]],
+            ]),
+        ]);
+
+        try {
+            $client->collectAndWait(
+                ['amount' => 100, 'phone' => '0712345678', 'idempotencyKey' => 'order-42'],
+                ['timeoutMs' => 1000, 'onPoll' => static function (): void {
+                    throw new \Error('an exotic failure from inside the wait');
+                }],
+            );
+            $this->fail('expected the wait to fail');
+        } catch (\Throwable $e) {
+            // Caught as \Throwable and asserted, rather than caught as PaylodException: if the
+            // wrapping is reverted the exotic \Error escapes BARE, and a narrower catch would turn
+            // that into a test ERROR rather than an assertion failure - which the non-vacuity
+            // harness (rightly) refuses to count as caught (requirement 8.4).
+            $this->assertInstanceOf(
+                \Paylod\Exceptions\PaylodException::class,
+                $e,
+                'a post-acknowledgement throwable escaped without being wrapped: ' . $e->getMessage()
+            );
+            // BOTH identifiers ride out. Either one alone leaves the caller unable to act safely:
+            // the key without the id means "retry safely but you cannot look"; the id without the
+            // key means "look, but any retry mints a fresh key".
+            $this->assertSame('order-42', $e->idempotencyKey, 'the effective key was lost');
+            $this->assertSame('pay_ack_1', $e->paymentId, 'the acknowledged payment id was lost');
+        }
+    }
+
+    /**
+     * THE CONTROL. A failure BEFORE acknowledgement must NOT be dressed up as "a payment exists" -
+     * that would be its own kind of wrong answer, and it is what a naive "bind everything" repair
+     * produces. A bad amount never reaches the network.
+     *
+     * nv:r10-pre-ack-is-not-rebound
+     */
+    public function testAFailureBeforeAcknowledgementIsNotReportedAsAnExistingPayment(): void
+    {
+        $client = new Paylod('mp_test_abc123', [
+            'allowCustomHttpClient' => true,
+            'httpClient' => new \Paylod\Tests\Support\MockHttpClient([]),
+        ]);
+
+        try {
+            $client->collectAndWait(['amount' => -5, 'phone' => '0712345678', 'idempotencyKey' => 'k']);
+            $this->fail('expected a validation error');
+        } catch (\Paylod\Exceptions\PaylodInvalidRequestError $e) {
+            $this->assertNull($e->paymentId, 'a pre-dispatch validation error claimed a payment exists');
+        }
+    }
+
+    // == 8. Requirement 4.4 - one depth constant, every parser ====================================
+
+    /**
+     * The redaction traversal was pinned to JsonLexeme::MAX_DEPTH and a test asserted the two named
+     * constants were equal - but the PARSERS still passed their own literal `512`. So the constant
+     * could be changed and every json_decode() would silently keep the old bound, which is exactly
+     * the drift the pinning exists to prevent. The invariant has to be enforced against the code,
+     * not against a second copy of the number.
+     *
+     * nv:r10-parser-depth-uses-the-constant
+     */
+    public function testNoParserPassesALiteralDepthInsteadOfTheSharedConstant(): void
+    {
+        $files = glob(__DIR__ . '/../src/*.php') ?: [];
+        foreach (glob(__DIR__ . '/../src/*/*.php') ?: [] as $f) {
+            $files[] = $f;
+        }
+        $this->assertNotEmpty($files, 'no sources were scanned - the sweep is vacuous');
+
+        $scanned = 0;
+        foreach ($files as $file) {
+            $src = file_get_contents($file);
+            $this->assertIsString($src, $file);
+            foreach (explode("\n", $src) as $lineNo => $line) {
+                if (!str_contains($line, 'json_decode(')) {
+                    continue;
+                }
+                $scanned++;
+                $this->assertDoesNotMatchRegularExpression(
+                    '/json_decode\([^;]*,\s*\d+\s*,/',
+                    $line,
+                    basename($file) . ':' . ($lineNo + 1) . ' passes a LITERAL nesting depth to '
+                    . 'json_decode(). Use JsonLexeme::MAX_DEPTH so the parser bound and the '
+                    . 'redaction bound cannot drift (requirement 4.4).'
+                );
+            }
+        }
+        $this->assertGreaterThan(0, $scanned, 'no json_decode() call was inspected');
+    }
+
+    // == 9. Requirement 8.7 - the sources are greppable ===========================================
+
+    /**
+     * A NUL byte made one JVM source file binary to file(1), so grep silently skipped it and a
+     * depth mismatch survived nine rounds because every search for it returned nothing. Node had a
+     * raw NUL and a DEL in a test fixture that made all 823 lines invisible. A permanent guard is
+     * cheap and the failure mode is total.
+     *
+     * nv:r10-sources-are-greppable
+     */
+    public function testNoSourceFileContainsRawControlBytes(): void
+    {
+        $roots = [__DIR__ . '/../src', __DIR__ . '/../tests', __DIR__ . '/../scripts'];
+        $checked = 0;
+
+        foreach ($roots as $root) {
+            $it = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($root));
+            foreach ($it as $file) {
+                if (!$file->isFile()) {
+                    continue;
+                }
+                if (!in_array($file->getExtension(), ['php', 'json'], true)) {
+                    continue;
+                }
+                $checked++;
+                $src = file_get_contents($file->getPathname());
+                $this->assertIsString($src);
+                // Everything in C0 except tab (0x09) and newline (0x0A), plus CR (0x0D) and DEL.
+                $this->assertSame(
+                    0,
+                    preg_match('/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/', $src),
+                    $file->getPathname() . ' contains a raw control byte. grep and file(1) treat '
+                    . 'such a file as binary, so its contents become invisible to every search - '
+                    . 'which is how a defect survives review (requirement 8.7).'
+                );
+            }
+        }
+
+        $this->assertGreaterThan(20, $checked, 'the sweep inspected almost nothing');
+    }
 }
