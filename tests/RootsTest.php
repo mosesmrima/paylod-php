@@ -115,7 +115,12 @@ final class RootsTest extends TestCase
         try {
             $paylod->status('pay_1');
             $this->fail('expected a credential compromise error');
-        } catch (PaylodCredentialCompromiseError $e) {
+        } catch (\Throwable $e) {
+            // CAUGHT AS \Throwable, then asserted. Catching only the expected type meant a
+            // regression that threw something ELSE escaped the test as a PHPUnit ERROR rather than
+            // a failure - and an error is what a crashed mutation run looks like too, so the
+            // non-vacuity harness could not tell "the test noticed" from "the suite broke".
+            $this->assertInstanceOf(PaylodCredentialCompromiseError::class, $e);
             $this->assertMatchesRegularExpression('/redirect/i', $e->getMessage());
         }
 
@@ -179,7 +184,8 @@ final class RootsTest extends TestCase
         try {
             $paylod->collect(['amount' => 100, 'phone' => '0712345678', 'idempotencyKey' => 'key-1']);
             $this->fail('expected a credential compromise error');
-        } catch (PaylodCredentialCompromiseError $e) {
+        } catch (\Throwable $e) {
+            $this->assertInstanceOf(PaylodCredentialCompromiseError::class, $e);
             $this->assertSame('key-1', $e->idempotencyKey);
         }
 
@@ -313,7 +319,10 @@ final class RootsTest extends TestCase
         try {
             $paylod->collect(['amount' => 1, 'phone' => '0712345678', 'idempotencyKey' => 'k-boom']);
             $this->fail('expected the throwable to be wrapped');
-        } catch (PaylodApiError $e) {
+        } catch (\Throwable $e) {
+            // The whole point of this test is that a NON-paylod throwable is wrapped. Catching only
+            // PaylodApiError meant the unwrapped case escaped as an ERROR instead of failing here.
+            $this->assertInstanceOf(PaylodApiError::class, $e);
             $this->assertTrue($e->indeterminate, 'the charge state is unknown, so it must say so');
             $this->assertSame('k-boom', $e->idempotencyKey, 'without the key the caller double-charges');
             // The ORIGINAL throwable is deliberately NOT chained. Keeping it as `previous` kept an

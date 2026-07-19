@@ -456,11 +456,17 @@ final class EighthRoundHardeningTest extends TestCase
     {
         $raw = '{"type":"payment.success","created":1,"data":{}}';
 
+        // THE MESSAGE IS THE DISCRIMINATING ASSERTION, not the reason code. An unbounded
+        // parseHeader() reaches the SAME `malformed_signature` verdict by simply failing to find a
+        // `t`/`v1` pair - so asserting only the reason passes with the ceilings removed, which is
+        // exactly the vacuous test this suite exists to refuse. The ceiling must be what refused it.
         try {
             Webhook::verify($raw, str_repeat(',', 200000), self::SECRET, 300, 1);
             $this->fail('an oversized signature header was parsed');
         } catch (PaylodSignatureVerificationError $e) {
             $this->assertSame('malformed_signature', $e->reason);
+            $this->assertStringContainsString('exceeds the', $e->getMessage());
+            $this->assertStringContainsString((string) Webhook::MAX_SIGNATURE_HEADER_BYTES, $e->getMessage());
         }
 
         // Short but with too many segments: bounded on segment count, not only on bytes.
@@ -469,6 +475,7 @@ final class EighthRoundHardeningTest extends TestCase
             $this->fail('a many-segment signature header was parsed');
         } catch (PaylodSignatureVerificationError $e) {
             $this->assertSame('malformed_signature', $e->reason);
+            $this->assertStringContainsString('comma-separated segments', $e->getMessage());
         }
     }
 
@@ -587,6 +594,69 @@ final class EighthRoundHardeningTest extends TestCase
         }
 
         $this->assertSame(0, $transport->count(), 'a payment was created before the request was refused');
+    }
+
+    /**
+     * THE SURROGATE'S OWN TRACE. sanitizedCause() drops the original throwable from the `previous`
+     * chain precisely so its message, its trace and its recorded call arguments cannot travel - and
+     * then handed it back anyway, because with `zend.exception_ignore_args=0` PHP records CALL
+     * ARGUMENTS in every frame, and the surrogate's own trace contains the sanitizedCause() frame
+     * whose arguments are the discarded throwable and the client-bound redactor.
+     *
+     * Run in a SUBPROCESS with argument recording ON, and the COMPLETE trace graph is inspected -
+     * getTraceAsString() abbreviates arguments, so a secret survives there while the string looks
+     * clean.
+     *
+     * nv:r8-sanitized-cause-trace
+     */
+    public function testTheSanitizedSurrogateDoesNotCarryTheOriginalInItsOwnTraceArguments(): void
+    {
+        $autoload = dirname(__DIR__) . '/vendor/autoload.php';
+        $this->assertFileExists($autoload, 'the probe cannot run without a composer autoloader');
+
+        $script = <<<PHP
+        require '{$autoload}';
+        \$client = new class implements Paylod\Http\HttpClient {
+            public function send(string \$m, string \$u, array \$h, ?string \$b, int \$t): array
+            {
+                // A NON-paylod throwable carrying the credential - the case sanitizedCause() exists
+                // for. It is caught, redacted, and replaced by a surrogate.
+                throw new RuntimeException('transport blew up with mp_test_LEAKTRACE in hand');
+            }
+        };
+        try {
+            \$p = new Paylod\Paylod('mp_test_LEAKTRACE', ['httpClient' => \$client, 'allowCustomHttpClient' => true]);
+            \$p->collect(['amount' => 1, 'phone' => '0712345678', 'idempotencyKey' => 'k']);
+        } catch (Throwable \$e) {
+            echo "MSG:", \$e->getMessage(), "\n";
+            echo "TRACE:", print_r(\$e->getTrace(), true), "\n";
+            for (\$prev = \$e->getPrevious(); \$prev !== null; \$prev = \$prev->getPrevious()) {
+                echo "PREV:", \$prev->getMessage(), "\n";
+                echo "PREVTRACE:", print_r(\$prev->getTrace(), true), "\n";
+            }
+        }
+        PHP;
+
+        $file = sys_get_temp_dir() . '/paylod_r8_trace_probe_' . getmypid() . '.php';
+        $written = file_put_contents($file, "<?php\n" . $script);
+
+        try {
+            // The probe's own machinery, asserted before its verdict is trusted - a failed write
+            // prints "Could not open input file", which contains no leak marker and would otherwise
+            // read as a pass.
+            $this->assertNotFalse($written, 'could not write the probe script');
+            $this->assertGreaterThan(0, (int) $written);
+
+            $cmd = escapeshellarg(PHP_BINARY) . ' -d zend.exception_ignore_args=0 -d error_reporting=0 '
+                . escapeshellarg($file) . ' 2>&1';
+            $out = (string) shell_exec($cmd);
+
+            $this->assertStringContainsString('TRACE:', $out, "the probe did not run: {$out}");
+            $this->assertStringContainsString('Array', $out, 'no structured trace was produced');
+            $this->assertStringNotContainsString('LEAKTRACE', $out, "the credential survived: {$out}");
+        } finally {
+            @unlink($file);
+        }
     }
 
     /** A genuine signed settlement still verifies - the guard must not break real webhooks. */

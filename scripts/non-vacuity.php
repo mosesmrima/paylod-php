@@ -250,7 +250,7 @@ $CASES = [
         'test' => 'testCollectRefusesToChargeWithoutACallerPersistedIdempotencyKey',
         'edits' => [
             [
-                'src/Paylod.php',
+                'src/Support/Validate.php',
                 "        if ((\$params['unsafeGeneratedIdempotencyKey'] ?? false) !== true) {",
                 '        if (false) {',
             ],
@@ -498,7 +498,7 @@ $CASES = [
         'edits' => [
             [
                 'src/Webhook.php',
-                '            return self::stripDerived($event);',
+                "            \$out['data'] = self::scalarsOnly(\$data);\n\n            return \$out;",
                 '            return $event;',
             ],
         ],
@@ -599,6 +599,265 @@ $CASES = [
             ],
         ],
     ],
+    // == ROUND 8 - the escaped-key result-code bypass, and the round-7 gaps that fed it ======
+    [
+        'id' => 'r8-escaped-result-code-key',
+        'what' => 'the raw result-code guard goes back to matching only the LITERAL bytes "resultCode"',
+        'test' => 'testEveryEscapedSpellingOfResultCodeIsScanned',
+        'edits' => [
+            ['src/Support/JsonLexeme.php', '    public static function nonCanonicalResultCodeToken(string $raw): ?string
+    {
+        $scan = new self($raw);
+
+        try {
+            $scan->parseDocument();
+        } catch (\\RuntimeException) {
+            if ($scan->bad !== null) {
+                return $scan->bad;
+            }
+
+            // DIVERGENCE CHECK. This scanner gave up. If PHP\'s parser would NOT have, then there is
+            // a document reaching `json_decode()` that was never examined - refuse it instead.
+            json_decode($raw, true, self::MAX_DEPTH, JSON_BIGINT_AS_STRING);
+
+            return json_last_error() === JSON_ERROR_NONE ? self::UNREADABLE : null;
+        }
+
+        return $scan->bad;
+    }', '    public static function nonCanonicalResultCodeToken(string $raw): ?string
+    {
+        $re = \'/"resultCode"\\s*:\\s*(-?(?:0|[1-9][0-9]*)(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)/\';
+        if (preg_match_all($re, $raw, $matches) === false) {
+            return null;
+        }
+        foreach ($matches[1] as $token) {
+            if (preg_match(self::CANONICAL_TOKEN_RE, $token) !== 1) {
+                return $token;
+            }
+        }
+
+        return null;
+    }'],
+        ],
+    ],
+    [
+        'id' => 'r8-status-path-escaped-key',
+        'what' => 'the STATUS path stops seeing an escaped-key impostor zero (same revert)',
+        'test' => 'testTheStatusPathRefusesAnEscapedKeyImpostorZero',
+        'edits' => [
+            ['src/Support/JsonLexeme.php', '    public static function nonCanonicalResultCodeToken(string $raw): ?string
+    {
+        $scan = new self($raw);
+
+        try {
+            $scan->parseDocument();
+        } catch (\\RuntimeException) {
+            if ($scan->bad !== null) {
+                return $scan->bad;
+            }
+
+            // DIVERGENCE CHECK. This scanner gave up. If PHP\'s parser would NOT have, then there is
+            // a document reaching `json_decode()` that was never examined - refuse it instead.
+            json_decode($raw, true, self::MAX_DEPTH, JSON_BIGINT_AS_STRING);
+
+            return json_last_error() === JSON_ERROR_NONE ? self::UNREADABLE : null;
+        }
+
+        return $scan->bad;
+    }', '    public static function nonCanonicalResultCodeToken(string $raw): ?string
+    {
+        $re = \'/"resultCode"\\s*:\\s*(-?(?:0|[1-9][0-9]*)(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)/\';
+        if (preg_match_all($re, $raw, $matches) === false) {
+            return null;
+        }
+        foreach ($matches[1] as $token) {
+            if (preg_match(self::CANONICAL_TOKEN_RE, $token) !== 1) {
+                return $token;
+            }
+        }
+
+        return null;
+    }'],
+        ],
+    ],
+    [
+        'id' => 'r8-webhook-path-escaped-key',
+        'what' => 'the SIGNED WEBHOOK path stops seeing an escaped-key impostor zero (same revert)',
+        'test' => 'testTheSignedWebhookPathRefusesAnEscapedKeyImpostorZero',
+        'edits' => [
+            ['src/Support/JsonLexeme.php', '    public static function nonCanonicalResultCodeToken(string $raw): ?string
+    {
+        $scan = new self($raw);
+
+        try {
+            $scan->parseDocument();
+        } catch (\\RuntimeException) {
+            if ($scan->bad !== null) {
+                return $scan->bad;
+            }
+
+            // DIVERGENCE CHECK. This scanner gave up. If PHP\'s parser would NOT have, then there is
+            // a document reaching `json_decode()` that was never examined - refuse it instead.
+            json_decode($raw, true, self::MAX_DEPTH, JSON_BIGINT_AS_STRING);
+
+            return json_last_error() === JSON_ERROR_NONE ? self::UNREADABLE : null;
+        }
+
+        return $scan->bad;
+    }', '    public static function nonCanonicalResultCodeToken(string $raw): ?string
+    {
+        $re = \'/"resultCode"\\s*:\\s*(-?(?:0|[1-9][0-9]*)(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)/\';
+        if (preg_match_all($re, $raw, $matches) === false) {
+            return null;
+        }
+        foreach ($matches[1] as $token) {
+            if (preg_match(self::CANONICAL_TOKEN_RE, $token) !== 1) {
+                return $token;
+            }
+        }
+
+        return null;
+    }'],
+        ],
+    ],
+    [
+        'id' => 'r8-escaped-result-code-key-controls',
+        'what' => 'the guard refuses EVERY numeric result code, canonical ones included',
+        'test' => 'testLegitimateBodiesAreNotRefused',
+        'edits' => [
+            ['src/Support/JsonLexeme.php', '        if ($isResultCode && preg_match(self::CANONICAL_TOKEN_RE, $token) !== 1) {', '        if ($isResultCode) {'],
+        ],
+    ],
+    [
+        'id' => 'r8-webhook-data-allowlist',
+        'what' => 'verified event `data` is forwarded verbatim instead of rebuilt from the allowlist',
+        'test' => 'testNestedRetryabilityClaimsDoNotSurviveVerification',
+        'edits' => [
+            ['src/Webhook.php', '        $out[\'data\'] = self::pick($data, self::PAYMENT_DATA_KEYS) + [', '        $out[\'data\'] = $data + ['],
+        ],
+    ],
+    [
+        'id' => 'r8-webhook-root-allowlist',
+        'what' => 'the verified event ROOT is forwarded verbatim instead of rebuilt from the allowlist',
+        'test' => 'testArbitraryRootAndDataFieldsAreDropped',
+        'edits' => [
+            ['src/Webhook.php', '        $out = self::pick($event, self::ROOT_KEYS);', '        $out = $event;'],
+        ],
+    ],
+    [
+        'id' => 'r8-webhook-unknown-type',
+        'what' => 'an UNKNOWN event type forwards its whole nested data payload again',
+        'test' => 'testAnUnknownEventTypeIsRepresentedMinimally',
+        'edits' => [
+            ['src/Webhook.php', '            $out[\'data\'] = self::scalarsOnly($data);', '            $out[\'data\'] = $data;'],
+        ],
+    ],
+    [
+        'id' => 'r8-diagnostic-redaction',
+        'what' => 'malformed-2xx diagnostics stop going through the redactor (BOTH surfaces reverted)',
+        'test' => 'testMalformedBodyDiagnosticsAreRedacted',
+        'edits' => [
+            ['src/Support/Validate.php', '        // THE FINISHED DIAGNOSTIC, THROUGH THE REDACTOR. Every branch above quotes some part of a
+        // SERVER-CONTROLLED body back at the reader - `status` via json_encode, a mismatched id, a
+        // status string. Redacting each site individually is a list nobody will keep complete, and
+        // one missed branch puts an echoed bearer token or webhook secret into an exception message
+        // and from there into the application\'s error log. So the whole string is scrubbed once,
+        // here, where no future branch can be added downstream of it.
+        $problem = $redact === null ? $problem : (string) $redact($problem);', '        // reverted'],
+            ['src/Support/Validate.php', '        // The same single scrub the acknowledgement path applies - see collectAck().
+        $problem = $redact === null ? $problem : (string) $redact($problem);', '        // reverted'],
+        ],
+    ],
+    [
+        'id' => 'r8-webhook-secret-redaction',
+        'what' => 'the decoded event is scrubbed by SHAPE only, without the exact supplied secret',
+        'test' => 'testTheSuppliedWebhookSecretIsRedactedOutOfTheDecodedEvent',
+        'edits' => [
+            ['src/Webhook.php', '        $scrubbed = Redact::apply($event, [$secret]);', '        $scrubbed = Redact::apply($event, []);'],
+        ],
+    ],
+    [
+        'id' => 'r8-webhook-stringable-refused',
+        'what' => 'a Stringable webhook body is materialised in full before its size is checked',
+        'test' => 'testANonStringPayloadIsRefusedRatherThanMaterialised',
+        'edits' => [
+            ['src/Webhook.php', '        if (!is_string($payload)) {', '        if (false) {'],
+            ['src/Webhook.php', '
+        $raw = $payload;
+', '
+        $raw = (string) $payload;
+'],
+        ],
+    ],
+    [
+        'id' => 'r8-signature-header-bounds',
+        'what' => 'the signature header is exploded with no byte or segment ceiling (BOTH reverted)',
+        'test' => 'testTheSignatureHeaderIsBoundedBeforeItIsParsed',
+        'edits' => [
+            ['src/Webhook.php', '        if ($sigBytes > self::MAX_SIGNATURE_HEADER_BYTES) {', '        if (false) {'],
+            ['src/Webhook.php', '        if (substr_count($signature, \',\') + 1 > self::MAX_SIGNATURE_HEADER_SEGMENTS) {', '        if (false) {'],
+        ],
+    ],
+    [
+        'id' => 'r8-sanitized-cause-trace',
+        'what' => 'the sanitized surrogate keeps the original throwable in its OWN trace arguments',
+        'test' => 'testTheSanitizedSurrogateDoesNotCarryTheOriginalInItsOwnTraceArguments',
+        'edits' => [
+            ['src/Paylod.php', '        #[\\SensitiveParameter] \\Throwable $e,
+        #[\\SensitiveParameter] \\Closure $redact,', '        \\Throwable $e,
+        \\Closure $redact,'],
+        ],
+    ],
+    [
+        'id' => 'r8-phone-anchor',
+        'what' => 'the phone grammar goes back to `$`, which accepts a trailing newline',
+        'test' => 'testAPhoneWithATrailingNewlineIsNotValid',
+        'edits' => [
+            ['src/Phone.php', '    public const INPUT_RE = \'/^(?:\\+?254|0)?[17]\\d{8}\\z/\';', '    public const INPUT_RE = \'/^(?:\\+?254|0)?[17]\\d{8}$/\';'],
+        ],
+    ],
+    [
+        'id' => 'r8-simulator-key-required',
+        'what' => 'the simulator silently GENERATES an idempotency key again',
+        'test' => 'testTheSimulatorRequiresAnIdempotencyKeyJustLikeProduction',
+        'edits' => [
+            ['src/Simulator.php', '        $idempotencyKey = Validate::collectIdempotencyKey($params, \'simulate.collect\', static function (): void {', '        $idempotencyKey = $params[\'idempotencyKey\'] ?? \\Paylod\\Support\\Uuid::v4();
+        $unusedWarner = (static function (): void {'],
+        ],
+    ],
+    [
+        'id' => 'r8-simulator-amount-ceiling',
+        'what' => 'the simulator goes back to its own weaker "any positive int" amount rule',
+        'test' => 'testTheSimulatorEnforcesTheProductionAmountCeiling',
+        'edits' => [
+            ['src/Simulator.php', '        $amount = Validate::collectAmount($params[\'amount\'] ?? 1, \'simulate.collect\');', '        $amount = (int) ($params[\'amount\'] ?? 1);'],
+        ],
+    ],
+    [
+        'id' => 'r8-simulator-failure-context',
+        'what' => 'a simulator dispatch failure loses the effective idempotency key again',
+        'test' => 'testASimulatorDispatchFailureCarriesTheEffectiveKey',
+        'edits' => [
+            ['src/Simulator.php', '                $e->attachIdempotencyKey($idempotencyKey);', '                // reverted'],
+        ],
+    ],
+    [
+        'id' => 'r8-simulator-outcomes-allowlist',
+        'what' => 'the acknowledged `outcomes` list is forwarded unvalidated and unredacted again',
+        'test' => 'testTheAcknowledgedOutcomesAreRebuiltFromTheClosedSet',
+        'edits' => [
+            ['src/Simulator.php', '            \'outcomes\' => self::allowlistedOutcomes($ack[\'outcomes\'] ?? []),', '            \'outcomes\' => $ack[\'outcomes\'] ?? [],'],
+        ],
+    ],
+    [
+        'id' => 'r8-simulator-validate-before-mutate',
+        'what' => 'pay() validates its outcome only AFTER collect() has created a payment',
+        'test' => 'testPayValidatesTheOutcomeBeforeCreatingAnything',
+        'edits' => [
+            ['src/Simulator.php', '        $outcome = $params[\'outcome\'] ?? null;
+        self::assertKnownOutcome($outcome);', '        $outcome = $params[\'outcome\'] ?? null;'],
+        ],
+    ],
 ];
 
 /**
@@ -617,22 +876,104 @@ function runTests(string $selector): array
     $out = implode("\n", $lines);
 
     $passed = 0;
-    $failed = 0;
     // "OK (12 tests, 30 assertions)" on a clean run.
     if (preg_match('/OK \((\d+) test/', $out, $m) === 1) {
         $passed = (int) $m[1];
     }
-    // "Tests: 12, Assertions: 30, Failures: 1." on a failing run.
+    // "Tests: 12, Assertions: 30, Failures: 1, Errors: 2." on anything else. EVERY label is read,
+    // not just the first - see $counts below for why that matters.
     if (preg_match('/Tests: (\d+),/', $out, $m) === 1) {
         $passed = max($passed, (int) $m[1]);
     }
-    if (preg_match('/(?:Failures|Errors): (\d+)/', $out, $m) === 1) {
-        $failed = (int) $m[1];
+
+    // THE SECOND TRAP THIS HARNESS EXISTS TO AVOID, and the one it was itself sprung on:
+    // A NONZERO EXIT IS NOT A CAUGHT MUTATION.
+    //
+    // The verdict used to be `$code !== 0`. PHPUnit exits nonzero for a FAILURE, but also for an
+    // ERROR, a WARNING, a RISKY test, an INCOMPLETE one, or a fatal in the mutated source. Those
+    // are all "the mutation broke something", not "the test noticed the protection was gone" - and
+    // a mutation that makes the suite crash would have been reported as a protection working
+    // perfectly. So the counts are read individually and a catch requires a genuine ASSERTION
+    // FAILURE with nothing else wrong.
+    $counts = [];
+    foreach (['Failures', 'Errors', 'Warnings', 'Risky', 'Skipped', 'Incomplete'] as $label) {
+        $counts[$label] = preg_match('/\b' . $label . ': (\d+)/', $out, $m) === 1 ? (int) $m[1] : 0;
     }
-    // THE TRAP: PHPUnit exits 0 and says this when the filter matched nothing.
+
+    // THE FIRST TRAP: PHPUnit exits 0 and says this when the filter matched nothing.
     $executed = !str_contains($out, 'No tests executed!') && $passed > 0;
 
-    return ['code' => $code, 'passed' => $passed, 'failed' => $failed, 'executed' => $executed];
+    return [
+        'code' => $code,
+        'passed' => $passed,
+        'failed' => $counts['Failures'],
+        'counts' => $counts,
+        'executed' => $executed,
+        'out' => $out,
+    ];
+}
+
+/**
+ * A run is CLEAN only if nothing at all went wrong - no failure, and no error/warning/risky/skipped
+ * /incomplete either. Applied to the pre-mutation run so a selector that is already noisy cannot
+ * have its noise mistaken for a catch afterwards.
+ *
+ * @param array{code:int,counts:array<string,int>} $run
+ */
+function isSpotless(array $run): bool
+{
+    return $run['code'] === 0 && array_sum($run['counts']) === 0;
+}
+
+/**
+ * A mutation is CAUGHT only by a real assertion failure, with nothing else wrong.
+ *
+ * @param array{counts:array<string,int>} $run
+ */
+function isGenuineCatch(array $run): bool
+{
+    $c = $run['counts'];
+
+    // WARNINGS are the one category deliberately tolerated, and only alongside a real failure.
+    // Some protections warn ON PURPOSE when they are removed - reverting the required-idempotency-key
+    // guard makes the unsafe path run, and that path emits E_USER_WARNING by design. The warning is
+    // therefore EVIDENCE the mutation took effect, not noise, and the assertion failure beside it is
+    // the verdict. The clean run is required to be spotless (see isSpotless), so any warning here
+    // was caused by the mutation.
+    //
+    // ERRORS, RISKY, SKIPPED and INCOMPLETE are never tolerated: each is a state in which the test
+    // did not actually reach and evaluate its assertions, which is precisely what a crashed mutation
+    // run looks like.
+    return $c['Failures'] >= 1
+        && $c['Errors'] === 0
+        && $c['Risky'] === 0
+        && $c['Skipped'] === 0
+        && $c['Incomplete'] === 0;
+}
+
+/**
+ * Every `nv:<id>` tag written in a test docblock must correspond to a registered case.
+ *
+ * A protection with a test but no mutation case is a protection nobody has proven is load-bearing,
+ * and the tag is the author saying they intended to prove it. Left unchecked the list drifts: the
+ * round-7 protections all had tests, none had cases, and the harness reported 48/48 caught.
+ *
+ * @param list<array{id:string}> $cases
+ * @return list<string> the tags that are not registered
+ */
+function unregisteredTags(array $cases): array
+{
+    $registered = array_column($cases, 'id');
+    $tags = [];
+    foreach (glob('tests/*.php') ?: [] as $file) {
+        if (preg_match_all('/nv:([A-Za-z0-9\-]+)/', (string) file_get_contents($file), $m) >= 1) {
+            foreach ($m[1] as $tag) {
+                $tags[$tag] = true;
+            }
+        }
+    }
+
+    return array_values(array_diff(array_keys($tags), $registered));
 }
 
 $results = [];
@@ -654,8 +995,11 @@ foreach ($CASES as $c) {
         $results[] = $c + ['status' => 'BROKEN-SELECTOR', 'detail' => 'matches 0 tests'];
         continue;
     }
-    if ($clean['code'] !== 0) {
-        $results[] = $c + ['status' => 'BROKEN-SELECTOR', 'detail' => 'fails on clean source'];
+    if (!isSpotless($clean)) {
+        $results[] = $c + [
+            'status' => 'BROKEN-SELECTOR',
+            'detail' => 'not spotless on clean source: ' . json_encode($clean['counts']),
+        ];
         continue;
     }
     $covers = $clean['passed'];
@@ -701,10 +1045,12 @@ foreach ($CASES as $c) {
         continue;
     }
 
-    $caught = $after['code'] !== 0;
+    $caught = isGenuineCatch($after);
+    $status = $caught ? 'CAUGHT' : ($after['code'] === 0 ? 'VACUOUS' : 'BROKEN-MUTATION');
     $results[] = $c + [
-        'status' => $caught ? 'CAUGHT' : 'VACUOUS',
-        'detail' => ($caught ? "{$after['failed']} test(s) failed" : 'test still PASSED')
+        'status' => $status,
+        'detail' => ($caught ? "{$after['failed']} assertion failure(s)" : 'no genuine assertion '
+            . 'failure: ' . json_encode($after['counts']))
             . "; selector covers {$covers} test(s)",
     ];
 }
@@ -715,8 +1061,18 @@ foreach ($results as $r) {
     printf("| %s | %s | %s | %s (%s) |\n", $r['id'], $r['what'], $r['test'], $r['status'], $r['detail']);
 }
 
+$unregistered = unregisteredTags($CASES);
+if ($unregistered !== []) {
+    fwrite(STDERR, "UNREGISTERED nv: TAGS (a protection with a test but no mutation case): "
+        . implode(', ', $unregistered) . "\n");
+}
+
 $bad = array_values(array_filter($results, static fn (array $r): bool => $r['status'] !== 'CAUGHT'));
 printf("\n%d/%d mutations caught.\n", count($results) - count($bad), count($results));
+
+if ($unregistered !== []) {
+    exit(1);
+}
 
 if ($bad !== []) {
     fwrite(STDERR, 'NOT ALL MUTATIONS CAUGHT: ' . implode(', ', array_map(
