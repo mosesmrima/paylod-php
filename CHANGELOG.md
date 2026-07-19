@@ -6,6 +6,54 @@ All notable changes to `paylod/paylod` are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-07-20
+
+Patch. No API change. The vendored Daraja code table is re-synced from its canonical home, and the
+copy is now mechanically pinned to that home so it cannot drift again unnoticed.
+
+### Fixed - the vendored Daraja catalog matched the canonical table again
+
+`src/resources/daraja-error-codes.json` is a physical COPY of the paylod monorepo's
+`supabase/functions/_shared/daraja/daraja-error-codes.json`; this SDK is a separate repo and a
+separate publish artifact, so it cannot import across the boundary. Six `customerMessage` strings
+had drifted behind the canonical table. All six had been rewritten upstream for the same reason:
+they invited a retry ("Please try again in a moment") on outcomes where a debit is NOT disproven.
+The canonical wording now tells the customer to check their M-Pesa messages first.
+
+The six are `17`, `26`, `1001`, `1025` and `9999` on the `stk_result` surface, plus
+`500.001.1001` on `api_error` - which is precisely the `NO_DEBIT_PROOF_STK_CODES` set that 0.10.0
+carved out, confirming the same finding had landed canonically but never reached this copy.
+
+No `retryable` value changed, and the `safeCustomerMessage` enforcement layer is untouched - it
+already overrode these strings at runtime for non-retryable codes, which is why the suite stayed
+green while the copy was stale. That is precisely the problem: the drift was invisible to tests.
+
+### Added - `scripts/sync-daraja-catalog.php`
+
+The copy is now GENERATED, mirroring the Node SDK's `sync-daraja-catalog.mjs`:
+
+    php scripts/sync-daraja-catalog.php           # write the copy
+    php scripts/sync-daraja-catalog.php --check   # exit 1 on drift
+
+The monorepo is located at `../mpesa` by default, overridable with `MPESA_REPO=/path`. In
+`--check` mode an absent monorepo warns and exits 0 - a published-package consumer has nothing to
+compare against - while write mode treats it as an error. `--check` is wired into `composer test`
+ahead of PHPUnit, so CI fails on drift rather than shipping it.
+
+### Added - drift and duplicate-code guards (`tests/DarajaCatalogDriftTest.php`)
+
+Four new tests, +50 assertions:
+
+- The vendored copy is byte-identical to the canonical table. Skips with a clear message when the
+  monorepo is absent; it never passes silently on a difference.
+- Every `(code, family)` pair in the catalog is unique. `code` alone is NOT the key.
+- Non-vacuity for the above: duplicate bare `code` values are asserted to EXIST - `0`, `2001` and
+  `500.001.1001` each appear under two families, and `2001` carries opposite `retryable` verdicts
+  on the STK and B2C/C2B surfaces. Without this the uniqueness test would be trivially true.
+- `errorCatalog()` keys by `code` alone and so cannot represent that ambiguity. Its documented
+  "STK wins" collision rule is now pinned by test rather than left implicit; the method's API and
+  behaviour are unchanged, since altering either would be breaking.
+
 ## [0.10.0] - 2026-07-20
 
 **Breaking.** The unit of work for this release is not a findings list, it is
@@ -881,7 +929,9 @@ v0.3.x) to idiomatic PHP 8.1+, with first-class Laravel support.
 - Injectable HTTP transport (`Paylod\Http\Transport`), defaulting to `CurlTransport`, so the
   whole test suite runs with no network.
 
-[Unreleased]: https://github.com/mosesmrima/paylod-php/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/mosesmrima/paylod-php/compare/v0.10.1...HEAD
+[0.10.1]: https://github.com/mosesmrima/paylod-php/compare/v0.10.0...v0.10.1
+[0.10.0]: https://github.com/mosesmrima/paylod-php/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/mosesmrima/paylod-php/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/mosesmrima/paylod-php/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/mosesmrima/paylod-php/compare/v0.6.0...v0.7.0
