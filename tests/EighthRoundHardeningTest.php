@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Paylod\Tests;
 
 use Paylod\Exceptions\PaylodApiError;
+use Paylod\Exceptions\PaylodCredentialCompromiseError;
 use Paylod\Exceptions\PaylodSignatureVerificationError;
 use Paylod\Paylod;
 use Paylod\Support\JsonLexeme;
@@ -408,9 +409,21 @@ final class EighthRoundHardeningTest extends TestCase
             ],
         ], JSON_THROW_ON_ERROR);
 
-        $event = Webhook::verify($raw, Webhook::sign($raw, $secret, $now), $secret, 300, $now);
-
-        $this->assertStringNotContainsString($secret, json_encode($event));
+        // ROUND 9 STRENGTHENED THIS FROM REDACT-AND-DELIVER TO REFUSE.
+        //
+        // It used to assert only that the secret was absent from the returned event. That is a
+        // strictly weaker property, and round 9 showed why it is not enough: the redactor's own
+        // output, `[redacted]`, was then read as a valid M-Pesa receipt, so redacting a credential
+        // turned it into proof of payment. A signed body that echoes our secret comes from a
+        // compromised or misconfigured sender, and the rest of it is not trustworthy either. It is
+        // now refused outright.
+        try {
+            Webhook::verify($raw, Webhook::sign($raw, $secret, $now), $secret, 300, $now);
+            $this->fail('expected the echoed webhook secret to be REFUSED, not sanitised');
+        } catch (PaylodCredentialCompromiseError $e) {
+            $this->assertStringNotContainsString($secret, $e->getMessage());
+            $this->assertStringContainsString('ECHOES YOUR WEBHOOK SIGNING SECRET', $e->getMessage());
+        }
     }
 
     /**

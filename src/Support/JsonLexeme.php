@@ -69,7 +69,7 @@ final class JsonLexeme
     private const JSON_NUMBER_RE = '/^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\z/';
 
     /** Matches `json_decode()`'s own default nesting limit, so the two agree about depth. */
-    private const MAX_DEPTH = 512;
+    public const MAX_DEPTH = 512;
 
     /**
      * The sentinel returned when this scanner cannot read a body that `json_decode()` can.

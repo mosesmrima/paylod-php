@@ -6,6 +6,7 @@ namespace Paylod\Support;
 
 use Paylod\Exceptions\PaylodApiError;
 use Paylod\Exceptions\PaylodInvalidRequestError;
+use Paylod\Support\Redact;
 
 /**
  * The money-path validators, in ONE place so every dispatch surface uses the SAME rules.
@@ -183,6 +184,22 @@ final class Validate
                 . 'non-Latin character cannot be sent reliably - and a silently re-encoded key stops '
                 . 'matching the retry it was meant to deduplicate. Derive the key from an id you '
                 . 'control (a UUID, or your order id slugged to ASCII).'
+            );
+        }
+
+        // AN IDEMPOTENCY KEY IS A CORRELATION ID, so the marker rule applies to it too. `[redacted]`
+        // is printable ASCII and passes every rule above, and a caller who built their key by
+        // interpolating something that went through the redactor would send it - collapsing every
+        // such attempt onto ONE key at the API, which is a charge silently not being made, or a
+        // refund silently not being issued. Part of the round-9 redaction-marker audit: the marker
+        // satisfies NO evidence, identifier or correlation check anywhere in this SDK.
+        if (Redact::containsPlaceholder($key)) {
+            throw new PaylodInvalidRequestError(
+                'idempotencyKey must not contain the redaction marker "' . Redact::PLACEHOLDER
+                . '". A key built from a redacted value is not unique to this attempt - every '
+                . 'attempt that redacted the same way would collapse onto it, and the duplicate '
+                . 'charge guard would be protecting the wrong thing. Derive the key from an id you '
+                . 'control.'
             );
         }
     }
@@ -442,6 +459,18 @@ final class Validate
         if (preg_match(self::IDENTIFIER_RE, $value) !== 1) {
             return "{$field} is not a well-formed identifier (expected an opaque token of letters, "
                 . 'digits, underscore, dot or hyphen)';
+        }
+
+        // A REDACTED VALUE IS NEVER AN IDENTIFIER. The grammar above already refuses `[redacted]`
+        // (it starts with a bracket), so this line is redundant TODAY - and it is written anyway,
+        // because the round-9 Critical was exactly this redundancy being absent somewhere else:
+        // `Semantics::hasReceipt()` accepted `[redacted]` as proof of payment because nothing stated
+        // the rule, only implied it. Stated here, no future widening of IDENTIFIER_RE can re-open
+        // the hole silently. See {@see Redact::containsPlaceholder()}.
+        if (Redact::containsPlaceholder($value)) {
+            return "{$field} is a redaction marker, not an identifier - the value it stood for was "
+                . 'destroyed because it was a credential, so nothing about this payment can be '
+                . 'correlated through it';
         }
 
         // THE CREDENTIAL CHECK, expressed through the redactor the client already carries. Redact

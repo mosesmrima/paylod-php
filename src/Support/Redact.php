@@ -22,8 +22,20 @@ final class Redact
 {
     public const PLACEHOLDER = '[redacted]';
 
-    /** Guard against pathological nesting; response bodies are attacker-influenced. */
-    private const MAX_DEPTH = 12;
+    /**
+     * THE REDACTION DEPTH IS PINNED TO THE PARSE DEPTH.
+     *
+     * This was 12 while {@see JsonLexeme::MAX_DEPTH} and every `json_decode()` call in the SDK use
+     * 512. A redactor that stops shallower than the parser is a redactor with a blind spot the
+     * parser can reach: a secret echoed at depth 13 of a signed body was PARSED into the event and
+     * then walked past by the scrubber. The sibling Node (8 vs 64), Python (12 vs 64) and JVM
+     * (8 vs 64) SDKs all carried the same drift; it is fixed the same way in all four - one
+     * constant, and a test asserting the two are equal so they cannot drift again.
+     *
+     * Beyond the limit the traversal FAILS CLOSED: content the redactor cannot reach is replaced
+     * with the placeholder outright, never forwarded on the assumption it is clean.
+     */
+    public const MAX_DEPTH = JsonLexeme::MAX_DEPTH;
 
     /** Credential-shaped tokens, redacted even when they are not the secrets we hold. */
     private const TOKEN_RE = '/\b(?:mp_live_|mp_test_|whsec_)[A-Za-z0-9_\-]+/';
@@ -72,6 +84,46 @@ final class Redact
         }
 
         return (string) preg_replace(self::TOKEN_RE, self::PLACEHOLDER, $value);
+    }
+
+    /**
+     * TRUE when a value carries the redaction marker.
+     *
+     * -- Why this exists -----------------------------------------------------------------------
+     * Redacting a credential turned it into proof of payment. `Semantics::hasReceipt()` asked only
+     * "is this a non-blank string?", and an API key echoed into `data.mpesaReceipt` was rewritten to
+     * `[redacted]` by the scrubber above - which IS a non-blank string. A `status: "success"` record
+     * with no result code therefore came back `paid = true`, and the equivalent `payment.success`
+     * webhook was delivered as a settled payment. Neither component was wrong on its own: the
+     * redactor believed it was sanitising a string, and the evidence check believed any non-empty
+     * string was a receipt. They disagreed about what the placeholder MEANS, and the money path sat
+     * in the gap.
+     *
+     * The rule that closes it, everywhere and permanently: THE REDACTION MARKER IS NEVER EVIDENCE,
+     * NEVER AN IDENTIFIER, AND NEVER A CORRELATION VALUE. A field whose content had to be destroyed
+     * carries no information, so no decision may be taken from it. Every evidence and identity check
+     * in the SDK calls this, and `tests/NinthRoundHardeningTest.php` asserts each one refuses it.
+     */
+    public static function containsPlaceholder(mixed $value): bool
+    {
+        return is_string($value) && str_contains($value, self::PLACEHOLDER);
+    }
+
+    /**
+     * TRUE when a string contains one of the EXACT secrets this process holds, or anything shaped
+     * like a paylod credential.
+     *
+     * Used on the money path, where the right answer is to REFUSE rather than redact-and-deliver: a
+     * signed body echoing our own credential back is a compromised or misconfigured server, and
+     * continuing to act on its contents is acting on an attacker's or a broken relay's output. The
+     * three sibling SDKs made the same call in round 9. Redaction stays where it belongs - in
+     * diagnostics - and this predicate is what lets the money path tell the two situations apart.
+     *
+     * @param list<string|null> $secrets
+     */
+    public static function contains(string $value, array $secrets): bool
+    {
+        return self::text($value, $secrets) !== $value;
     }
 
     /**

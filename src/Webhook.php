@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Paylod;
 
+use Paylod\Exceptions\PaylodCredentialCompromiseError;
 use Paylod\Exceptions\PaylodSignatureVerificationError;
 use Paylod\Support\JsonLexeme;
 use Paylod\Support\Redact;
@@ -538,6 +539,33 @@ final class Webhook
         // body built from the request that carried it - would otherwise be handed to the handler
         // verbatim, and `whsec_` shape matching only catches it when it is spelled the way we
         // expect. The one secret we can name, we name.
+        //
+        // -- BUT ON THE MONEY PATH WE REFUSE RATHER THAN REDACT ------------------------------------
+        // Redaction is the right answer for DIAGNOSTICS - an error message, a log line, a dump. It is
+        // the wrong answer here, and round 9 showed exactly why: the redactor rewrote an echoed
+        // credential to `[redacted]`, the evidence check read `[redacted]` as a non-blank receipt, and
+        // a `payment.success` with no result code was delivered as a settled payment. Redacting a
+        // credential had turned it into proof of payment.
+        //
+        // The receipt grammar in {@see \Paylod\Semantics} closes that particular instance. This closes
+        // the CLASS: a correctly-signed body that echoes our own webhook secret back is not a body with
+        // one bad field, it is output from a server that is compromised or badly misconfigured, and
+        // there is no reading under which the REST of it is trustworthy. Sanitising it and handing it
+        // to a fulfilment handler is acting on that server's output while knowing it is broken.
+        //
+        // So we refuse, loudly, with the type that is deliberately NOT retryable. The sibling Node,
+        // Python and JVM SDKs made the same call in round 9.
+        if (Redact::contains($raw, [$secret])) {
+            throw new PaylodCredentialCompromiseError(
+                'Webhook body is signed correctly but ECHOES YOUR WEBHOOK SIGNING SECRET back inside '
+                . 'the payload. A legitimate paylod event never contains the secret it was signed '
+                . 'with, so the sender is compromised or misconfigured - and a body from such a sender '
+                . 'cannot be trusted about whether money moved. This event is REFUSED rather than '
+                . 'sanitised and delivered. Rotate the webhook signing secret, then find what is '
+                . 'reflecting it into the payload.'
+            );
+        }
+
         /** @var array<string,mixed> $scrubbed */
         $scrubbed = Redact::apply($event, [$secret]);
 

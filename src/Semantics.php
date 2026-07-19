@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Paylod;
 
+use Paylod\Support\Redact;
+
 /**
  * THE semantic model for a payment record.
  *
@@ -146,12 +148,60 @@ final class Semantics
         };
     }
 
-    /** A receipt counts only if it is a non-blank string. `""` and `"   "` prove nothing. */
+    /**
+     * THE M-PESA RECEIPT GRAMMAR.
+     *
+     * -- Where this came from -------------------------------------------------------------------
+     * DERIVED, NOT INVENTED. Every receipt this repository carries - the `mpesaReceipt` fixtures in
+     * `tests/OutcomeTest.php`, `tests/SemanticsTest.php`, `tests/WebhookTest.php` and
+     * `tests/MoneyPathHardeningTest.php`, including the ones embedded in the raw signed webhook
+     * bodies, and the one quoted in this file's own header comment - is `SFF6XYZ123`: TEN BYTES,
+     * UPPERCASE LETTERS AND DIGITS ONLY. That is the form Safaricom issues M-Pesa confirmation
+     * codes in, and it is the only form this SDK has ever been shown. Anything else is not a
+     * receipt we can read, and a receipt we cannot read is not proof that money moved.
+     *
+     * Anchored with `\z`, not `$` - in PCRE `$` also matches before a trailing newline, so
+     * `/^[A-Z0-9]{10}$/` would accept `"SFF6XYZ123\n"`. Same trap as the result-code grammar in
+     * {@see DarajaCatalog}.
+     */
+    public const RECEIPT_RE = '/^[A-Z0-9]{10}\z/';
+
+    /**
+     * A receipt counts only if it MATCHES THE GRAMMAR ABOVE.
+     *
+     * -- Why non-emptiness was not a test ------------------------------------------------------
+     * This used to be `is_string($receipt) && trim($receipt) !== ''`, and that is the whole of the
+     * round-9 Critical. `Redact` rewrites an echoed API key or webhook secret to `[redacted]`, which
+     * is correct sanitisation and is also a non-blank string - so the redactor's output PASSED as a
+     * valid M-Pesa receipt. A `status: "success"` record carrying nothing but a redacted credential
+     * returned `paid = true`, and a `payment.success` webhook of the same shape was delivered as a
+     * settled payment. Redacting a credential had turned it into proof of payment.
+     *
+     * The fix is not to special-case the marker. It is to stop asking a non-emptiness question about
+     * a value that has a SHAPE: evidence needs a POSITIVE GRAMMAR, and anything that does not match
+     * the grammar is not evidence. `[redacted]` fails it (brackets, lowercase, nine letters), and so
+     * does every other string that is not a receipt - a truncated field, a `null` stringified by a
+     * proxy, an error message, a JSON fragment. The marker check below is kept anyway, stated
+     * explicitly rather than left implicit in the character class, so that no future widening of the
+     * grammar can quietly re-open this hole.
+     */
     public static function hasReceipt(array $payment): bool
     {
         $receipt = $payment['mpesaReceipt'] ?? null;
 
-        return is_string($receipt) && trim($receipt) !== '';
+        return is_string($receipt) && self::isReceipt($receipt);
+    }
+
+    /** Does this string match the receipt grammar? THE one place the question is answered. */
+    public static function isReceipt(string $receipt): bool
+    {
+        // A destroyed value carries no information, so no decision may be taken from it. See
+        // {@see \Paylod\Support\Redact::containsPlaceholder()}.
+        if (Redact::containsPlaceholder($receipt)) {
+            return false;
+        }
+
+        return preg_match(self::RECEIPT_RE, $receipt) === 1;
     }
 
     /** A result code is "present" if it is neither null nor absent. `0` is present and meaningful. */

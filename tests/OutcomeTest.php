@@ -75,7 +75,10 @@ final class OutcomeTest extends TestCase
         // status:"success" but the code (4999) classifies as pending -> reported pending, NOT paid.
         $o = PaymentOutcome::fromPayment(self::payment([
             'status' => 'success',
-            'mpesaReceipt' => 'SHOULD_NOT_SHOW',
+            // A GRAMMATICAL receipt, so the record really does reach the conflict cell. Before the
+            // receipt grammar landed this fixture was 'SHOULD_NOT_SHOW', which is not receipt-shaped
+            // at all - the test passed for the weaker reason that the field was ignored outright.
+            'mpesaReceipt' => 'SFF6XYZ123',
             'resultCode' => 4999,
         ]));
         $this->assertSame('pending', $o->status);
