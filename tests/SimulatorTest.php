@@ -73,7 +73,7 @@ final class SimulatorTest extends TestCase
         ]);
         $paylod = new Paylod('mp_test_x', ['httpClient' => $transport, 'allowCustomHttpClient' => true]);
 
-        $result = $paylod->simulator->pay(['outcome' => 'approve', 'amount' => 100]);
+        $result = $paylod->simulator->pay(['outcome' => 'approve', 'amount' => 100, 'idempotencyKey' => 'k-pay']);
         $this->assertSame('succeeded', $result['outcome']->status);
         $this->assertTrue($result['outcome']->paid);
         $this->assertSame('SFF6XYZ123', $result['outcome']->receipt);

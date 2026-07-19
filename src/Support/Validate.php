@@ -45,6 +45,92 @@ final class Validate
     public const ACK_HTTP_STATUS = 202;
 
     /**
+     * The M-Pesa STK ceiling. A dispatch above it is rejected by Daraja, so sending it is a
+     * round-trip spent to learn what the SDK already knew.
+     */
+    public const MAX_AMOUNT = 150000;
+
+    /**
+     * THE COLLECT AMOUNT RULE, in one place.
+     *
+     * It lived as a private static on the client, so the simulator - a second public DISPATCH
+     * surface - had a rule of its own that only required "a positive int". An amount of 10,000,000
+     * therefore dispatched from the simulator and was refused from production, which is precisely
+     * backwards: the simulator exists so a test can prove things about the production path, and one
+     * that accepts what production rejects teaches the wrong lesson.
+     *
+     * @param string $surface named in the error so the caller knows which call they got wrong
+     */
+    public static function collectAmount(mixed $amount, string $surface = 'collect'): int
+    {
+        $prefix = $surface === 'collect' ? '' : "{$surface}(): ";
+
+        if (!is_int($amount) && !is_float($amount)) {
+            throw new PaylodInvalidRequestError($prefix . 'amount must be a number (whole KES).');
+        }
+        if (is_float($amount) && floor($amount) !== $amount) {
+            throw new PaylodInvalidRequestError(
+                $prefix . "amount must be a whole number of KES - M-Pesa rejects decimals (got {$amount})."
+            );
+        }
+        $amount = (int) $amount;
+        if ($amount <= 0 || $amount > self::MAX_AMOUNT) {
+            throw new PaylodInvalidRequestError(
+                $prefix . 'amount must be between 1 and ' . self::MAX_AMOUNT . " KES (got {$amount})."
+            );
+        }
+
+        return $amount;
+    }
+
+    /**
+     * THE DOUBLE-CHARGE GUARD, resolved before a single byte leaves the process - for EVERY collect
+     * surface.
+     *
+     * A generated key is NOT idempotency. It is a fresh value on every invocation, so it collapses
+     * exactly nothing: a double-clicked Pay button, a refreshed tab, a redelivered queue job and a
+     * process restart mid-request each mint a NEW key and each raise a SEPARATE charge.
+     *
+     * The client required a key (or an explicit, warned opt-in). `Simulator::collect()` silently
+     * GENERATED one when it was absent, so the one surface a developer uses to convince themselves
+     * "this cannot charge twice" was the surface on which it could.
+     *
+     * @param array<string,mixed> $params
+     * @param ?\Closure():void $onUnsafe invoked when a key is generated under the explicit opt-in
+     */
+    public static function collectIdempotencyKey(
+        array $params,
+        string $surface = 'collect',
+        ?\Closure $onUnsafe = null,
+    ): string {
+        if (isset($params['idempotencyKey'])) {
+            self::idempotencyKey($params['idempotencyKey']);
+
+            return (string) $params['idempotencyKey'];
+        }
+
+        if (($params['unsafeGeneratedIdempotencyKey'] ?? false) !== true) {
+            throw new PaylodInvalidRequestError(
+                $surface . '() requires an idempotencyKey. Mint ONE KEY PER PAYMENT ATTEMPT - an id you '
+                . 'create when the customer presses Pay and PERSIST on that attempt - and pass it '
+                . 'here. Without it this charge has no double-charge protection at all: a '
+                . 'double-clicked button, a refreshed tab, a redelivered job or a process restart '
+                . 'will fire a SECOND STK prompt and can charge your customer twice. A key the SDK '
+                . 'generates for you is not idempotency - it is different on every call, so it '
+                . 'collapses nothing. If you genuinely want an unprotected charge (a scratch script, '
+                . 'never production), pass "unsafeGeneratedIdempotencyKey" => true and accept that '
+                . 'this call can double-charge. See https://paylod.dev/docs/sdk#idempotency'
+            );
+        }
+
+        if ($onUnsafe !== null) {
+            $onUnsafe();
+        }
+
+        return Uuid::v4();
+    }
+
+    /**
      * Reject an idempotency key that would silently drop double-charge protection: blank/whitespace
      * keys, keys carrying control characters (which also cannot go in an HTTP header), and absurdly
      * long values. A caller-supplied key is the ONE thing standing between a double-click and a

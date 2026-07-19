@@ -5,10 +5,10 @@ declare(strict_types=1);
 namespace Paylod;
 
 use Closure;
+use Paylod\Exceptions\PaylodApiError;
 use Paylod\Exceptions\PaylodInvalidRequestError;
 use Paylod\Exceptions\PaylodSandboxOnlyError;
 use Paylod\Support\Redact;
-use Paylod\Support\Uuid;
 use Paylod\Support\Validate;
 
 /**
@@ -127,12 +127,10 @@ final class Simulator
     {
         self::assertSandboxKey(($this->apiKey)(), 'simulate.collect()');
 
-        $amount = $params['amount'] ?? 1;
-        if (!is_int($amount) || $amount <= 0) {
-            throw new PaylodInvalidRequestError(
-                "simulate.collect(): amount must be a positive whole number of KES (got {$amount})."
-            );
-        }
+        // THE PRODUCTION AMOUNT RULE, not a local approximation of it. The simulator required only
+        // "a positive int", so 10,000,000 KES dispatched here and was refused by the client - the
+        // exact inversion of what a simulator is for. See Validate::collectAmount().
+        $amount = Validate::collectAmount($params['amount'] ?? 1, 'simulate.collect');
 
         $body = [
             'phone' => array_key_exists('phone', $params)
@@ -172,19 +170,24 @@ final class Simulator
             $body['metadata'] = $metadata;
         }
 
-        if (isset($params['idempotencyKey'])) {
-            // The SAME key rules production enforces. The simulator exists so a test can prove "a
-            // double-click cannot charge twice" against the real thing - a simulator that accepted a
-            // key production would reject would make that test a lie.
-            Validate::idempotencyKey($params['idempotencyKey']);
-        }
-        // A missing key is GENERATED rather than omitted. Settling is a mutating call, and a
-        // simulator that dispatches an unkeyed charge cannot be used to prove anything about the
-        // keyed production path it stands in for.
-        $idempotencyKey = $params['idempotencyKey'] ?? Uuid::v4();
+        // THE SAME KEY RESOLVER PRODUCTION USES - required, or an explicit warned opt-in.
+        //
+        // A missing key used to be silently GENERATED here. That made this surface the one place a
+        // developer could dispatch an unprotected charge without being told, on the very surface
+        // they use to convince themselves that a double-click cannot charge twice. Resolved BEFORE
+        // anything is dispatched, like every other rule in this method.
+        $idempotencyKey = Validate::collectIdempotencyKey($params, 'simulate.collect', static function (): void {
+            trigger_error(
+                '[paylod] simulate.collect() was called with unsafeGeneratedIdempotencyKey => true, '
+                . 'so this simulated charge is NOT protected against being sent twice - exactly as '
+                . 'it would not be in production. Pass ONE KEY PER PAYMENT ATTEMPT instead.',
+                E_USER_WARNING
+            );
+        });
         $redact = $this->redactor();
 
-        $ack = ($this->request)([
+        try {
+            $ack = ($this->request)([
             'method' => 'POST',
             'path' => '/simulate/collect',
             'body' => $body,
@@ -197,14 +200,63 @@ final class Simulator
             'validate' => static function (#[\SensitiveParameter] array $parsed, int $status) use ($idempotencyKey, $redact): void {
                 Validate::collectAck($parsed, $status, $idempotencyKey, $redact);
             },
-        ]);
+            ]);
+        } catch (\Throwable $e) {
+            // THE EFFECTIVE KEY SURVIVES THE FAILURE. Whatever went wrong - network, timeout, 5xx,
+            // malformed 2xx - the caller must be able to retry with the SAME key; a fresh one is a
+            // second charge. The client's collect() has carried this context since round 4; this
+            // dispatch surface dropped it on the floor, so a simulator failure taught the caller the
+            // opposite reflex to the one production requires.
+            if ($e instanceof \Paylod\Exceptions\PaylodException) {
+                $e->attachIdempotencyKey($idempotencyKey);
+
+                throw $e;
+            }
+
+            throw new PaylodApiError(
+                'simulate.collect() failed with an unexpected error: '
+                . (string) $redact($e->getMessage()) . ' - the simulated charge state is '
+                . 'INDETERMINATE. Read the payment with this idempotencyKey before starting any new '
+                . 'attempt; do NOT mint a fresh key.',
+                0,
+                null,
+                $idempotencyKey,
+                true,
+            );
+        }
 
         return [
             'paymentId' => (string) $ack['paymentId'],
             'status' => 'pending',
             'checkoutRequestId' => (string) $ack['checkoutRequestId'],
-            'outcomes' => $ack['outcomes'] ?? [],
+            // REBUILT FROM THE CLOSED SET, not forwarded. `outcomes` was returned exactly as the
+            // server sent it - unvalidated and unredacted - into a value callers print and log, so
+            // an echoed API key rode out through ordinary (non-error) output. There are exactly five
+            // legal outcomes and they are compiled into this class, so anything else is noise at
+            // best and a credential at worst.
+            'outcomes' => self::allowlistedOutcomes($ack['outcomes'] ?? []),
         ];
+    }
+
+    /**
+     * The acknowledged `outcomes` list, reduced to the closed set this SDK defines.
+     *
+     * @return list<string>
+     */
+    private static function allowlistedOutcomes(mixed $outcomes): array
+    {
+        if (!is_array($outcomes)) {
+            return [];
+        }
+
+        $out = [];
+        foreach ($outcomes as $outcome) {
+            if (is_string($outcome) && in_array($outcome, self::OUTCOMES, true)) {
+                $out[] = $outcome;
+            }
+        }
+
+        return array_values(array_unique($out));
     }
 
     /**
@@ -231,12 +283,7 @@ final class Simulator
         // supplied. "The SDK generated it" is not a reason to trust a string the caller wrote most
         // of, and a simulator that accepts a request production would reject teaches the wrong
         // lesson about the path it stands in for.
-        if (!in_array($outcome, self::OUTCOMES, true)) {
-            throw new PaylodInvalidRequestError(
-                'simulate.outcome(): outcome must be one of ' . implode(', ', self::OUTCOMES)
-                . ' (got ' . json_encode($outcome) . ').'
-            );
-        }
+        self::assertKnownOutcome($outcome);
 
         $idempotencyKey = "sim-outcome-{$paymentId}-{$outcome}";
         // Run the PRODUCTION key rules over the derived value. With `$outcome` now closed, this is
@@ -272,6 +319,17 @@ final class Simulator
         ];
     }
 
+    /** The closed outcome set, checked in one place so every surface refuses the same values. */
+    private static function assertKnownOutcome(mixed $outcome): void
+    {
+        if (!is_string($outcome) || !in_array($outcome, self::OUTCOMES, true)) {
+            throw new PaylodInvalidRequestError(
+                'simulate.outcome(): outcome must be one of ' . implode(', ', self::OUTCOMES)
+                . ' (got ' . json_encode($outcome) . ').'
+            );
+        }
+    }
+
     /**
      * collect() + outcome() in one call - the whole point of the simulator, in one line.
      *
@@ -280,7 +338,12 @@ final class Simulator
      */
     public function pay(array $params): array
     {
-        $outcome = $params['outcome'];
+        // EVERY INPUT IS VALIDATED BEFORE ANYTHING IS CREATED. `$outcome` used to be checked inside
+        // outcome(), i.e. AFTER collect() had already created a payment - so a typo'd outcome left a
+        // stranded pending payment behind and reported a validation error, which is a mutation
+        // performed on the way to rejecting the request that caused it.
+        $outcome = $params['outcome'] ?? null;
+        self::assertKnownOutcome($outcome);
         unset($params['outcome']);
         $created = $this->collect($params);
 

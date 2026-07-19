@@ -368,21 +368,8 @@ final class Paylod
      */
     private function buildCollectBody(array $params): array
     {
-        $amount = $params['amount'] ?? null;
-        if (!is_int($amount) && !is_float($amount)) {
-            throw new PaylodInvalidRequestError('amount must be a number (whole KES).');
-        }
-        if (is_float($amount) && floor($amount) !== $amount) {
-            throw new PaylodInvalidRequestError(
-                "amount must be a whole number of KES - M-Pesa rejects decimals (got {$amount})."
-            );
-        }
-        $amount = (int) $amount;
-        if ($amount <= 0 || $amount > self::MAX_AMOUNT) {
-            throw new PaylodInvalidRequestError(
-                'amount must be between 1 and ' . self::MAX_AMOUNT . " KES (got {$amount})."
-            );
-        }
+        // ONE implementation, shared with the simulator - see Validate::collectAmount().
+        $amount = Validate::collectAmount($params['amount'] ?? null);
         if (isset($params['accountReference']) && strlen(trim((string) $params['accountReference'])) > 12) {
             throw new PaylodInvalidRequestError('accountReference must be 12 characters or fewer.');
         }
@@ -778,31 +765,14 @@ final class Paylod
      */
     private static function resolveIdempotencyKey(array $params): string
     {
-        if (isset($params['idempotencyKey'])) {
-            // A caller-supplied key is the double-charge guard - reject a blank/whitespace/control-char
-            // one loudly rather than silently drop protection.
-            Validate::idempotencyKey($params['idempotencyKey']);
-
-            return (string) $params['idempotencyKey'];
-        }
-
-        if (($params['unsafeGeneratedIdempotencyKey'] ?? false) !== true) {
-            throw new PaylodInvalidRequestError(
-                'collect() requires an idempotencyKey. Mint ONE KEY PER PAYMENT ATTEMPT - an id you '
-                . 'create when the customer presses Pay and PERSIST on that attempt - and pass it '
-                . 'here. Without it this charge has no double-charge protection at all: a '
-                . 'double-clicked button, a refreshed tab, a redelivered job or a process restart '
-                . 'will fire a SECOND STK prompt and can charge your customer twice. A key the SDK '
-                . 'generates for you is not idempotency - it is different on every call, so it '
-                . 'collapses nothing. If you genuinely want an unprotected charge (a scratch script, '
-                . 'never production), pass "unsafeGeneratedIdempotencyKey" => true and accept that '
-                . 'this call can double-charge. See https://paylod.dev/docs/sdk#idempotency'
-            );
-        }
-
-        self::warnUnsafeGeneratedIdempotencyKey();
-
-        return Uuid::v4();
+        // ONE implementation, shared with the simulator - see Validate::collectIdempotencyKey().
+        return Validate::collectIdempotencyKey(
+            $params,
+            'collect',
+            static function (): void {
+                self::warnUnsafeGeneratedIdempotencyKey();
+            },
+        );
     }
 
     private static function warnUnsafeGeneratedIdempotencyKey(): void

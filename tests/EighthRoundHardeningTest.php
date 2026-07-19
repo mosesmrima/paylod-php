@@ -484,6 +484,111 @@ final class EighthRoundHardeningTest extends TestCase
         $this->assertSame(0, preg_match(\Paylod\Phone::INPUT_RE, "0712345678\n"));
     }
 
+    // == The simulator is the PRODUCTION path with the handset removed, and nothing else ==========
+
+    /** @param list<array<string,mixed>> $steps */
+    private function sim(array $steps): \Paylod\Simulator
+    {
+        return (new Paylod('mp_test_x', [
+            'httpClient' => new MockHttpClient($steps),
+            'allowCustomHttpClient' => true,
+        ]))->simulator;
+    }
+
+    private const ACK_STEP = ['status' => 202, 'json' => [
+        'paymentId' => 'pay_sim',
+        'checkoutRequestId' => 'ws_sim',
+        'status' => 'pending',
+        'outcomes' => [],
+    ]];
+
+    /**
+     * The simulator is what a developer uses to convince themselves a double-click cannot charge
+     * twice. It was the one surface that silently generated a key when none was passed.
+     *
+     * nv:r8-simulator-key-required
+     */
+    public function testTheSimulatorRequiresAnIdempotencyKeyJustLikeProduction(): void
+    {
+        $this->expectException(\Paylod\Exceptions\PaylodInvalidRequestError::class);
+        $this->expectExceptionMessageMatches('/requires an idempotencyKey/');
+
+        $this->sim([self::ACK_STEP])->collect(['amount' => 100]);
+    }
+
+    /**
+     * The production ceiling applies here too: the simulator required only "a positive int", so an
+     * amount production refuses dispatched from the surface that stands in for production.
+     *
+     * nv:r8-simulator-amount-ceiling
+     */
+    public function testTheSimulatorEnforcesTheProductionAmountCeiling(): void
+    {
+        $this->expectException(\Paylod\Exceptions\PaylodInvalidRequestError::class);
+        $this->expectExceptionMessageMatches('/between 1 and 150000/');
+
+        $this->sim([self::ACK_STEP])->collect(['amount' => 10_000_000, 'idempotencyKey' => 'k']);
+    }
+
+    /**
+     * A transport failure must leave the caller holding the EFFECTIVE key - a fresh one is a second
+     * charge. The simulator dropped it.
+     *
+     * nv:r8-simulator-failure-context
+     */
+    public function testASimulatorDispatchFailureCarriesTheEffectiveKey(): void
+    {
+        try {
+            $this->sim([['throw' => true]])->collect(['amount' => 100, 'idempotencyKey' => 'k-real']);
+            $this->fail('expected a dispatch failure');
+        } catch (\Paylod\Exceptions\PaylodException $e) {
+            $this->assertSame('k-real', $e->idempotencyKey);
+        }
+    }
+
+    /**
+     * `outcomes` is returned into ordinary, logged output. It was forwarded from the server
+     * unvalidated and unredacted, so an echoed API key rode out through a non-error path.
+     *
+     * nv:r8-simulator-outcomes-allowlist
+     */
+    public function testTheAcknowledgedOutcomesAreRebuiltFromTheClosedSet(): void
+    {
+        $created = $this->sim([['status' => 202, 'json' => [
+            'paymentId' => 'pay_sim',
+            'checkoutRequestId' => 'ws_sim',
+            'status' => 'pending',
+            'outcomes' => ['approve', 'mp_test_supersecretkey', ['nested' => true], 'not_an_outcome', 'timeout'],
+        ]]])->collect(['amount' => 100, 'idempotencyKey' => 'k']);
+
+        $this->assertSame(['approve', 'timeout'], $created['outcomes']);
+        $this->assertStringNotContainsString('supersecretkey', json_encode($created));
+    }
+
+    /**
+     * `pay()` validated its outcome only AFTER collect() had created a payment, so a typo left a
+     * stranded pending payment behind. Nothing may be created on the way to rejecting the request.
+     *
+     * nv:r8-simulator-validate-before-mutate
+     */
+    public function testPayValidatesTheOutcomeBeforeCreatingAnything(): void
+    {
+        $transport = new MockHttpClient([self::ACK_STEP]);
+        $paylod = new Paylod('mp_test_x', [
+            'httpClient' => $transport,
+            'allowCustomHttpClient' => true,
+        ]);
+
+        try {
+            $paylod->simulator->pay(['outcome' => 'nope', 'amount' => 100, 'idempotencyKey' => 'k']);
+            $this->fail('expected an invalid-outcome error');
+        } catch (\Paylod\Exceptions\PaylodInvalidRequestError $e) {
+            $this->assertStringContainsString('outcome must be one of', $e->getMessage());
+        }
+
+        $this->assertSame(0, $transport->count(), 'a payment was created before the request was refused');
+    }
+
     /** A genuine signed settlement still verifies - the guard must not break real webhooks. */
     public function testAGenuineSignedSettlementStillVerifies(): void
     {
