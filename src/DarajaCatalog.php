@@ -118,18 +118,73 @@ final class DarajaCatalog
     }
 
     /**
+     * THE EXACT overloaded Daraja business code. Not a `500.` prefix - see classifyStkResult().
+     */
+    private const OVERLOADED_500_CODE = '500.001.1001';
+
+    /**
+     * The canonical form of an STK ResultCode, as the schema defines it. TWO shapes and no others:
+     *
+     *   - a plain unsigned decimal integer with no leading zero, no sign, no exponent, no point;
+     *   - a DOTTED business code of at least THREE non-empty all-digit segments (`500.001.1001`).
+     *
+     * Anchored with `\z`, never `$`: in PCRE `$` also matches before a trailing newline, so a `$`
+     * anchor accepts `"500.001.1001\n"` as canonical - a padded code laundered into a real catalog
+     * entry by the regex itself.
+     */
+    private const CANONICAL_INTEGER_RE = '/^(?:0|[1-9][0-9]*)\z/';
+    private const CANONICAL_DOTTED_RE = '/^[0-9]+(?:\.[0-9]+){2,}\z/';
+
+    /**
      * Classify a synchronous STK Query result. THE authoritative call - the decoder defers to
      * this, so a stale or wrong table entry can never resurrect the 4999 bug.
      *
-     * @return "pending"|"success"|"failed"
+     * -- THE ORDER IS THE POINT: VALIDATE THE FORM, THEN CLASSIFY -------------------------------
+     * Round 9 found this function normalising before validating for the second time, now in the
+     * DESCRIPTION path. The terminal `500.*` branch ran FIRST, ahead of every check on the code's
+     * shape, and it matched on a bare `str_starts_with($raw, '500.')`. So `"500.0"`, `"500.x"` and
+     * `"500.001.1001\n"` - none of which is a code the schema defines - all became TERMINAL FAILURE
+     * evidence the moment the description happened to contain a phrase like "insufficient funds",
+     * which is server-controlled free text. A description is not a code, and it must never be able
+     * to promote an unreadable code into a terminal verdict.
+     *
+     * The form is therefore settled BEFORE anything else looks at the value. A code that is not
+     * canonically shaped is UNREADABLE, and unreadable is `pending` - never success, never terminal.
+     *
+     * -- AND AN UNCATALOGUED CODE IS NOT EVIDENCE ------------------------------------------------
+     * The other half: every canonically shaped positive integer used to return `failed`, catalogued
+     * or not. An unfamiliar code like `87654` therefore made a claimed failure TERMINAL and let a
+     * `payment.failed` webhook through as a settled failure - while the decoder, looking at the same
+     * code, described the outcome as indeterminate and non-retryable. The two disagreed, and the one
+     * that governed the money path was the permissive one.
+     *
+     * An unknown code proves nothing in either direction, so it now says so: `unknown`, which
+     * {@see \Paylod\Semantics} maps to its own evidence kind with its own five table rows, all
+     * INDETERMINATE. Terminal failure is reserved for codes the catalog actually knows.
+     *
+     * @return "pending"|"success"|"failed"|"unknown"
      */
     public static function classifyStkResult(mixed $resultCode, ?string $resultDesc = null): string
     {
         $raw = self::lexeme($resultCode);
         $desc = trim($resultDesc ?? '');
 
-        // A terminal 500.* config error must not be mistaken for "still processing".
-        if (str_starts_with($raw, '500.') && preg_match(self::TERMINAL_500_MESSAGE_RE, $desc) === 1) {
+        // STEP 1 - FORM FIRST. Nothing below may look at a value that is not a code.
+        if (!self::isCanonicalCode($raw)) {
+            return 'pending';
+        }
+
+        // STEP 2 - SUCCESS IS MATCHED EXACTLY, NEVER NUMERICALLY. See the lexeme() docblock: the
+        // comparison is against the sender's own bytes so no earlier layer can manufacture a match.
+        if ($raw === '0') {
+            return 'success';
+        }
+
+        // STEP 3 - the overloaded business code. 500.001.1001 is a Daraja bucket that carries BOTH
+        // "still processing" and hard terminal configuration errors, told apart only by the message.
+        // Restricted to that EXACT code: the description may disambiguate a code we know is
+        // overloaded, and nothing else.
+        if ($raw === self::OVERLOADED_500_CODE && preg_match(self::TERMINAL_500_MESSAGE_RE, $desc) === 1) {
             return 'failed';
         }
 
@@ -137,49 +192,72 @@ final class DarajaCatalog
             return 'pending';
         }
 
-        // SUCCESS IS MATCHED EXACTLY, NEVER NUMERICALLY.
-        //
-        // This branch decides whether money moved, so it is the single most dangerous coercion in
-        // the SDK. It used to read `is_numeric($raw) && $raw + 0 === 0` - and PHP's numeric string
-        // grammar is far wider than the schema's. Every one of "0e999", "+0", "00", "0.0", "0x0"
-        // (as a float-parsed form), " 0 " and "-0" is `is_numeric` and coerces to zero, so a
-        // malformed, truncated or hostile record carrying any of them was classified `success`,
-        // became EVIDENCE_SUCCESS, and a `status: "success"` row alongside it became PAID. A
-        // merchant ships goods on that.
-        //
-        // The schema defines exactly one zero: the JSON number `0`, which Daraja may also send as
-        // the string "0". Those, and nothing else.
-        //
-        // The comparison is made against the LEXEME - the sender's own bytes - precisely so that no
-        // earlier layer can manufacture a match. `" 0"` is not `"0"`; it is a four-byte string the
-        // schema does not define, and it stays that way all the way to this line. Floats have no
-        // lexeme at all, so `0.0`, `-0.0` and every other float-typed code fail here by
-        // construction rather than by a string-form coincidence.
-        //
-        // Never `==`, never `is_numeric`, never arithmetic, and now also never `trim`.
-        if ($raw === '0') {
-            return 'success';
+        // STEP 4 - the "still processing" description safety net, for a pending code we have not
+        // catalogued yet. This runs on a code whose FORM is already settled (step 1), so a
+        // description can only ever move a real code towards the CONSERVATIVE answer here. It can
+        // never promote an unreadable value, and - since step 3 is pinned to one exact code - it can
+        // never push anything towards terminal.
+        if (preg_match(self::PENDING_DESC_RE, $desc) === 1) {
+            return 'pending';
         }
 
-        // A TERMINAL code must also be canonically shaped: a non-zero unsigned integer with no
-        // leading zero, no sign, no exponent, no decimal point. Anything else that merely LOOKS
-        // numeric ("0e999", "+1", "01", "1.0", "-1") is a representation the schema does not
-        // define, so we do not know what it means - and "we do not know" is never a terminal
-        // failure, because a terminal failure is what tells a merchant it is safe to charge again.
-        // ANCHORED WITH `\z`, NOT `$`. In PCRE, `$` also matches immediately BEFORE a trailing
-        // newline, so `/^[1-9][0-9]*$/` accepted "1032\n" as canonical - a padded code laundered
-        // into the real, RETRYABLE 1032 entry by the regex itself, with no trim() involved. `\z`
-        // means the true end of the subject and nothing else.
-        if (preg_match('/^[1-9][0-9]*\z/', $raw) === 1) {
-            // A known-numeric, non-zero code is terminal - UNLESS the description says otherwise
-            // (guards against a new "still processing" code we haven't catalogued yet).
-            return preg_match(self::PENDING_DESC_RE, $desc) === 1 ? 'pending' : 'failed';
+        // STEP 5 - TERMINAL REQUIRES A CATALOG ENTRY.
+        //
+        // This used to be `preg_match('/^[1-9][0-9]*\z/', $raw)` -> `failed`, i.e. every canonically
+        // shaped positive integer was a terminal failure whether or not the SDK had ever heard of it.
+        // `87654` made a claimed failure TERMINAL and let a `payment.failed` webhook through as
+        // settled, while decode() described the very same code as indeterminate. Terminal failure is
+        // the verdict that tells a merchant it is safe to charge again; it is not something to infer
+        // from a number's shape.
+        if (isset(self::terminalStkCodes()[$raw])) {
+            return 'failed';
         }
 
-        // Blank / non-canonical / unknown -> never force-fail on ambiguity, and never call it
-        // success either. `pending` is the conservative cell: it becomes EVIDENCE_IN_FLIGHT, which
-        // is never PAID under any claim and never a retryable failure under any claim.
-        return 'pending';
+        // STEP 6 - canonically shaped, but the catalog has never seen it. This proves NOTHING: not
+        // success, not failure, not that the prompt is still live. `unknown` is its own answer, with
+        // its own evidence kind and its own five rows in the semantic table, every one of them
+        // INDETERMINATE. Saying "pending" here would be a guess in the safe direction; saying
+        // "failed" was a guess in the dangerous one. We now say neither.
+        return 'unknown';
+    }
+
+    /** Is this the canonical form of an STK ResultCode? Form only - says nothing about meaning. */
+    private static function isCanonicalCode(string $raw): bool
+    {
+        return preg_match(self::CANONICAL_INTEGER_RE, $raw) === 1
+            || preg_match(self::CANONICAL_DOTTED_RE, $raw) === 1;
+    }
+
+    /** @var array<string,true>|null */
+    private static ?array $terminalCodes = null;
+
+    /**
+     * The STK codes the catalog knows to be TERMINAL, derived FROM the table for the same reason
+     * {@see pendingResultCodes()} is: the classifier and the decoder must not be able to disagree
+     * about which codes exist.
+     *
+     * @return array<string,true>
+     */
+    public static function terminalStkCodes(): array
+    {
+        if (self::$terminalCodes === null) {
+            $set = [];
+            foreach (self::allEntries() as $e) {
+                if (($e['family'] ?? null) !== 'stk_result') {
+                    continue;
+                }
+                if (($e['category'] ?? null) === 'pending') {
+                    continue;
+                }
+                if ((string) $e['code'] === '0') {
+                    continue;
+                }
+                $set[(string) $e['code']] = true;
+            }
+            self::$terminalCodes = $set;
+        }
+
+        return self::$terminalCodes;
     }
 
     /**
@@ -300,6 +378,11 @@ final class DarajaCatalog
                 return self::pendingFallback($code);
             }
 
+            // `unknown` and `failed` both land on the same fallback, which already says what an
+            // uncatalogued code means: indeterminate, and NOT safely retryable. The classifier and
+            // this decoder now agree about that - the round-9 High was precisely that they did not,
+            // with the classifier calling an unfamiliar code TERMINAL while this text called it
+            // unprovable.
             return self::failedFallback($code !== '' ? $code : 'unknown', $rawDesc);
         }
 

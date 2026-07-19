@@ -102,6 +102,7 @@ final class SemanticsTest extends TestCase
         'success|failure' => Semantics::VERDICT_INDETERMINATE,
         'success|in_flight' => Semantics::VERDICT_INDETERMINATE,
         'success|conflict' => Semantics::VERDICT_INDETERMINATE,
+        'success|unknown' => Semantics::VERDICT_INDETERMINATE,
 
         // claim = pending
         'pending|success' => Semantics::VERDICT_INDETERMINATE,
@@ -109,6 +110,7 @@ final class SemanticsTest extends TestCase
         'pending|failure' => Semantics::VERDICT_INDETERMINATE,
         'pending|in_flight' => Semantics::VERDICT_IN_FLIGHT,
         'pending|conflict' => Semantics::VERDICT_INDETERMINATE,
+        'pending|unknown' => Semantics::VERDICT_INDETERMINATE,
 
         // claim = failed. Note `failed|in_flight`: the claim is terminal, the code says the prompt
         // is live, and the SDK refuses to pick a winner. Never failed (that invites a retry against
@@ -122,6 +124,7 @@ final class SemanticsTest extends TestCase
         'failed|failure' => Semantics::VERDICT_FAILED,
         'failed|in_flight' => Semantics::VERDICT_INDETERMINATE,
         'failed|conflict' => Semantics::VERDICT_INDETERMINATE,
+        'failed|unknown' => Semantics::VERDICT_INDETERMINATE,
 
         // claim = cancelled (enumerated explicitly, never a default)
         'cancelled|success' => Semantics::VERDICT_INDETERMINATE,
@@ -130,6 +133,7 @@ final class SemanticsTest extends TestCase
         'cancelled|failure' => Semantics::VERDICT_FAILED,
         'cancelled|in_flight' => Semantics::VERDICT_INDETERMINATE,
         'cancelled|conflict' => Semantics::VERDICT_INDETERMINATE,
+        'cancelled|unknown' => Semantics::VERDICT_INDETERMINATE,
 
         // claim = unknown - a status outside the closed set. Five rows, not one default.
         'unknown|success' => Semantics::VERDICT_INDETERMINATE,
@@ -137,6 +141,7 @@ final class SemanticsTest extends TestCase
         'unknown|failure' => Semantics::VERDICT_INDETERMINATE,
         'unknown|in_flight' => Semantics::VERDICT_INDETERMINATE,
         'unknown|conflict' => Semantics::VERDICT_INDETERMINATE,
+        'unknown|unknown' => Semantics::VERDICT_INDETERMINATE,
     ];
 
     /**
@@ -153,6 +158,9 @@ final class SemanticsTest extends TestCase
             Semantics::EVIDENCE_FAILURE => ['resultCode' => 1032],
             Semantics::EVIDENCE_IN_FLIGHT => ['resultCode' => 4999],
             Semantics::EVIDENCE_CONFLICT => ['mpesaReceipt' => 'SFF6XYZ123', 'resultCode' => 1032],
+            // A canonically shaped code the catalog has never heard of. Round 9: this used to
+            // classify as a TERMINAL FAILURE purely because it looks like a number.
+            Semantics::EVIDENCE_UNKNOWN => ['resultCode' => 87654],
         };
     }
 
@@ -198,11 +206,11 @@ final class SemanticsTest extends TestCase
         self::assertSame(self::EXPECTED[$key], $judgement->verdict, "wrong verdict for {$key}");
     }
 
-    /** The cross-product is COMPLETE: 5 claims x 5 evidence kinds, no more and no fewer. */
+    /** The cross-product is COMPLETE: 5 claims x 6 evidence kinds, no more and no fewer. */
     public function testTheTableCoversEveryClaimTimesEveryEvidenceKind(): void
     {
         $expectedPairs = count(Semantics::CLAIMS) * count(Semantics::EVIDENCE_KINDS);
-        self::assertSame(25, $expectedPairs, 'the alphabets changed - the table must change with them');
+        self::assertSame(30, $expectedPairs, 'the alphabets changed - the table must change with them');
         self::assertCount($expectedPairs, self::EXPECTED);
         self::assertCount($expectedPairs, self::tableProvider());
         self::assertSame(array_keys(self::EXPECTED), array_keys(array_flip(array_map(

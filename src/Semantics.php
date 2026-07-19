@@ -82,6 +82,17 @@ final class Semantics
     public const EVIDENCE_IN_FLIGHT = 'in_flight';
     /** The evidence disagrees with ITSELF - e.g. a receipt alongside a cancellation code. */
     public const EVIDENCE_CONFLICT = 'conflict';
+    /**
+     * A canonically shaped result code the CATALOG HAS NEVER SEEN. Proves nothing in any direction.
+     *
+     * Distinct from EVIDENCE_NONE (the record carries no code at all) and from EVIDENCE_IN_FLIGHT
+     * (a code we know means the prompt is live). Before round 9 an uncatalogued code like `87654`
+     * was classified as a terminal FAILURE purely because it was shaped like a number, so a claimed
+     * failure became terminal and a `payment.failed` webhook was delivered as settled - on a code
+     * whose own decoded entry said "we cannot prove no money moved". An unfamiliar code is not
+     * evidence; it is the absence of evidence dressed as a number.
+     */
+    public const EVIDENCE_UNKNOWN = 'unknown';
 
     // -- Stage 2 vocabulary: the resolved state -----------------------------------------------
 
@@ -119,6 +130,7 @@ final class Semantics
         self::EVIDENCE_FAILURE,
         self::EVIDENCE_IN_FLIGHT,
         self::EVIDENCE_CONFLICT,
+        self::EVIDENCE_UNKNOWN,
     ];
 
     /**
@@ -238,6 +250,10 @@ final class Semantics
                 'success' => self::EVIDENCE_SUCCESS,
                 'failed' => self::EVIDENCE_FAILURE,
                 'pending' => self::EVIDENCE_IN_FLIGHT,
+                // A code the catalog has never seen. Its own kind, not folded into any of the
+                // others - folding it into `pending` would assert a live prompt we cannot see, and
+                // folding it into `failure` is the round-9 High this arm exists to close.
+                'unknown' => self::EVIDENCE_UNKNOWN,
             };
         } else {
             $codeEvidence = self::EVIDENCE_NONE;
@@ -254,6 +270,10 @@ final class Semantics
             return self::EVIDENCE_SUCCESS;
         }
 
+        // Everything else - failure, in-flight, and UNKNOWN - lands here as a conflict. An
+        // uncatalogued code is deliberately NOT treated as silence: we cannot read it, so we cannot
+        // rule out that it denies the receipt, and the fail-closed reading costs one more poll while
+        // the permissive one ships goods on a code nobody can interpret.
         return self::EVIDENCE_CONFLICT;
     }
 
@@ -262,7 +282,7 @@ final class Semantics
      *
      * This table is TOTAL AND EXHAUSTIVE, and it says so structurally: the claim is first
      * normalised into a five-member closed alphabet by {@see claimFor()}, the evidence is already a
-     * five-member closed alphabet, and the resolution below is a single `match` over the 25
+     * six-member closed alphabet, and the resolution below is a single `match` over the 30
      * `claim|evidence` pairs WITH NO DEFAULT ARM. A cell that goes missing is an
      * `\UnhandledMatchError` at the point of the omission - it cannot be absorbed by a fallthrough,
      * which is exactly where every previous round of this bug lived. `SemanticsTest` walks the same
@@ -300,7 +320,7 @@ final class Semantics
     }
 
     /**
-     * THE TABLE. 5 claims x 5 evidence kinds = 25 rows, no default arm.
+     * THE TABLE. 5 claims x 6 evidence kinds = 30 rows, no default arm.
      *
      * @param self::CLAIM_* $claim
      * @param self::EVIDENCE_* $evidence
@@ -334,6 +354,7 @@ final class Semantics
                 'status claims success but the result code says the payment is still in flight'
             ),
             'success|conflict' => $conflict,
+            'success|unknown' => $contradiction(self::uncatalogued()),
 
             // -- claim = pending -------------------------------------------------------------
             // THE named hole. ['status' => 'pending', 'resultCode' => 0] used to come back paid,
@@ -350,6 +371,7 @@ final class Semantics
             ),
             'pending|in_flight' => [self::VERDICT_IN_FLIGHT, 'the payment is still on the handset'],
             'pending|conflict' => $conflict,
+            'pending|unknown' => $contradiction(self::uncatalogued()),
 
             // -- claim = failed --------------------------------------------------------------
             // L4. Includes the receipt-on-a-failed-row case that used to be rendered as
@@ -385,6 +407,7 @@ final class Semantics
                 . 'can be trusted'
             ),
             'failed|conflict' => $conflict,
+            'failed|unknown' => $contradiction(self::uncatalogued()),
 
             // -- claim = cancelled (a terminal failure claim by another name) ------------------
             'cancelled|success' => $contradiction(
@@ -403,6 +426,7 @@ final class Semantics
                 . 'record contradicts itself, so neither reading can be trusted'
             ),
             'cancelled|conflict' => $conflict,
+            'cancelled|unknown' => $contradiction(self::uncatalogued()),
 
             // -- claim = unknown --------------------------------------------------------------
             // A status outside the known set, or no status at all. The shape validators reject
@@ -414,7 +438,25 @@ final class Semantics
             'unknown|failure' => $contradiction(self::unrecognised($evidence)),
             'unknown|in_flight' => $contradiction(self::unrecognised($evidence)),
             'unknown|conflict' => $contradiction(self::unrecognised($evidence)),
+            'unknown|unknown' => $contradiction(self::unrecognised($evidence)),
         };
+    }
+
+    /**
+     * THE UNCATALOGUED-CODE ROWS. All five verdicts are INDETERMINATE, and that is the whole point.
+     *
+     * Before round 9 there were no such rows: an unfamiliar code was classified `failed`, so
+     * `failed|failure` fired and a claimed failure became TERMINAL - which is what permits a
+     * `payment.failed` webhook to be delivered as settled and what tells a merchant a re-charge is
+     * being considered. The code was one the SDK had never seen. Terminal failure is a conclusion
+     * that requires evidence exactly as `paid` does (law L2'), and an unrecognised number is not
+     * evidence of anything.
+     */
+    private static function uncatalogued(): string
+    {
+        return 'the result code is not in the catalog, so it proves nothing - we can establish '
+            . 'neither that money moved nor that it did not, and an unrecognised code is never a '
+            . 'terminal failure';
     }
 
     private static function unrecognised(string $evidence): string
