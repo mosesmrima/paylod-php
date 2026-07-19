@@ -1,10 +1,10 @@
 # paylod/paylod
 
-The official PHP client for the **paylod API** - M-Pesa collections without the Daraja boilerplate, with first-class **Laravel** support.
+This package is the official PHP client for the **paylod API**. It collects M-Pesa payments without Daraja boilerplate. It includes **Laravel** support.
 
-You send one call. paylod hosts the Daraja callback, refreshes the OAuth token, decodes the result code, and POSTs you a signed webhook when the money lands.
+You send one call. paylod hosts the Daraja callback. paylod refreshes the access token. paylod decodes the result code. paylod then sends you a signed webhook when the payment settles.
 
-**No backend. No fees. No custody.** paylod runs the M-Pesa plumbing so you don't stand up a callback server; there are no per-transaction fees during free early access; and the money never touches paylod - it settles into **your own** Daraja shortcode with **your own** credentials. You bring the Daraja creds, paylod brings everything around them.
+**No backend. No fees. No custody.** paylod operates the M-Pesa integration, so you do not run a callback server. There are no per-transaction fees during free early access. The money does not go to paylod. The money settles into **your own** Daraja shortcode with **your own** credentials. You supply the Daraja credentials. paylod supplies the rest.
 
 ---
 
@@ -14,11 +14,15 @@ You send one call. paylod hosts the Daraja callback, refreshes the OAuth token, 
 composer require paylod/paylod
 ```
 
-Requires **PHP 8.1+** with the `curl`, `json` and `hash` extensions (all standard). No third-party HTTP client required.
+This package requires **PHP 8.1+** with the `curl`, `json` and `hash` extensions. All three extensions are standard. No third-party HTTP client is necessary.
 
-> **Why `paylod/paylod`?** The package name mirrors the scoped npm name `@paylod/node` - one obvious, memorable vendor/package pair. `paylod/sdk` was the alternative, but the SDK is the product's PHP client, not a meta "sdk", so `paylod/paylod` reads better in `composer require` and in a Laravel app's `config/app.php`.
+> **The package name is `paylod/paylod`.** The name matches the scoped npm name `@paylod/node`. The vendor name and the package name are the same word. This SDK is the PHP client for the product, so the name `paylod/sdk` was not used.
 
 ## Quickstart
+
+> Call this SDK from a server only. Your `PAYLOD_API_KEY` can move money. Never ship the key in a browser bundle, a mobile application, or any other client.
+
+> Pass an idempotency key on every collect call. Mint one key for each payment attempt. Duplicates of that attempt collapse into one STK push and one charge. A double-clicked Pay button, a refreshed tab, and a redelivered job are duplicates of one attempt. Do not use the order id or the product id as the key. A retry after a wrong PIN is a new attempt, and it needs a new key.
 
 ```php
 use Paylod\Paylod;
@@ -40,36 +44,32 @@ if ($outcome->paid) {
 }
 ```
 
-That's the whole integration. `collectAndWait()` sends the STK prompt, polls with a sane backoff, and hands you something you can **render**.
+This example is the complete integration. `collectAndWait()` sends the STK push. It then polls the payment, and it returns an outcome that you can render.
 
-> **`idempotencyKey` is REQUIRED, and you mint one per payment attempt.** Duplicates of that attempt - a double-clicked Pay button, a refreshed tab, a redelivered job - collapse into **one** prompt and **one** charge. Do **not** key on the order or the product: that replays an old payment instead of making a new one. A retry after a wrong PIN is a new charge and needs a **new** key. See [Idempotency](#idempotency).
+The idempotency key is required. The SDK refuses a collect call without one, before the call leaves your process. For more information, read [Idempotency](#idempotency).
 
-**One argument in, one renderable thing out.** You pass an API key - not a base URL, not a config object, not an OAuth token. You get back a `message` a customer can read and a `retryable` flag you can hang a button off. There is no result-code table in your app.
+**One argument in, one renderable outcome out.** You pass an API key. You do not pass a base URL, a config object, or an access token. You get a `message` that the customer can read. You also get a `retryable` flag that controls your retry button. Your application does not need a result code table.
 
-> **If you find yourself writing `if ($code === 1032)`, we've failed.** Decoding M-Pesa's result codes is our job, not yours.
-
-### Server-side only - not browser-safe
-
-Your `PAYLOD_API_KEY` can move money. Call this SDK from a server. Never ship the key to a browser.
+paylod decodes the M-Pesa result codes for you. Do not write a test such as `if ($code === 1032)` in your application.
 
 ---
 
 ## Laravel
 
-Auto-discovery registers the service provider and the `Paylod` facade. Publish the config if you want to tweak it:
+Auto-discovery registers the service provider and the `Paylod` facade. To change the configuration, publish it first:
 
 ```bash
 php artisan vendor:publish --tag=paylod-config
 ```
 
-Set your key in `.env`:
+Set your key in `.env`.
 
 ```dotenv
 PAYLOD_API_KEY=mp_live_xxxxxxxx
 PAYLOD_WEBHOOK_SECRET=whsec_xxxxxxxx   # only if you consume webhooks
 ```
 
-Then inject the client, or use the facade:
+Then inject the client, or use the facade.
 
 ```php
 use Paylod\Paylod;
@@ -101,7 +101,7 @@ new Paylod($key, ['timeoutMs' => 10000]);     // with an escape hatch
 new Paylod(['apiKey' => $key]);               // everything-in-one-array form, if you prefer
 ```
 
-Throws `Paylod\Exceptions\PaylodConfigError` immediately if there is no key anywhere.
+The constructor throws `Paylod\Exceptions\PaylodConfigError` immediately if it finds no key.
 
 | Option | Type | Default |
 | --- | --- | --- |
@@ -112,12 +112,14 @@ Throws `Paylod\Exceptions\PaylodConfigError` immediately if there is no key anyw
 | `timeoutMs` | `int` | `30000` (must be 1-600000 ms; `0` would disable the timeout entirely) |
 | `maxRetries` | `int` | `2` (transient failures only: network, transient 5xx, 429; not 501/505/511) |
 | `simulate` | `bool` | `false` (sandbox simulator; requires a `mp_test_` key) |
-| `httpClient` | `Paylod\Http\HttpClient` | `CurlHttpClient`. **Test-only.** Requires `allowCustomHttpClient => true` and is refused for `mp_live_` keys - a custom client receives your `Authorization` header on every request |
+| `httpClient` | `Paylod\Http\HttpClient` | `CurlHttpClient`. **Test-only.** This option requires `allowCustomHttpClient => true`. The SDK refuses this option for `mp_live_` keys. A custom client receives your `Authorization` header on every request |
 | `allowCustomHttpClient` | `bool` | `false` (the explicit opt-in that `httpClient` requires) |
 
 ### `collect(array $params): array`
 
-Fire the STK push and return as soon as the prompt is on the phone.
+This method sends the STK push. It returns as soon as the STK push is on the handset.
+
+Pass an idempotency key on every collect call. Mint one key for each payment attempt. The idempotency key is required. The SDK refuses a collect call without one, before the call leaves your process.
 
 ```php
 $ack = $paylod->collect([
@@ -131,7 +133,7 @@ $ack = $paylod->collect([
 // ['paymentId' => ..., 'status' => 'pending', 'checkoutRequestId' => ..., 'idempotencyKey' => ...]
 ```
 
-`amount`, `phone` and the field lengths are validated **locally** - bad input throws `PaylodInvalidRequestError` before a byte hits the network.
+The SDK validates `amount`, `phone` and the field lengths **locally**. Bad input throws `PaylodInvalidRequestError` before the SDK sends the request.
 
 ### `status(string $paymentId): array`
 
@@ -140,21 +142,21 @@ $p = $paylod->status($ack['paymentId']);
 // ['id' => ..., 'status' => 'pending'|'success'|'failed', 'mpesaReceipt' => ..., 'resultCode' => ..., 'resultDesc' => ...]
 ```
 
-> Note the states: **`success`**, not `paid`.
+> Note the state names. This method returns **`success`**, not `paid`.
 
 ### `check(string $paymentId): PaymentOutcome`
 
-`status()`, but already decoded and renderable. This is the one you want.
+This method does the same work as `status()`. It returns a decoded outcome that you can render. Use this method.
 
 ### `wait(string $paymentId, array $options = []): PaymentOutcome`
 
-Poll an existing payment until it settles. Options: `timeoutMs` (default 120000), `onPoll` (callable, called with each pending snapshot). Polling ramps 1s -> 1s -> 1.5s -> 2s -> 2.5s -> 3s -> 4s -> 5s (capped), each with +/-20% jitter.
+This method polls an existing payment until the payment settles. The options are `timeoutMs` (default 120000) and `onPoll` (a callable, called with each pending snapshot). The poll interval increases through 1s, 1s, 1.5s, 2s, 2.5s, 3s, 4s and 5s. The interval stops at 5s. Each interval has +/-20% jitter.
 
-`wait()` decides "has it settled?" using the **classifier**, not the raw `status` field. Daraja reports code `4999` on a row it also marks `failed`, but `4999` means *"the prompt is live and the customer hasn't typed their PIN yet"* - so `wait()` keeps polling.
+`wait()` uses the **classifier** to decide whether the payment settled. It does not use the raw `status` field. Daraja reports result code `4999` on a record that Daraja also marks `failed`. Result code `4999` means that the STK push is live on the handset. The customer did not enter the PIN yet. Therefore `wait()` continues to poll.
 
 ### `collectAndWait(array $params, array $options = []): PaymentOutcome`
 
-`collect()` + `wait()`.
+This method does the work of `collect()` and then the work of `wait()`.
 
 ### The outcome: one renderable shape
 
@@ -171,16 +173,18 @@ $outcome->detail;    // decoded cause/fix/category array, or null - for logs
 $outcome->payment;   // the raw payment record
 ```
 
-**Two invariants worth internalising:**
+**Two rules apply to this shape:**
 
-1. **`retryable` means SAFE TO CHARGE AGAIN.** A `pending` payment is **never** retryable: codes `4999` / `500.001.1001` mean the STK prompt is live and the customer simply hasn't entered their PIN yet. Retrying pushes a **second prompt** and can double-charge them.
-2. **A wrong PIN is not an exception - it's an answer.** Cancellations, wrong PINs and low balances come back as data (`status: "failed"`, with a `message`), not as a thrown error.
+1. `retryable` means SAFE TO CHARGE AGAIN. It does not mean that the customer may press a button. `retryable = false` means that paylod cannot prove that no debit occurred. Result code `4999` and result code `500.001.1001` mean that the STK push is live on the handset. The customer did not enter the PIN yet. The payment is IN FLIGHT, not failed. A pending payment is never retryable. A second collect call sends a second STK push, and it can charge the customer twice.
+2. A wrong PIN is an answer, not an exception. A cancellation, a wrong PIN, and a low balance come back as data, with `status` and a `message`. They do not raise an error.
 
-**What throws:** `PaylodInvalidRequestError` (bad input), `PaylodConfigError` (no key), `PaylodApiError` (non-2xx; carries `->status` and `->isAuthError()` / `->isRateLimited()` / `->isIdempotencyConflict()` / `->isIdempotencyIndeterminate()` / `->isIdempotencyInProgress()` / `->isIdempotencyBodyConflict()`), `PaylodConnectionError` (network failed after retries), `PaylodTimeoutError` (still pending at the deadline - **not** a failure; leave the order pending and let the webhook settle it).
+**The SDK throws these exceptions:** `PaylodInvalidRequestError` for bad input. `PaylodConfigError` for a missing key. `PaylodApiError` for a non-2xx response. `PaylodApiError` carries `->status` and the methods `->isAuthError()`, `->isRateLimited()`, `->isIdempotencyConflict()`, `->isIdempotencyIndeterminate()`, `->isIdempotencyInProgress()` and `->isIdempotencyBodyConflict()`. `PaylodConnectionError` means that the network failed after the retries. `PaylodTimeoutError` means that the payment is still pending at the deadline.
+
+A timeout is not a failed payment. The outcome is INDETERMINATE. The customer can still enter the PIN, and the payment can still succeed. Leave the order pending. The webhook settles the order.
 
 ### `decodeError(int|string|null $resultCode, ?string $rawDesc = null): array`
 
-Offline. No network, no API call.
+This method operates offline. It uses no network and no API call.
 
 ```php
 $paylod->decodeError(1032);
@@ -195,13 +199,13 @@ $paylod->decodeError(1032);
 // ]
 ```
 
-The strings are byte-identical to the ones paylod puts in `event.data.decoded`. Also available standalone via `Paylod\DarajaCatalog::decode(...)` and `Paylod\DarajaCatalog::errorCatalog()`.
+These strings are byte-identical to the strings that paylod puts in `event.data.decoded`. The same data is available from `Paylod\DarajaCatalog::decode(...)` and from `Paylod\DarajaCatalog::errorCatalog()`.
 
 ---
 
 ## Test your checkout without a phone
 
-Your failure paths are where payment bugs live. The simulator removes the handset - and nothing else. A real sandbox payment row, the real Daraja result codes, the real settlement path, a real signed webhook. Only the phone is fiction.
+Most payment defects occur in the failure paths. The simulator removes the handset, and it changes nothing else. You get a real sandbox payment record, real Daraja result codes, and a real signed webhook. The settlement path is also real.
 
 ```php
 $paylod = new Paylod($_ENV['PAYLOD_TEST_KEY']); // mp_test_... key
@@ -220,7 +224,7 @@ $outcome->retryable; // true - no money moved, so a fresh charge is safe
 | `user_cancelled` | `cancelled` | `1032` |
 | `timeout` | `failed` | `1037` |
 
-To exercise *your* code, split it in two - the payment id is real, so your poller, webhook route and UI run unchanged:
+To test **your** code, do the two steps separately. The payment id is real. Therefore your poller, your webhook route and your user interface operate without a change.
 
 ```php
 $created = $paylod->simulator->collect(['amount' => 250]);
@@ -228,13 +232,15 @@ $paylod->simulator->outcome($created['paymentId'], 'insufficient_funds');
 $view = readCheckout($created['paymentId']); // your code, verbatim
 ```
 
-Or build the client with `['simulate' => true]` so `collect()` itself creates a simulated payment instead of ringing a phone. **Sandbox only, structurally:** every simulator call refuses a `mp_live_` key locally (`PaylodSandboxOnlyError`), and `['simulate' => true]` throws from the constructor.
+You can also build the client with `['simulate' => true]`. `collect()` then creates a simulated payment, and it sends no STK push to a handset.
+
+Every simulator call refuses an `mp_live_` key locally, before the call leaves your process. The SDK throws `PaylodSandboxOnlyError`. The option `['simulate' => true]` throws from the constructor for an `mp_live_` key.
 
 ---
 
 ## Webhooks
 
-paylod POSTs a signed JSON body to your endpoint when a payment settles:
+paylod sends a signed JSON body to your endpoint when a payment settles.
 
 ```
 POST /your/webhook
@@ -243,7 +249,9 @@ x-webhook-id: <event id>
 x-webhook-event: payment.success
 ```
 
-The signature is `HMAC-SHA256(secret, "${t}.${rawBody}")`. Verify it with a 300s replay tolerance and a constant-time compare:
+The signature is `HMAC-SHA256(secret, "${t}.${rawBody}")`. Verify the signature with a 300s replay tolerance and a constant-time compare.
+
+> Verify the signature against the raw bytes. A re-serialised body does not reproduce the same bytes, and the signature check then fails. In Laravel, read `$request->getContent()` for the raw string. Do not read the parsed array.
 
 ```php
 // Boolean form - matches verifyWebhook($rawBody, $signatureHeader, $secret)
@@ -259,51 +267,57 @@ if ($event['type'] === 'payment.success') {
 }
 ```
 
-> **The raw body is load-bearing.** Re-serialising a parsed body does not reliably reproduce the same bytes, so it will fail verification. In Laravel, read `$request->getContent()` (the raw string), never the parsed array.
+paylod can deliver the same webhook more than once. Key your fulfilment on the signed `data.paymentId`, and make the fulfilment idempotent. Do not use the `x-webhook-id` header for this check. The header is unsigned, so an attacker can replay a body under a new header value.
 
-**Deliveries can repeat.** Dedup your fulfilment on the **signed** `data.paymentId` and make it idempotent. Never dedup on the unsigned `x-webhook-id` header - it is replayable and not covered by the signature.
-
-`Paylod\Webhook::sign($rawBody, $secret, $timestamp)` is exported so you can build realistic fixtures in your own tests without a network.
+The SDK exports `Paylod\Webhook::sign($rawBody, $secret, $timestamp)`. Use this function to build realistic fixtures in your own tests, without a network.
 
 ---
 
 ## Idempotency
 
-**This is the section that stops you charging a customer twice. Read it.**
+**Read this section. This section shows you how to prevent a double charge.**
 
-An idempotency key names **one payment attempt**. Duplicate deliveries of that one attempt - a double-click, a refreshed tab, a job-queue redelivery, an internal network retry - collapse into a single charge.
+An idempotency key names **one payment attempt**. Pass an idempotency key on every collect call. Mint one key for each payment attempt. Duplicates of that attempt collapse into one STK push and one charge. A double-clicked Pay button, a refreshed tab, and a redelivered job are duplicates of one attempt. Do not use the order id or the product id as the key. A retry after a wrong PIN is a new attempt, and it needs a new key.
 
 ```php
 $attempt = $db->attempts()->create(['order_id' => $order->id]); // a row per press of Pay
 $paylod->collectAndWait(['amount' => $amount, 'phone' => $phone, 'idempotencyKey' => $attempt->id]);
 ```
 
-**Key format:** printable ASCII (`0x20-0x7E`), 1-255 bytes. The key travels as an HTTP header, and header values are ASCII on the wire - a key containing an accented letter, a CJK character or a pasted en dash is rejected locally rather than silently re-encoded into a *different* key that no longer deduplicates. Use a UUID, or slug your order id to ASCII.
+**Key format:** printable ASCII (`0x20-0x7E`), 1 to 255 bytes. The key travels as an HTTP header, and header values are ASCII. The SDK refuses a key that contains an accented letter, a CJK character, or a pasted en dash. The SDK refuses that key locally. A re-encoded key is a **different** key, and a different key does not deduplicate. Use a UUID, or convert your order id to an ASCII slug.
 
 | Key you pass | What happens |
 | --- | --- |
-| An id minted per **payment attempt** | Correct. Duplicates collapse; a new attempt is a new charge. |
-| Your **order id** | Stable, but never fresh. A retry after a wrong PIN replays the FAILED attempt - that order can never be paid. |
-| A **product id** (reused across purchases) | Catastrophic. Every customer after the first replays the first-ever payment. |
-| A fresh UUID **per call** | Equivalent to no key: a double-click is two keys, two prompts, two charges. |
+| An id minted per **payment attempt** | Correct. Duplicates collapse. A new attempt is a new charge. |
+| Your **order id** | Stable, but never fresh. A retry after a wrong PIN repeats the FAILED attempt. That order can never be paid. |
+| A **product id**, used again for each purchase | Very dangerous. Every customer after the first customer repeats the first payment. |
+| A fresh UUID **for each call** | The same result as no key. A double click makes two keys, two STK pushes and two charges. |
 
-**A concurrent double-click cannot double-charge**, unconditionally: the key is reserved before Daraja is called, so ten simultaneous requests with the same key produce one payment and one STK push.
+**A concurrent double click cannot cause a double charge.** paylod reserves the key before it calls Daraja. Therefore ten simultaneous requests with the same key produce one payment and one STK push.
 
-**The one case where the same key is not a safe retry:** if an earlier request under that key died mid-flight against Daraja, the key is *spent*. paylod returns a `409` **indeterminate** (`$err->isIdempotencyIndeterminate()`). That is a **stop** signal, not a retry signal - read the payment status (`$paylod->check($paymentId)`), and only if nothing happened start a new attempt with a **new** key. For money, at-most-once beats at-least-once.
+**One condition makes the same key unsafe for a retry.** An interrupted request spends its idempotency key, and paylod answers `409` indeterminate (`$err->isIdempotencyIndeterminate()`). Read the payment status before you retry. Use `$paylod->check($paymentId)`. The `409` is a STOP signal, not a retry signal. paylod cannot prove that no debit occurred, so paylod refuses to repeat the request. If the payment settled, you are done. If nothing occurred, start a new attempt with a NEW key. For money, at-most-once is better than at-least-once.
 
-**Omitting the key is an error.** `collect()` throws `PaylodInvalidRequestError` before any byte leaves the process, so no prompt can already be on a handset when you see it.
+The idempotency key is required. The SDK refuses a collect call without one, before the call leaves your process. `collect()` throws `PaylodInvalidRequestError`. Therefore no STK push can be on a handset when you see the exception.
 
-This is deliberate, and it is a change in 0.6.0. Earlier versions generated a key for you and warned once per process. A generated key is *not* idempotency: it is a different value on every invocation, so it collapses nothing. It protects an internal network retry within a single call and nothing else - your application sending the same logical charge twice still charges twice. The guard was, in effect, off by default, behind a warning that is invisible in every production posture that matters.
+This behaviour is deliberate, and it is a change in 0.6.0. Earlier versions minted a key for you, and they warned once for each process. A minted key is not idempotency. A minted key is a different value on every call, so it collapses nothing. A minted key protects an internal network retry inside one call only. If your application sends the same charge twice, the customer still pays twice. The guard was off by default, behind a warning that most production deployments never show.
 
-If you genuinely want an unprotected charge - a scratch script, never production - pass `'unsafeGeneratedIdempotencyKey' => true`. It warns on every call, and it can double-charge.
+Do not use this option in production. To make an unprotected charge in a scratch script, pass `'unsafeGeneratedIdempotencyKey' => true`. The SDK then mints a throwaway key, and it warns on every call. A throwaway key protects nothing, and the call can charge a customer twice.
 
 ---
 
 ## Testing your integration
 
-The SDK dispatches through its OWN transport, which holds the API key: you pass a method, a path
-and a body, and never see the credential or build a header. For tests you can replace the low-level
-byte mover underneath it - but only deliberately, and only with a sandbox key:
+The SDK sends every request through its OWN transport. The transport holds the API key. You pass a
+method, a path and a body. You never see the credential, and you never build a header. For tests,
+you can replace the low-level HTTP client under the transport. You must do this deliberately, and
+you must use a sandbox key.
+
+Read the next paragraph before you use this option. Your API key is a bearer credential. Whoever
+receives the key can move money. A custom client receives the key on every request. A custom client
+also decides for itself whether to follow a redirect. If the custom client follows a cross-origin
+`302`, it sends your key to another host before the SDK can refuse. For this reason the custom
+client is a gated test seam, not a general extension point. You can never combine it with an
+`mp_live_` key. The client enforces this rule, and the transport enforces the rule again.
 
 ```php
 use Paylod\Paylod;
@@ -326,28 +340,21 @@ $paylod = new Paylod('mp_test_x', [
 ]);
 ```
 
-**Why the opt-in.** Your API key is a bearer credential: whoever receives it can move money. A
-custom client gets it on every request and decides for itself whether to follow a redirect - so a
-cross-origin `302` it follows would replay your key to another host before the SDK could object.
-That is why this is a gated test seam rather than a general extension point, and why it can never
-be combined with an `mp_live_` key. The rule is enforced by the client and again inside the
-transport.
-
-Any PSR-18 client can be wrapped in an `HttpClient` in a few lines if you prefer to route through
-your existing HTTP stack in tests. It must not follow redirects.
+You can wrap any PSR-18 client in an `HttpClient` with a few lines of code. Use this method to send
+test traffic through your existing HTTP stack. The wrapped client must not follow redirects.
 
 ---
 
 ## Security
 
-The threat model is stated explicitly in [SECURITY.md](SECURITY.md) - what this SDK defends against
-and, just as importantly, what it does not. It is honest about the limits: the closure-based secret
-storage resists `var_dump`, `print_r`, `var_export` and serialization, but an attacker who can
-already run code in your process can still recover the key by casting the client with `(array)` and
-invoking the resulting closures. That is defence against accidental disclosure, not a security
-boundary - no in-process client library can defend against hostile in-process code.
+[SECURITY.md](SECURITY.md) states the threat model. It states what this SDK defends against. It also
+states what this SDK does not defend against. The closure-based secret storage resists `var_dump`,
+`print_r`, `var_export` and serialization. An attacker who can already run code in your process can
+still recover the key. That attacker casts the client with `(array)` and calls the closures in the
+result. Therefore this storage is a defence against accidental disclosure. It is not a security
+boundary. No in-process client library can defend against hostile in-process code.
 
-Report a suspected vulnerability to **security@paylod.dev**, not via a public issue.
+Report a suspected vulnerability to **security@paylod.dev**. Do not use a public issue.
 
 ---
 
