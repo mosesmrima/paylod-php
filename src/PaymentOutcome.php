@@ -119,8 +119,16 @@ final class PaymentOutcome
         $paymentId = (string) self::scrub($paymentId);
         $code = $code === null ? null : (string) self::scrub($code);
 
-        if ($verdict === Semantics::VERDICT_PAID) {
-            return new self(
+        // AN EXHAUSTIVE `match` OVER THE FOUR VERDICTS, WITH NO DEFAULT ARM.
+        //
+        // This used to be three `if` blocks and a fallthrough, so EVERY verdict the first three did
+        // not match was rendered as a TERMINAL FAILURE - including any fifth verdict a future change
+        // might add, which would arrive silently as `failed`/`retryable` rather than as an error.
+        // The verdict alphabet is closed, so the rendering must say so structurally: a missing arm
+        // is an \UnhandledMatchError at the point of the omission, never a silent guess. Same rule,
+        // and the same reason, as the 30-cell table in {@see Semantics::cell()}.
+        return match ($verdict) {
+            Semantics::VERDICT_PAID => new self(
                 status: 'succeeded',
                 message: (string) self::scrub($detail['customerMessage'] ?? 'Payment received - thank you!'),
                 retryable: false, // it worked - charging again would be a second charge
@@ -130,14 +138,11 @@ final class PaymentOutcome
                 code: $code,
                 detail: self::nonRetryableDetail($detail),
                 payment: $safePayment,
-            );
-        }
-
-        if ($verdict === Semantics::VERDICT_INDETERMINATE) {
+            ),
             // Rendered as `pending` so wait() keeps polling and lets the webhook settle it, rather
             // than reporting a false success (goods shipped for nothing) or a false retryable failure
             // (the customer charged twice). Never paid, never retryable - both unconditional.
-            return new self(
+            Semantics::VERDICT_INDETERMINATE => new self(
                 status: 'pending',
                 message: self::INDETERMINATE,
                 retryable: false,
@@ -147,11 +152,9 @@ final class PaymentOutcome
                 code: $code,
                 detail: self::nonRetryableDetail($detail),
                 payment: $safePayment,
-            );
-        }
+            ),
 
-        if ($verdict === Semantics::VERDICT_IN_FLIGHT) {
-            return new self(
+            Semantics::VERDICT_IN_FLIGHT => new self(
                 status: 'pending',
                 // `detail` is only useful here if it is genuinely a pending code (4999 /
                 // 500.001.1001); anything else that classified as pending has no useful message.
@@ -165,26 +168,27 @@ final class PaymentOutcome
                 code: $code,
                 detail: self::nonRetryableDetail($detail),
                 payment: $safePayment,
-            );
-        }
+            ),
 
-        // Terminal failure. Cancellation gets its own word: the customer chose this, it is not an
-        // error, and a UI usually wants to say so more gently.
-        $retryable = $detail['retryable'] ?? false;
-
-        return new self(
-            status: $code === self::CANCELLED_CODE ? 'cancelled' : 'failed',
-            message: (string) self::scrub($detail['customerMessage'] ?? 'The payment didn\'t go through. Please try again.'),
-            retryable: $retryable,
-            paid: false,
-            paymentId: $paymentId,
-            receipt: null,
-            code: $code,
-            // The terminal branch is the ONE place the nested flag may be true, and it is exactly
-            // as true as the top-level one - they are the same value, not two independent readings.
-            detail: $retryable ? self::scrubDetail($detail) : self::nonRetryableDetail($detail),
-            payment: $safePayment,
-        );
+            // Terminal failure. Cancellation gets its own word: the customer chose this, it is not
+            // an error, and a UI usually wants to say so more gently. This arm is now reached ONLY
+            // by the verdict it names - it is no longer where every unmatched verdict lands.
+            Semantics::VERDICT_FAILED => new self(
+                status: $code === self::CANCELLED_CODE ? 'cancelled' : 'failed',
+                message: (string) self::scrub($detail['customerMessage'] ?? 'The payment didn\'t go through. Please try again.'),
+                retryable: $detail['retryable'] ?? false,
+                paid: false,
+                paymentId: $paymentId,
+                receipt: null,
+                code: $code,
+                // The terminal branch is the ONE place the nested flag may be true, and it is
+                // exactly as true as the top-level one - the same value, not two readings.
+                detail: ($detail['retryable'] ?? false)
+                    ? self::scrubDetail($detail)
+                    : self::nonRetryableDetail($detail),
+                payment: $safePayment,
+            ),
+        };
     }
 
     /**

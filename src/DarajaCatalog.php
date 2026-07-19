@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Paylod;
 
+use Paylod\Support\Redact;
+
 /**
  * THE single source of truth for Daraja result-code meanings - classification AND decoding.
  *
@@ -465,7 +467,7 @@ final class DarajaCatalog
     private static function pendingFallback(string $code): array
     {
         return [
-            'code' => $code,
+            'code' => self::safeCode($code),
             'title' => 'Payment still in progress',
             'cause' => 'M-Pesa is still processing this payment - the customer has most likely not entered their '
                 . 'M-Pesa PIN yet. This is NOT a failure: the payment is still live and can still succeed.',
@@ -478,17 +480,54 @@ final class DarajaCatalog
     }
 
     /**
+     * THE `code` FIELD IS NEVER A VERBATIM COPY OF AN UNRECOGNISED SERVER STRING.
+     *
+     * Found by the round-9 ADVERSARIAL SWEEP, and by nothing else - no per-field test looked here,
+     * because nobody thought to. Both fallbacks copied the raw ResultCode lexeme straight into
+     * `code`, which is a PUBLIC field of the decoded array and lands in json_encode(), logs, dumps
+     * and support tickets. A gateway echoing the Authorization header into `ResultCode` therefore
+     * put a live key into every one of those sinks - through the OFFLINE decoder, on a path that
+     * never touches a client and so never met a client redactor.
+     *
+     * A catalogued code is safe by construction (it matched a table entry). A code we did NOT
+     * recognise is server-controlled text of unknown provenance, so it is not echoed at all unless
+     * it is canonically shaped and short. Anything else becomes the literal `unknown` - which is
+     * exactly as informative, because a code we cannot read tells the reader nothing anyway.
+     */
+    private static function safeCode(string $code): string
+    {
+        if ($code === '' || strlen($code) > 32 || !self::isCanonicalCode($code)) {
+            return 'unknown';
+        }
+
+        return $code;
+    }
+
+    /**
      * Unknown code. The outcome is INDETERMINATE - we cannot prove no money moved - so it is NOT
      * safely retryable.
      *
      * @return array{code:string,title:string,cause:string,fix:string,category:string,retryable:bool,customerMessage:string}
      */
-    private static function failedFallback(string $code, ?string $rawDesc = null): array
+    private static function failedFallback(string $code, #[\SensitiveParameter] ?string $rawDesc = null): array
     {
-        $desc = trim($rawDesc ?? '');
+        // THE RAW DESCRIPTION IS SHAPE-SCRUBBED BEFORE IT IS COPIED INTO `cause`.
+        //
+        // `cause` is a PUBLIC field of the decoded array. It reaches json_encode(), application
+        // logs, exception dumps, support tickets and the value merchants paste into chat. This line
+        // used to be a bare copy of server-controlled free text - so a gateway echoing the
+        // Authorization header into `ResultDesc` put a live `mp_live_` key into every one of those
+        // sinks, through the OFFLINE decoder, on a path that never touches a client and therefore
+        // never met the client's redactor.
+        //
+        // This is a static method with no process secrets, so it can apply the SHAPE rules only -
+        // which is precisely the layer that catches a reflected bearer token. The client's EXACT
+        // credentials are applied on top by {@see \Paylod\Paylod::decodeError()}. Two layers,
+        // because either one alone leaks; same argument as {@see \Paylod\Support\Redact}.
+        $desc = trim(Redact::text($rawDesc ?? '', []));
 
         return [
-            'code' => $code,
+            'code' => self::safeCode($code),
             'title' => 'Payment failed',
             'cause' => $desc !== '' ? $desc : 'M-Pesa returned a non-zero ResultCode with no further detail.',
             'fix' => 'Check the raw ResultDesc, verify your credentials + shortcode/till pairing, and confirm '

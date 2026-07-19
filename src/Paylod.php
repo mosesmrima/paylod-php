@@ -445,7 +445,22 @@ final class Paylod
             // Validate::collectAck() is not enough: the closure is a separate frame in the trace,
             // invoked with the raw body as ITS argument, so an unmarked parameter here left a
             // reflected bearer token sitting verbatim in getTrace() one frame below the redacted one.
-            $ack = $this->request('POST', '/collect', $body, $idempotencyKey, null, function (#[\SensitiveParameter] array $parsed, int $status) use ($idempotencyKey): void {
+            // THE ACKNOWLEDGED PAYMENT ID IS CAPTURED BEFORE IT CAN BE LOST.
+            //
+            // Failure handling below used to attach only the idempotency key, so a malformed 202
+            // that nonetheless carried a perfectly usable `paymentId` threw with
+            // `$exception->paymentId` null. The message says "a charge may already be live, read the
+            // payment before you retry" - and the id needed to read it had been thrown away, on the
+            // exact path where recovering it matters most. An interrupt (a timeout, a fatal, a
+            // signal) landing after `$ack` was assigned but before the `return` had the same gap.
+            //
+            // Capturing INSIDE the validator closes both: the closure runs while the parsed body is
+            // in hand, before validation can throw and before `$ack` is assigned, so the id is
+            // already bound no matter where control leaves afterwards. It goes through the SAME
+            // identifier grammar and the SAME credential check the success path applies.
+            $acknowledgedPaymentId = null;
+            $ack = $this->request('POST', '/collect', $body, $idempotencyKey, null, function (#[\SensitiveParameter] array $parsed, int $status) use ($idempotencyKey, &$acknowledgedPaymentId): void {
+                $acknowledgedPaymentId = Validate::usableIdentifier($parsed, 'paymentId', $this->redactor());
                 Validate::collectAck($parsed, $status, $idempotencyKey, $this->redactor());
             });
 
@@ -459,7 +474,14 @@ final class Paylod
             // Whatever went wrong (network, timeout, 5xx, malformed 2xx), the caller MUST be able to
             // recover the effective key and retry with the SAME one - a fresh key would double-charge.
             if ($e instanceof \Paylod\Exceptions\PaylodException) {
-                $e->attachIdempotencyKey($idempotencyKey);
+                // BIND BOTH IDENTIFIERS WHENEVER A USABLE PAYMENT ID IS KNOWN. The key alone lets
+                // the caller retry safely; the key AND the id let them go and find out what actually
+                // happened, which is the better move on an indeterminate charge.
+                if ($acknowledgedPaymentId !== null) {
+                    $e->bindToAcknowledgedPayment($idempotencyKey, $acknowledgedPaymentId);
+                } else {
+                    $e->attachIdempotencyKey($idempotencyKey);
+                }
                 throw $e;
             }
 
@@ -480,6 +502,9 @@ final class Paylod
                 true,
                 self::sanitizedCause($e, $this->redactor()),
             );
+            if ($acknowledgedPaymentId !== null) {
+                $wrapped->bindToAcknowledgedPayment($idempotencyKey, $acknowledgedPaymentId);
+            }
 
             throw $wrapped;
         }
@@ -629,9 +654,19 @@ final class Paylod
      *
      * @return array{code:string,title:string,cause:string,fix:string,category:string,retryable:bool,customerMessage:string}
      */
-    public function decodeError(int|string|null $resultCode, ?string $rawDesc = null): array
+    public function decodeError(int|string|null $resultCode, #[\SensitiveParameter] ?string $rawDesc = null): array
     {
-        return DarajaCatalog::decode($resultCode, $rawDesc);
+        // THE CLIENT'S REDACTOR IS APPLIED. The catalog scrubs credential SHAPES on its own (it is
+        // static and holds no secrets), but the EXACT secrets are only knowable here - and this
+        // method's return value goes straight into json_encode(), logs and dumps. A `$rawDesc`
+        // echoing this client's own API key reached all of them unchanged.
+        //
+        // `$rawDesc` is also #[\SensitiveParameter] now: without it a throw anywhere below records
+        // the whole description verbatim in getTrace()['args'].
+        /** @var array{code:string,title:string,cause:string,fix:string,category:string,retryable:bool,customerMessage:string} $decoded */
+        $decoded = $this->redact(DarajaCatalog::decode($resultCode, $rawDesc));
+
+        return $decoded;
     }
 
     /**
@@ -642,8 +677,8 @@ final class Paylod
      * PAYLOD_WEBHOOK_SECRET) is used. Use {@see parseWebhook()} when you want the decoded event.
      */
     public function verifyWebhook(
-        string $rawBody,
-        ?string $signatureHeader,
+        #[\SensitiveParameter] string $rawBody,
+        #[\SensitiveParameter] ?string $signatureHeader,
         #[\SensitiveParameter] ?string $secret = null,
         int|float $toleranceSec = Webhook::DEFAULT_TOLERANCE_SEC,
     ): bool {
@@ -657,12 +692,40 @@ final class Paylod
      * @return array<string,mixed>
      */
     public function parseWebhook(
-        string $rawBody,
-        ?string $signatureHeader,
+        #[\SensitiveParameter] string $rawBody,
+        #[\SensitiveParameter] ?string $signatureHeader,
         #[\SensitiveParameter] ?string $secret = null,
         int|float $toleranceSec = Webhook::DEFAULT_TOLERANCE_SEC,
     ): array {
-        return Webhook::verify($rawBody, $signatureHeader, $secret ?? ($this->webhookSecret)() ?? '', $toleranceSec);
+        $event = Webhook::verify($rawBody, $signatureHeader, $secret ?? ($this->webhookSecret)() ?? '', $toleranceSec);
+
+        // ON THE MONEY PATH WE REFUSE RATHER THAN REDACT. Webhook::verify() already applies this
+        // rule to the ONE secret it was handed; the client is the only object that also knows the
+        // API KEY, so the check is completed here. A correctly-signed body echoing a live
+        // money-moving key is not a body with one bad field - it is output from a sender that is
+        // compromised or misconfigured, and nothing in it can be trusted about whether money moved.
+        if (Redact::contains($rawBody, [($this->apiKey)()])) {
+            throw new \Paylod\Exceptions\PaylodCredentialCompromiseError(
+                'Webhook body is signed correctly but ECHOES THIS CLIENT\'S API KEY back inside the '
+                . 'payload. A legitimate paylod event never contains your API key, so the sender is '
+                . 'compromised or misconfigured. This event is REFUSED rather than sanitised and '
+                . 'delivered. Rotate the API key, then find what is reflecting it into the payload.'
+            );
+        }
+
+        // THE CLIENT'S OWN CREDENTIALS ARE RE-APPLIED TO THE VERIFIED EVENT.
+        //
+        // Webhook::verify() is static. It knows the ONE secret it was handed and the credential
+        // SHAPES, and that is all it can know - so a body echoing THIS CLIENT'S API KEY (a different
+        // secret entirely, and one spelled in a way the shape rules may not catch) passed straight
+        // through it and was returned to the caller verbatim. The client is the only object that
+        // holds both credentials, so it is the only place this can be done. Cheap, total, and it
+        // cannot drift from what the SDK considers a secret elsewhere - it is the same redactor the
+        // error paths use.
+        /** @var array<string,mixed> $redacted */
+        $redacted = $this->redact($event);
+
+        return $redacted;
     }
 
     // -- Internals ------------------------------------------------------------

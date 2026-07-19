@@ -97,9 +97,19 @@ final class JsonLexeme
      * keyed indeterminate `PaylodApiError` on the money path, an `invalid_payload` signature error
      * on the webhook path.
      */
-    public static function nonCanonicalResultCodeToken(string $raw): ?string
+    public static function nonCanonicalResultCodeToken(string $raw, ?int $scanDepthLimit = null): ?string
     {
         $scan = new self($raw);
+        // TEST-ONLY SEAM. The divergence branch below is the fail-closed cross-check, and it was
+        // UNREACHABLE from a test: the scanner and `json_decode()` share MAX_DEPTH, so no ordinary
+        // body makes one give up while the other succeeds - which meant the round-8 test for it
+        // supplied only JSON both parsers reject, and would have passed just as happily if the whole
+        // cross-check were deleted. Lowering the SCANNER's limit (and only the scanner's) produces a
+        // genuine, controlled divergence, so the branch can be exercised and mutation-tested.
+        // Never narrows in production: callers pass nothing, and a limit above MAX_DEPTH is ignored.
+        if ($scanDepthLimit !== null && $scanDepthLimit < self::MAX_DEPTH) {
+            $scan->depthLimit = max(0, $scanDepthLimit);
+        }
 
         try {
             $scan->parseDocument();
@@ -138,6 +148,9 @@ final class JsonLexeme
 
     // -- the scan --------------------------------------------------------------------------------
 
+    /** The effective scan depth ceiling. MAX_DEPTH unless a test narrows it. */
+    private int $depthLimit = self::MAX_DEPTH;
+
     private function parseDocument(): void
     {
         $this->skipWhitespace();
@@ -156,7 +169,7 @@ final class JsonLexeme
         if ($this->bad !== null) {
             return; // unwind: the verdict is already decided
         }
-        if ($depth > self::MAX_DEPTH) {
+        if ($depth > $this->depthLimit) {
             $this->fail();
         }
         if ($this->i >= $this->len) {

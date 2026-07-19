@@ -445,6 +445,32 @@ final class Validate
     /** Opaque token: alphanumeric, with the separators paylod ids actually use. No spaces, no colons-into-URLs. */
     private const IDENTIFIER_RE = '/^[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}\z/';
 
+    /**
+     * The payment id in a body, IF it is one we could actually use - else null.
+     *
+     * Exists so that a FAILED acknowledgement can still surrender its identifier. A malformed 202
+     * carrying a perfectly good `paymentId` used to throw with `$exception->paymentId` left null,
+     * because failure handling attached only the idempotency key - so the caller was told "a charge
+     * may be live, go and read it" while being denied the id that would let them read it. The id is
+     * put through the SAME grammar and the SAME credential check the success path uses, so this can
+     * never become a back door for an unvalidated or credential-shaped value.
+     *
+     * @param array<string,mixed> $parsed
+     * @param ?callable(mixed):mixed $redact
+     */
+    public static function usableIdentifier(
+        #[\SensitiveParameter] array $parsed,
+        string $field,
+        #[\SensitiveParameter] ?callable $redact = null,
+    ): ?string {
+        $value = $parsed[$field] ?? null;
+        if (!self::isNonBlankString($value)) {
+            return null;
+        }
+
+        return self::identifierProblem($field, (string) $value, $redact) === null ? (string) $value : null;
+    }
+
     /** @param ?callable(mixed):mixed $redact */
     private static function identifierProblem(
         string $field,

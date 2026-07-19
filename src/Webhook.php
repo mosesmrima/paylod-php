@@ -150,7 +150,7 @@ final class Webhook
         $type = (string) $event['type'];
 
         // THE ROOT IS REBUILT, NOT EDITED. See ROOT_KEYS.
-        $out = self::pick($event, self::ROOT_KEYS);
+        $out = self::pickTyped($event, self::ROOT_KEYS, self::ROOT_TYPES, 'event');
         $out['type'] = $type;
 
         // A non-payment event carries no payment claim, so there is nothing to derive FROM - and a
@@ -177,7 +177,7 @@ final class Webhook
         $decoded = $outcome->detail ?? self::synthesizeDecoded($outcome);
 
         // THE PAYMENT DATA IS REBUILT FROM THE ALLOWLIST, then the derived block is written on top.
-        $out['data'] = self::pick($data, self::PAYMENT_DATA_KEYS) + [
+        $out['data'] = self::pickTyped($data, self::PAYMENT_DATA_KEYS, self::PAYMENT_DATA_TYPES, 'data') + [
             'decoded' => $decoded,
             'retryable' => $outcome->retryable,
             'customerMessage' => $outcome->message,
@@ -196,6 +196,54 @@ final class Webhook
      * first field an attacker invents that is not on it survives.
      */
     private const ROOT_KEYS = ['type', 'created', 'id', 'apiVersion'];
+
+    /**
+     * THE TYPE OF EVERY ALLOWLISTED FIELD. An allowlist of NAMES is only half a schema.
+     *
+     * -- Why names were not enough ---------------------------------------------------------------
+     * `pick()` copied an allowlisted key's value verbatim, whatever it was. So a body could smuggle
+     * a payload-supplied CONCLUSION through the allowlist by hiding it inside an allowlisted name:
+     *
+     *     "applicationId": {"retryable": true}
+     *     "amount":        {"decoded": {"retryable": true}}
+     *
+     * Both names are on the allowlist, so both survived the rebuild - and a handler reading
+     * `$event['data']['amount']['decoded']['retryable']`, or merely iterating `data` looking for a
+     * retryable flag, is told a re-charge is safe by a field the SDK has just judged NON-retryable.
+     * That is the same double-charge generator the allowlist was introduced to close, walking
+     * through the allowlist's own front door.
+     *
+     * The rule that actually closes it: an allowlist must name what may exist AND what it may BE.
+     * Every field here is a documented scalar, and a wrong-typed one is not a field we can read - so
+     * the event is REFUSED, not silently pruned. Refusing is the fail-closed answer: a body we
+     * cannot read is a body we must not act on, and quietly dropping a malformed `status` or
+     * `resultCode` would hand the semantic model a record with the evidence removed.
+     *
+     * `string` / `int` / `number` / `scalar` are checked exactly; a NULL is always permitted,
+     * because an absent-but-present optional field is legitimate on every one of these.
+     */
+    private const ROOT_TYPES = [
+        'type' => 'string',
+        'created' => 'scalar',
+        'id' => 'string',
+        'apiVersion' => 'scalar',
+    ];
+
+    private const PAYMENT_DATA_TYPES = [
+        'paymentId' => 'string',
+        'applicationId' => 'string',
+        'env' => 'string',
+        'status' => 'string',
+        'amount' => 'number',
+        'phone' => 'string',
+        'accountRef' => 'string',
+        'mpesaReceipt' => 'string',
+        'checkoutRequestId' => 'string',
+        // The one field that is legitimately either. The strict-zero rule in DarajaCatalog reads
+        // its LEXEME, so both an int and its decimal string are meaningful here - and nothing else.
+        'resultCode' => 'code',
+        'resultDesc' => 'string',
+    ];
 
     /**
      * The ONLY `data` keys a verified PAYMENT event may carry, before the derived block is written.
@@ -243,6 +291,51 @@ final class Webhook
         }
 
         return $out;
+    }
+
+    /**
+     * {@see pick()}, with every allowlisted value checked against {@see ROOT_TYPES} /
+     * {@see PAYMENT_DATA_TYPES}. A wrong-typed field REFUSES the whole event.
+     *
+     * @param array<string,mixed> $source
+     * @param list<string> $keys
+     * @param array<string,string> $types
+     * @return array<string,mixed>
+     * @throws PaylodSignatureVerificationError
+     */
+    private static function pickTyped(array $source, array $keys, array $types, string $where): array
+    {
+        $out = [];
+        foreach ($keys as $key) {
+            if (!array_key_exists($key, $source)) {
+                continue;
+            }
+            $value = $source[$key];
+            if ($value !== null && !self::isOfType($value, $types[$key])) {
+                throw new PaylodSignatureVerificationError(
+                    'invalid_payload',
+                    "Webhook body is signed correctly but {$where}.{$key} is a "
+                    . get_debug_type($value) . ', not the ' . $types[$key] . ' the schema defines. '
+                    . 'A structured value in a scalar field is how a payload-supplied conclusion '
+                    . '(a `retryable` flag, a forged `decoded` block) gets carried past a '
+                    . 'name-only allowlist, so the event is refused rather than forwarded.'
+                );
+            }
+            $out[$key] = $value;
+        }
+
+        return $out;
+    }
+
+    private static function isOfType(mixed $value, string $type): bool
+    {
+        return match ($type) {
+            'string' => is_string($value),
+            'int' => is_int($value),
+            'number' => is_int($value) || is_float($value),
+            'code' => is_int($value) || is_string($value),
+            'scalar' => is_scalar($value),
+        };
     }
 
     /**

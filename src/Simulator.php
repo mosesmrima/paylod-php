@@ -121,7 +121,7 @@ final class Simulator
      * Create a real, pending, sandbox payment. No phone rings.
      *
      * @param array{phone?:string,amount?:int,accountReference?:string,description?:string,metadata?:array<string,mixed>,idempotencyKey?:string} $params
-     * @return array{paymentId:string,status:string,checkoutRequestId:string,outcomes:array<int,mixed>}
+     * @return array{paymentId:string,status:string,checkoutRequestId:string,outcomes:array<int,mixed>,idempotencyKey:string}
      */
     public function collect(array $params = []): array
     {
@@ -235,6 +235,11 @@ final class Simulator
             // legal outcomes and they are compiled into this class, so anything else is noise at
             // best and a credential at worst.
             'outcomes' => self::allowlistedOutcomes($ack['outcomes'] ?? []),
+            // THE EFFECTIVE KEY IS RETURNED, exactly as Paylod::collect() returns it. Without it a
+            // caller who relied on the (opt-in) generated key had no way to learn what it was, so a
+            // later failure could not be retried under the same key - and pay() could not rebind the
+            // attempt's key onto a settlement failure.
+            'idempotencyKey' => $idempotencyKey,
         ];
     }
 
@@ -292,7 +297,13 @@ final class Simulator
 
         $redact = $this->redactor();
 
-        $ack = ($this->request)([
+        // THE SETTLEMENT IS INSIDE A RECOVERY SCOPE. outcome() - and therefore pay() - used to
+        // dispatch this bare, so a settlement transport failure after the payment was already
+        // acknowledged returned an exception with BOTH `idempotencyKey` and `paymentId` null. The
+        // caller was told nothing about which payment was in flight or which key would replay the
+        // operation, on the one surface whose whole purpose is to teach the production reflexes.
+        try {
+            $ack = ($this->request)([
             'method' => 'POST',
             'path' => '/simulate/outcome',
             'body' => ['paymentId' => $paymentId, 'outcome' => $outcome],
@@ -309,7 +320,32 @@ final class Simulator
             'validate' => static function (#[\SensitiveParameter] array $parsed, int $status) use ($paymentId, $redact): void {
                 Validate::paymentBody(self::normalizeSettleAck($parsed), $status, $redact, $paymentId);
             },
-        ]);
+            ]);
+        } catch (\Throwable $e) {
+            // BOTH IDENTIFIERS ARE BOUND. The deterministic settlement key replays the operation;
+            // the payment id says WHICH payment is in an unknown state. `$paymentId` is known to be
+            // usable here - it was put through Validate::idempotencyKey() as part of the derived key
+            // above, before any request was made.
+            if ($e instanceof \Paylod\Exceptions\PaylodException) {
+                $e->bindToAcknowledgedPayment($idempotencyKey, $paymentId);
+
+                throw $e;
+            }
+
+            $wrapped = new PaylodApiError(
+                'simulate.outcome() failed with an unexpected error: '
+                . (string) $redact($e->getMessage()) . ' - the simulated settlement state is '
+                . 'INDETERMINATE. Read the payment before starting any new attempt; do NOT mint a '
+                . 'fresh key.',
+                0,
+                null,
+                $idempotencyKey,
+                true,
+            );
+            $wrapped->bindToAcknowledgedPayment($idempotencyKey, $paymentId);
+
+            throw $wrapped;
+        }
 
         $payment = self::normalizeSettleAck($ack);
 
@@ -347,7 +383,18 @@ final class Simulator
         unset($params['outcome']);
         $created = $this->collect($params);
 
-        return $this->outcome($created['paymentId'], $outcome);
+        // THE ACKNOWLEDGED PAYMENT AND THE ORIGINAL ATTEMPT KEY SURVIVE A SETTLEMENT FAILURE.
+        // collect() has already created a payment by this line, so an exception escaping the settle
+        // leaves a real pending payment behind. outcome() binds the payment id and its own
+        // deterministic settlement key; this rebinds the key the ATTEMPT was made under, which is
+        // the one the caller persisted and the only one that replays the collect safely.
+        try {
+            return $this->outcome($created['paymentId'], $outcome);
+        } catch (\Paylod\Exceptions\PaylodException $e) {
+            $e->bindToAcknowledgedPayment($created['idempotencyKey'], $created['paymentId']);
+
+            throw $e;
+        }
     }
 
     /**

@@ -178,6 +178,9 @@ final class Semantics
      */
     public const RECEIPT_RE = '/^[A-Z0-9]{10}\z/';
 
+    /** The `status` strings we know are all short words; anything longer is not a status. */
+    private const MAX_CLAIM_BYTES = 64;
+
     /**
      * A receipt counts only if it MATCHES THE GRAMMAR ABOVE.
      *
@@ -311,8 +314,17 @@ final class Semantics
     {
         $evidence = self::evidenceFor($payment);
         $claim = self::claimFor($payment);
+        // `claimed` IS SERVER TEXT AND IT IS A PUBLIC FIELD. Found by the round-9 adversarial sweep:
+        // this was a verbatim copy of `status`, and `Judgement` is json_encode()d, printed and
+        // logged - so a gateway echoing the Authorization header into `status` put a live key into
+        // all of those. Shape-scrubbed (this is a static context with no process secrets, so the
+        // credential SHAPES are what it can catch) and bounded, because an unrecognised status is
+        // not a value we display for its content anyway.
         $rawClaim = $payment['status'] ?? null;
-        $claimed = is_string($rawClaim) ? $rawClaim : '';
+        $claimed = is_string($rawClaim) ? Redact::text($rawClaim, []) : '';
+        if (strlen($claimed) > self::MAX_CLAIM_BYTES) {
+            $claimed = substr($claimed, 0, self::MAX_CLAIM_BYTES) . '...';
+        }
 
         [$verdict, $reason] = self::cell($claim, $evidence);
 
