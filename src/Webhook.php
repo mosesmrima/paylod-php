@@ -81,6 +81,16 @@ final class Webhook
     public const MAX_BODY_BYTES = 1048576;
 
     /**
+     * The pre-authentication ceilings on the SIGNATURE HEADER: bytes, and comma-separated segments.
+     *
+     * The body had a ceiling; the header did not, and it is parsed on the same unauthenticated
+     * surface, before the HMAC. Both are checked before `explode()` ever runs.
+     */
+    public const MAX_SIGNATURE_HEADER_BYTES = 512;
+
+    public const MAX_SIGNATURE_HEADER_SEGMENTS = 8;
+
+    /**
      * Verify a paylod webhook and return the typed event as an associative array.
      *
      * Throws {@see PaylodSignatureVerificationError} on any failure - never returns a half-trusted
@@ -91,7 +101,7 @@ final class Webhook
      * @throws PaylodSignatureVerificationError
      */
     public static function verify(
-        string|\Stringable $payload,
+        #[\SensitiveParameter] string|\Stringable $payload,
         ?string $signature,
         #[\SensitiveParameter] string $secret,
         int|float $toleranceSec = self::DEFAULT_TOLERANCE_SEC,
@@ -138,12 +148,19 @@ final class Webhook
         $data = $event['data'];
         $type = (string) $event['type'];
 
+        // THE ROOT IS REBUILT, NOT EDITED. See ROOT_KEYS.
+        $out = self::pick($event, self::ROOT_KEYS);
+        $out['type'] = $type;
+
         // A non-payment event carries no payment claim, so there is nothing to derive FROM - and a
-        // derived-looking field on it is therefore unverifiable by construction. Strip rather than
-        // forward: an unknown event type is for forward compatibility, and a future field must not
-        // be able to smuggle a retryability claim through a version that cannot check it.
+        // derived-looking field on it is therefore unverifiable by construction. It is represented
+        // MINIMALLY: the envelope, plus the scalar members of `data` and nothing else. An unknown
+        // type exists for forward compatibility, and forward compatibility must not be a channel
+        // through which a version that cannot check a claim still forwards one.
         if (!isset(self::PAYMENT_EVENT_STATUS[$type])) {
-            return self::stripDerived($event);
+            $out['data'] = self::scalarsOnly($data);
+
+            return $out;
         }
 
         $outcome = PaymentOutcome::fromPayment([
@@ -158,44 +175,102 @@ final class Webhook
         // locally-derived block.
         $decoded = $outcome->detail ?? self::synthesizeDecoded($outcome);
 
-        $event = self::stripDerived($event);
-        /** @var array<string,mixed> $data */
-        $data = $event['data'];
+        // THE PAYMENT DATA IS REBUILT FROM THE ALLOWLIST, then the derived block is written on top.
+        $out['data'] = self::pick($data, self::PAYMENT_DATA_KEYS) + [
+            'decoded' => $decoded,
+            'retryable' => $outcome->retryable,
+            'customerMessage' => $outcome->message,
+            'category' => $decoded['category'],
+        ];
 
-        $data['decoded'] = $decoded;
-        $data['retryable'] = $outcome->retryable;
-        $data['customerMessage'] = $outcome->message;
-        $data['category'] = $decoded['category'];
-        $event['data'] = $data;
-
-        return $event;
+        return $out;
     }
-
-    /** The derived keys, at both levels. Names are shared with the sibling SDKs. */
-    private const DERIVED_KEYS = ['decoded', 'retryable', 'customerMessage', 'category'];
 
     /**
-     * Remove every derived field from the root AND from `data`, so nothing server-supplied survives
-     * into the value a handler reads.
+     * The ONLY root-level keys a verified event may carry.
      *
-     * @param array<string,mixed> $event
+     * Everything else - `retryable`, `decoded`, `category`, an invented `safeToRetry`, a whole
+     * nested object - is dropped. Stripping a known-bad LIST was the previous approach and it is
+     * the wrong shape of rule: it is a denylist, it has to be kept complete forever, and the very
+     * first field an attacker invents that is not on it survives.
+     */
+    private const ROOT_KEYS = ['type', 'created', 'id', 'apiVersion'];
+
+    /**
+     * The ONLY `data` keys a verified PAYMENT event may carry, before the derived block is written.
+     *
+     * -- Why an allowlist and not a strip ----------------------------------------------------------
+     * The derived fields were removed by name at both levels, and everything else in `data` was
+     * forwarded verbatim. So `data.details.retryable = true`, `data.extra.retryable = true`, or any
+     * other nesting depth carried a retryability claim straight to a handler, on an event the SDK
+     * had just judged NON-retryable. A handler reading `$event['data']['details']['retryable']` -
+     * which is exactly the shape a "read the detail object" instinct produces - is told another
+     * charge is safe by a field nothing verified. That is a double-charge generator that survives
+     * every check we have, because none of them look at fields we never named.
+     *
+     * The only rule that holds is the one that names what MAY exist. Anything not on this list does
+     * not reach the handler, whatever it is called and however deeply it is buried.
+     */
+    private const PAYMENT_DATA_KEYS = [
+        'paymentId',
+        'applicationId',
+        'env',
+        'status',
+        'amount',
+        'phone',
+        'accountRef',
+        'mpesaReceipt',
+        'checkoutRequestId',
+        'resultCode',
+        'resultDesc',
+    ];
+
+    /**
+     * A fresh array carrying only `$keys` that are actually present, in allowlist order.
+     *
+     * @param array<string,mixed> $source
+     * @param list<string> $keys
      * @return array<string,mixed>
      */
-    private static function stripDerived(array $event): array
+    private static function pick(array $source, array $keys): array
     {
-        foreach (self::DERIVED_KEYS as $key) {
-            unset($event[$key]);
-        }
-        if (isset($event['data']) && is_array($event['data'])) {
-            $data = $event['data'];
-            foreach (self::DERIVED_KEYS as $key) {
-                unset($data[$key]);
+        $out = [];
+        foreach ($keys as $key) {
+            if (array_key_exists($key, $source)) {
+                $out[$key] = $source[$key];
             }
-            $event['data'] = $data;
         }
 
-        return $event;
+        return $out;
     }
+
+    /**
+     * The SCALAR members of an unknown event's `data`, with any derived-looking name removed.
+     *
+     * Scalars only, because a nested structure is where an unverifiable claim hides and there is no
+     * schema here against which to judge one. Derived names are dropped even as scalars: an unknown
+     * type is precisely the case in which the SDK cannot re-derive them.
+     *
+     * @param array<string,mixed> $data
+     * @return array<string,mixed>
+     */
+    private static function scalarsOnly(array $data): array
+    {
+        $out = [];
+        foreach ($data as $key => $value) {
+            if (in_array($key, self::DERIVED_KEYS, true)) {
+                continue;
+            }
+            if ($value === null || is_scalar($value)) {
+                $out[$key] = $value;
+            }
+        }
+
+        return $out;
+    }
+
+    /** The derived keys. Names are shared with the sibling SDKs. */
+    private const DERIVED_KEYS = ['decoded', 'retryable', 'customerMessage', 'category'];
 
     /**
      * A decoded block for a record that carries no result code. It exists so `decoded` is never
@@ -259,7 +334,7 @@ final class Webhook
      * @throws PaylodSignatureVerificationError
      */
     public static function verifySignature(
-        string|\Stringable $payload,
+        #[\SensitiveParameter] string|\Stringable $payload,
         ?string $signature,
         #[\SensitiveParameter] string $secret,
         int|float $toleranceSec = self::DEFAULT_TOLERANCE_SEC,
@@ -288,13 +363,37 @@ final class Webhook
      * @throws PaylodSignatureVerificationError
      */
     private static function parseSignedEnvelope(
-        string|\Stringable $payload,
+        #[\SensitiveParameter] string|\Stringable $payload,
         ?string $signature,
         #[\SensitiveParameter] string $secret,
         int|float $toleranceSec = self::DEFAULT_TOLERANCE_SEC,
         int|float|null $nowSec = null,
     ): array {
-        $raw = (string) $payload;
+        // THE BYTES MUST ALREADY BE BOUNDED WHEN THEY GET HERE.
+        //
+        // The ceiling below is checked on `strlen($raw)` - which is AFTER `(string) $payload` has
+        // already materialised a `\Stringable` in full. For a PSR-7 stream wrapper that is the
+        // entire attack: a network-sized body is pulled into memory, unauthenticated, and only then
+        // measured. The SDK cannot bound a foreign `__toString()`; there is no hook, no partial
+        // read, no way to stop halfway.
+        //
+        // So it does not pretend to. A non-string payload is REFUSED, with an error that says what
+        // to pass instead. The caller's framework already read the body under its own limit
+        // (`post_max_size`, `client_max_body_size`, a bounded stream read) - handing this method the
+        // resulting string is both trivial and the only version of this that is actually bounded.
+        if (!is_string($payload)) {
+            throw new PaylodSignatureVerificationError(
+                'invalid_payload',
+                'Webhook verification needs the raw body as a STRING. A Stringable/stream payload '
+                . 'would have to be materialised in full before its size could be checked, and this '
+                . 'endpoint is unauthenticated - so that read is the denial of service, not the '
+                . 'defence against it. Read the body yourself under your framework\'s own limit and '
+                . 'pass the string: Webhook::verify((string) $request->getBody(), ...) is only safe '
+                . 'when you have already bounded that read.'
+            );
+        }
+
+        $raw = $payload;
 
         // THE CEILING, FIRST. Before the tolerance, before the secret, before the header parse and
         // above all before the HMAC and the JSON parser - the three things an attacker would be
@@ -327,6 +426,26 @@ final class Webhook
             throw new PaylodSignatureVerificationError(
                 'missing_signature',
                 'Missing ' . self::SIGNATURE_HEADER . ' header.'
+            );
+        }
+
+        // THE SIGNATURE HEADER IS BOUNDED TOO, before it is split. `explode(',', ...)` on an
+        // attacker-supplied header is unbounded work on an unauthenticated surface: a megabyte of
+        // commas is a million-element array built to conclude "malformed". A real header is
+        // `t=<10 digits>,v1=<64 hex>` - about 80 bytes and two segments.
+        $sigBytes = strlen($signature);
+        if ($sigBytes > self::MAX_SIGNATURE_HEADER_BYTES) {
+            throw new PaylodSignatureVerificationError(
+                'malformed_signature',
+                "Signature header is {$sigBytes} bytes, which exceeds the "
+                . self::MAX_SIGNATURE_HEADER_BYTES . '-byte limit. A real header is around 80 bytes.'
+            );
+        }
+        if (substr_count($signature, ',') + 1 > self::MAX_SIGNATURE_HEADER_SEGMENTS) {
+            throw new PaylodSignatureVerificationError(
+                'malformed_signature',
+                'Signature header has more than ' . self::MAX_SIGNATURE_HEADER_SEGMENTS
+                . ' comma-separated segments. A real header has two.'
             );
         }
 
@@ -414,8 +533,13 @@ final class Webhook
         // is a static method with no process secrets - which is precisely the layer that catches a
         // reflected bearer token. Result codes are integers and are untouched, so nothing the
         // semantic model reads as EVIDENCE can be altered by this.
+        // The EXACT secret this call was given is passed in, not just the shape rules. A signed
+        // event that echoes the webhook secret back - a debug endpoint, a misconfigured relay, a
+        // body built from the request that carried it - would otherwise be handed to the handler
+        // verbatim, and `whsec_` shape matching only catches it when it is spelled the way we
+        // expect. The one secret we can name, we name.
         /** @var array<string,mixed> $scrubbed */
-        $scrubbed = Redact::apply($event, []);
+        $scrubbed = Redact::apply($event, [$secret]);
 
         return $scrubbed;
     }
@@ -534,7 +658,7 @@ final class Webhook
      * want the decoded event (and a typed error explaining *why* it failed).
      */
     public static function isValid(
-        string|\Stringable $payload,
+        #[\SensitiveParameter] string|\Stringable $payload,
         ?string $signature,
         #[\SensitiveParameter] string $secret,
         int|float $toleranceSec = self::DEFAULT_TOLERANCE_SEC,
@@ -559,7 +683,7 @@ final class Webhook
      * @internal pins the signing scheme; not part of the supported event-handling surface.
      */
     public static function isValidSignatureOnlyNotActionable(
-        string|\Stringable $payload,
+        #[\SensitiveParameter] string|\Stringable $payload,
         ?string $signature,
         #[\SensitiveParameter] string $secret,
         int|float $toleranceSec = self::DEFAULT_TOLERANCE_SEC,
@@ -577,7 +701,11 @@ final class Webhook
      * Sign a payload the way the paylod webhook worker does. Exported so you can build realistic
      * fixtures in your own tests - you never need this in production code.
      */
-    public static function sign(string|\Stringable $payload, #[\SensitiveParameter] string $secret, ?int $timestampSec = null): string
+    public static function sign(
+        #[\SensitiveParameter] string|\Stringable $payload,
+        #[\SensitiveParameter] string $secret,
+        ?int $timestampSec = null,
+    ): string
     {
         $t = $timestampSec ?? time();
         $v1 = hash_hmac('sha256', $t . '.' . (string) $payload, $secret);

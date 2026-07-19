@@ -987,9 +987,20 @@ final class Paylod
      * So the original is DROPPED and a sanitized surrogate takes its place: the original's class
      * name and its redacted message, and nothing else. The diagnostic value - what kind of thing
      * went wrong, and where - survives; the secret does not travel with it.
+     *
+     * -- And why BOTH parameters are #[\SensitiveParameter] ---------------------------------------
+     * Dropping the original from the `previous` chain was not enough. With
+     * `zend.exception_ignore_args=0` (the development default) PHP records CALL ARGUMENTS in every
+     * stack frame, and the surrogate's OWN trace contains this very frame - so the discarded
+     * throwable, complete with its original message, its own trace and its Authorization header, was
+     * handed straight back through `$surrogate->getTrace()`. The redactor is bound to the client, so
+     * a trace renderer that walks its bound scope reaches the API key through it. Marking both
+     * replaces them with the string "Object(SensitiveParameterValue)" in every recorded frame.
      */
-    private static function sanitizedCause(\Throwable $e, \Closure $redact): \Throwable
-    {
+    private static function sanitizedCause(
+        #[\SensitiveParameter] \Throwable $e,
+        #[\SensitiveParameter] \Closure $redact,
+    ): \Throwable {
         return new PaylodConnectionError(
             'sanitized cause: ' . $e::class . ': ' . (string) $redact($e->getMessage())
             . ' (the original throwable is deliberately NOT chained - its message, its trace and '

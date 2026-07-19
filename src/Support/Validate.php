@@ -134,6 +134,13 @@ final class Validate
         if ($problem === null) {
             return;
         }
+        // THE FINISHED DIAGNOSTIC, THROUGH THE REDACTOR. Every branch above quotes some part of a
+        // SERVER-CONTROLLED body back at the reader - `status` via json_encode, a mismatched id, a
+        // status string. Redacting each site individually is a list nobody will keep complete, and
+        // one missed branch puts an echoed bearer token or webhook secret into an exception message
+        // and from there into the application's error log. So the whole string is scrubbed once,
+        // here, where no future branch can be added downstream of it.
+        $problem = $redact === null ? $problem : (string) $redact($problem);
 
         throw new PaylodApiError(
             "paylod returned a {$status} whose body is not a valid acknowledgement ({$problem}) - the "
@@ -183,6 +190,8 @@ final class Validate
         if ($problem === null) {
             return;
         }
+        // The same single scrub the acknowledgement path applies - see collectAck().
+        $problem = $redact === null ? $problem : (string) $redact($problem);
 
         throw new PaylodApiError(
             "paylod returned a {$status} status body that is not a valid payment ({$problem}). The "

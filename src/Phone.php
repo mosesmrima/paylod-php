@@ -18,8 +18,15 @@ use Paylod\Exceptions\PaylodInvalidRequestError;
  */
 final class Phone
 {
-    /** Validates RAW user input in any accepted Kenyan form (before normalization). */
-    public const INPUT_RE = '/^(?:\+?254|0)?[17]\d{8}$/';
+    /**
+     * Validates RAW user input in any accepted Kenyan form (before normalization).
+     *
+     * `\z`, NOT `$`. PCRE's `$` matches before a trailing newline, so `"0712345678\n"` satisfied a
+     * money-path validator that is supposed to define an exact grammar. `isValid()` happens to trim
+     * first, but this constant is PUBLIC - anything applying it directly inherited the hole - and a
+     * validator whose safety depends on a caller normalising first is not a validator.
+     */
+    public const INPUT_RE = '/^(?:\+?254|0)?[17]\d{8}\z/';
 
     /** True if `$input` is an acceptable Kenyan MSISDN form. Does not throw. */
     public static function isValid(string $input): bool

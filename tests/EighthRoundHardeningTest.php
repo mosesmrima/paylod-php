@@ -234,6 +234,256 @@ final class EighthRoundHardeningTest extends TestCase
         }
     }
 
+    // == The verified event is REBUILT from an allowlist ==========================================
+
+    /**
+     * @param array<string,mixed> $data
+     * @param array<string,mixed> $extraRoot
+     * @return array<string,mixed>
+     */
+    private function verifiedEvent(array $data, array $extraRoot = [], string $type = 'payment.failed'): array
+    {
+        $now = 1700000000;
+        $raw = json_encode($extraRoot + [
+            'type' => $type,
+            'created' => $now,
+            'data' => $data,
+        ], JSON_THROW_ON_ERROR);
+
+        return Webhook::verify($raw, Webhook::sign($raw, self::SECRET, $now), self::SECRET, 300, $now);
+    }
+
+    /**
+     * A NON-retryable failure carrying forged retryability claims at every depth an instinctive
+     * handler might read. Every one of them must be gone: result code 17 is a terminal M-Pesa
+     * system error, and a `true` on any of these fields tells the caller to charge again.
+     *
+     * nv:r8-webhook-data-allowlist
+     */
+    public function testNestedRetryabilityClaimsDoNotSurviveVerification(): void
+    {
+        $event = $this->verifiedEvent([
+            'paymentId' => 'pay_123',
+            'status' => 'failed',
+            'mpesaReceipt' => null,
+            'resultCode' => 17,
+            'resultDesc' => 'system error',
+            // Every one of these was forwarded verbatim before the allowlist.
+            'details' => ['retryable' => true],
+            'extra' => ['retryable' => true, 'deep' => ['retryable' => true]],
+            'decoded' => ['retryable' => true, 'category' => 'network'],
+            'retryable' => true,
+            'safeToRetry' => true,
+            'meta' => ['anything' => 'at all'],
+        ], ['retryable' => true, 'decoded' => ['retryable' => true]]);
+
+        $this->assertFalse($event['data']['retryable']);
+        $this->assertFalse($event['data']['decoded']['retryable']);
+        $this->assertArrayNotHasKey('retryable', $event);
+        $this->assertArrayNotHasKey('decoded', $event);
+
+        foreach (['details', 'extra', 'safeToRetry', 'meta'] as $key) {
+            $this->assertArrayNotHasKey($key, $event['data'], $key);
+        }
+
+        // And nothing anywhere in the returned graph still claims retryability.
+        $this->assertStringNotContainsString('"retryable":true', json_encode($event));
+    }
+
+    /**
+     * The allowlist is a list of what MAY exist, so an invented field is gone whatever it is called.
+     *
+     * nv:r8-webhook-root-allowlist
+     */
+    public function testArbitraryRootAndDataFieldsAreDropped(): void
+    {
+        $event = $this->verifiedEvent([
+            'paymentId' => 'pay_123',
+            'status' => 'success',
+            'mpesaReceipt' => 'SFF6XYZ123',
+            'resultCode' => 0,
+            'resultDesc' => 'ok',
+            'somethingNobodyNamed' => 'x',
+            'nested' => ['a' => ['b' => 'c']],
+        ], ['rootJunk' => 'x', 'alsoJunk' => ['deep' => true]], 'payment.success');
+
+        $this->assertSame(['type', 'created', 'data'], array_keys($event));
+        $this->assertArrayNotHasKey('somethingNobodyNamed', $event['data']);
+        $this->assertArrayNotHasKey('nested', $event['data']);
+
+        // The legitimate payload survives intact.
+        $this->assertSame('pay_123', $event['data']['paymentId']);
+        $this->assertSame('SFF6XYZ123', $event['data']['mpesaReceipt']);
+        $this->assertTrue($event['data']['decoded']['retryable'] === false);
+    }
+
+    /**
+     * An UNKNOWN event type is forward-compatible, but forward compatibility must not be a channel
+     * for an unverifiable claim: nested structures and derived names are both gone.
+     *
+     * nv:r8-webhook-unknown-type
+     */
+    public function testAnUnknownEventTypeIsRepresentedMinimally(): void
+    {
+        $event = $this->verifiedEvent([
+            'payoutId' => 'po_1',
+            'amount' => 100,
+            'details' => ['retryable' => true],
+            'retryable' => true,
+            'decoded' => ['retryable' => true],
+        ], [], 'payout.something.new');
+
+        $this->assertSame('payout.something.new', $event['type']);
+        $this->assertSame(['payoutId' => 'po_1', 'amount' => 100], $event['data']);
+        $this->assertArrayNotHasKey('retryable', $event);
+    }
+
+    // == Diagnostics, secrets and bounds ==========================================================
+
+    /**
+     * A malformed 2xx quotes the offending value back at the reader. When a gateway echoes the
+     * bearer token into that value, the diagnostic put a live key into the exception message and
+     * from there into the application's error log.
+     *
+     * nv:r8-diagnostic-redaction
+     */
+    public function testMalformedBodyDiagnosticsAreRedacted(): void
+    {
+        $key = 'mp_test_supersecretkey';
+
+        // (a) the acknowledgement path: `status` is quoted verbatim.
+        $paylod = new Paylod($key, [
+            'httpClient' => new MockHttpClient([['status' => 202, 'json' => [
+                'paymentId' => 'pay_123',
+                'checkoutRequestId' => 'ws_CO_1',
+                'status' => $key,
+            ]]]),
+            'allowCustomHttpClient' => true,
+        ]);
+
+        try {
+            $paylod->collect(['amount' => 100, 'phone' => '0712345678', 'idempotencyKey' => 'k-1']);
+            $this->fail('expected a malformed-ack error');
+        } catch (PaylodApiError $e) {
+            $this->assertStringNotContainsString('supersecretkey', $e->getMessage());
+        }
+
+        // (b) the status path: an unknown `status` string is quoted verbatim.
+        $paylod = new Paylod($key, [
+            'httpClient' => new MockHttpClient([['status' => 200, 'json' => [
+                'id' => 'pay_123',
+                'status' => $key,
+                'mpesaReceipt' => null,
+                'resultCode' => null,
+                'resultDesc' => null,
+            ]]]),
+            'allowCustomHttpClient' => true,
+        ]);
+
+        try {
+            $paylod->status('pay_123');
+            $this->fail('expected a malformed-payment error');
+        } catch (PaylodApiError $e) {
+            $this->assertStringNotContainsString('supersecretkey', $e->getMessage());
+        }
+    }
+
+    /**
+     * A correctly-signed event that echoes the WEBHOOK SECRET back must not hand it to the handler.
+     *
+     * nv:r8-webhook-secret-redaction
+     */
+    public function testTheSuppliedWebhookSecretIsRedactedOutOfTheDecodedEvent(): void
+    {
+        $secret = 'a-secret-that-is-not-credential-shaped';
+        $now = 1700000000;
+        $raw = json_encode([
+            'type' => 'payment.failed',
+            'created' => $now,
+            'data' => [
+                'paymentId' => 'pay_123',
+                'status' => 'failed',
+                'resultCode' => 1032,
+                'resultDesc' => 'echoed: ' . $secret,
+            ],
+        ], JSON_THROW_ON_ERROR);
+
+        $event = Webhook::verify($raw, Webhook::sign($raw, $secret, $now), $secret, 300, $now);
+
+        $this->assertStringNotContainsString($secret, json_encode($event));
+    }
+
+    /**
+     * The body ceiling is checked on `strlen()` AFTER `(string) $payload` has already materialised a
+     * Stringable in full - so on an unauthenticated endpoint the read IS the denial of service. A
+     * non-string payload is refused rather than measured.
+     *
+     * nv:r8-webhook-stringable-refused
+     */
+    public function testANonStringPayloadIsRefusedRatherThanMaterialised(): void
+    {
+        $materialised = false;
+        $payload = new class ($materialised) implements \Stringable {
+            public function __construct(private bool &$flag)
+            {
+            }
+
+            public function __toString(): string
+            {
+                $this->flag = true;
+
+                return '{"type":"payment.success","created":1,"data":{}}';
+            }
+        };
+
+        try {
+            Webhook::verify($payload, 't=1,v1=' . str_repeat('a', 64), self::SECRET, 300, 1);
+            $this->fail('a Stringable payload was accepted');
+        } catch (PaylodSignatureVerificationError $e) {
+            $this->assertSame('invalid_payload', $e->reason);
+        }
+
+        $this->assertFalse($materialised, '__toString() ran before the payload was refused');
+    }
+
+    /**
+     * The signature header was exploded without any ceiling: a megabyte of commas is a million-entry
+     * array built, unauthenticated, to conclude "malformed".
+     *
+     * nv:r8-signature-header-bounds
+     */
+    public function testTheSignatureHeaderIsBoundedBeforeItIsParsed(): void
+    {
+        $raw = '{"type":"payment.success","created":1,"data":{}}';
+
+        try {
+            Webhook::verify($raw, str_repeat(',', 200000), self::SECRET, 300, 1);
+            $this->fail('an oversized signature header was parsed');
+        } catch (PaylodSignatureVerificationError $e) {
+            $this->assertSame('malformed_signature', $e->reason);
+        }
+
+        // Short but with too many segments: bounded on segment count, not only on bytes.
+        try {
+            Webhook::verify($raw, str_repeat('a=b,', 50), self::SECRET, 300, 1);
+            $this->fail('a many-segment signature header was parsed');
+        } catch (PaylodSignatureVerificationError $e) {
+            $this->assertSame('malformed_signature', $e->reason);
+        }
+    }
+
+    /**
+     * PCRE's `$` matches before a trailing newline, so a money-path validator accepted
+     * `"0712345678\n"`.
+     *
+     * nv:r8-phone-anchor
+     */
+    public function testAPhoneWithATrailingNewlineIsNotValid(): void
+    {
+        $this->assertSame(1, preg_match(\Paylod\Phone::INPUT_RE, '0712345678'));
+        $this->assertSame(0, preg_match(\Paylod\Phone::INPUT_RE, "0712345678\n"));
+    }
+
     /** A genuine signed settlement still verifies - the guard must not break real webhooks. */
     public function testAGenuineSignedSettlementStillVerifies(): void
     {
