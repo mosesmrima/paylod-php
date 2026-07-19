@@ -6,6 +6,111 @@ All notable changes to `paylod/paylod` are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-19
+
+**Breaking.** A ninth independent review - the first complete one since round 8 - found ONE
+CRITICAL, six highs, two mediums and three lows. Every protection below is verified NON-VACUOUS by
+`scripts/non-vacuity.php`: **81/81 mutations caught** (up from 68/68). The golden webhook vector
+still signs byte-for-byte identically.
+
+The theme of this round is COMPOSITION. Every previous round found rules that were wrong. This one
+found rules that were each right and wrong *together*:
+
+> `Redact` rewrote an echoed credential to `[redacted]`, which is correct sanitisation.
+> `Semantics::hasReceipt()` accepted any non-blank string as an M-Pesa receipt, which was locally
+> defensible. Composed, **redacting a credential turned it into proof of payment**: `[redacted]` is
+> non-blank, so it passed as a valid receipt, and a `status: "success"` record with no result code
+> returned `paid = true`. The same held for a `payment.success` webhook.
+
+Neither component was wrong on its own. They disagreed about what the placeholder MEANS, and the
+money path sat in the gap.
+
+### The rules that came out of it
+
+- **Evidence needs a positive grammar, not a non-emptiness test.** `Semantics::RECEIPT_RE` is
+  derived from the receipts this repository actually carries (`SFF6XYZ123` - ten bytes, uppercase
+  letters and digits), not invented. Anything that does not match is not evidence.
+- **A redaction marker satisfies no evidence, identifier or correlation check anywhere.** Audited
+  across receipts, `paymentId`, `checkoutRequestId`, payment `id` and idempotency keys, with a
+  permanent test that walks every one of them.
+- **Refuse rather than redact on the money path.** A correctly-signed body echoing your webhook
+  secret or API key is now REFUSED (`PaylodCredentialCompromiseError`), not sanitised and delivered.
+  Redaction stays where it belongs: diagnostics. The other three SDKs made the same call.
+- **Validate the form, then classify.** Twice more, in the description path.
+
+### Fixed - Critical
+
+- **Forged success through the redactor** (`Semantics.php`). See above. Receipt evidence is now
+  validated against the derived grammar before anything else looks at it.
+
+### Fixed - High
+
+- **`500.*` description overload ran before code validation** (`DarajaCatalog.php`). `500.0`,
+  `500.x` and `"500.001.1001\n"` became terminal failure evidence whenever the server-controlled
+  description contained a phrase like "insufficient funds". The code's form is now settled first,
+  and the overload branch is pinned to the exact documented code `500.001.1001`.
+- **An unknown code was terminal failure evidence** (`DarajaCatalog.php`). Every canonically shaped
+  positive integer classified as `failed`, catalogued or not - so `87654` made a claimed failure
+  terminal and let a `payment.failed` webhook through as settled, while the decoder called the same
+  code unprovable. Terminal now requires a catalog entry; an uncatalogued code is the new `unknown`
+  outcome, mapping to `Semantics::EVIDENCE_UNKNOWN` with its own five table rows, all
+  INDETERMINATE. **The verdict table is now 5 claims x 6 evidence kinds = 30 cells**, still with no
+  default arm.
+- **The webhook allowlist checked names but not TYPES** (`Webhook.php`). `applicationId:
+  {"retryable":true}` and `amount: {"decoded":{"retryable":true}}` carried payload-supplied retry
+  conclusions past the allowlist. Every allowlisted field now has a declared scalar type, and a
+  wrong-typed one refuses the event rather than being pruned.
+- **The client webhook wrappers leaked the raw body into traces** (`Paylod.php`). Both wrappers now
+  mark the raw body and signature header `#[\SensitiveParameter]`, and `parseWebhook()` re-applies
+  the client's exact credentials.
+- **`decodeError()` did not redact** (`DarajaCatalog.php`, `Paylod.php`). An unknown code's raw
+  `resultDesc` was copied into `cause` verbatim and reached `json_encode`, logs and dumps. Now
+  shape-scrubbed in the catalog and exact-scrubbed on the client, with both raw descriptions marked
+  sensitive.
+- **A malformed 202 lost its payment id** (`Paylod.php`). Failure handling attached only the
+  idempotency key, so an acknowledgement carrying a perfectly usable `paymentId` threw with
+  `$exception->paymentId` null - on the exact path whose message says "go and read the payment".
+  The id is now captured inside the validator, before validation can throw and before `$ack` is
+  assigned, so an interrupt has the same coverage.
+
+### Fixed - Medium
+
+- **`PaymentOutcome` had an implicit fallback** - every verdict not matched by the first three
+  branches rendered as terminal failure. Now an exhaustive `match` over all four verdicts with no
+  default arm.
+- **`Simulator::outcome()` and `pay()` bound no failure context** - a settlement failure after the
+  payment was acknowledged returned an exception with both identifiers null. Both are now bound;
+  `Simulator::collect()` also returns its effective idempotency key, as `Paylod::collect()` does.
+
+### Fixed - Low
+
+- The "unknown code is indeterminate" test asserted only decoder category and retryability; it now
+  asserts the classifier, the semantic verdict, the rendered outcome and the webhook refusal.
+- The scanner/parser divergence test never reached the fail-closed branch. A test-only scanner depth
+  seam makes the divergence reachable, and the branch is now mutation-tested.
+- **The non-vacuity harness is part of `composer test`.** While it was a separate command, ordinary
+  CI could report success without ever exercising it.
+
+### Found by the new adversarial sweep
+
+A permanent sweep constructs every public object and exception from a hostile response echoing both
+credentials in every string field at several depths, then asserts neither appears in any output.
+The sibling SDKs added the same net; Python's found six unreported leaks the moment it existed and
+the JVM's found one. This one found two that nothing had reported:
+
+- `DarajaCatalog::decode()` copied an unrecognised raw `ResultCode` lexeme into the public `code`
+  field, reaching `json_encode`, logs and dumps through the OFFLINE decoder.
+- `Judgement::$claimed` was a verbatim copy of the server's `status` string.
+
+Both are now shape-scrubbed and bounded.
+
+### Also
+
+- **Redaction depth is pinned to parse depth.** `Redact::MAX_DEPTH` was 12 while every parse in the
+  SDK uses 512, so a secret nested past depth 12 of a signed body was parsed in and then walked past
+  by the scrubber. Node (8 vs 64), Python (12 vs 64) and JVM (8 vs 64) all carried the same drift.
+  A test asserts the invariant.
+
 ## [0.8.0] - 2026-07-19
 
 **Breaking.** An eighth independent review found ONE CRITICAL - a forged-success bypass that
@@ -657,7 +762,8 @@ v0.3.x) to idiomatic PHP 8.1+, with first-class Laravel support.
 - Injectable HTTP transport (`Paylod\Http\Transport`), defaulting to `CurlTransport`, so the
   whole test suite runs with no network.
 
-[Unreleased]: https://github.com/mosesmrima/paylod-php/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/mosesmrima/paylod-php/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/mosesmrima/paylod-php/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/mosesmrima/paylod-php/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/mosesmrima/paylod-php/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/mosesmrima/paylod-php/compare/v0.5.0...v0.6.0

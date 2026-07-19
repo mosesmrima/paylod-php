@@ -223,6 +223,13 @@ final class JsonLexeme
             if ($this->peek() !== '"') {
                 $this->fail();
             }
+            // The offset of the member name's OPENING QUOTE, so the raw bytes of the name are
+            // recoverable beside its decoded form. Nothing in production reads it - the guard is
+            // deliberately driven by the DECODED name - but keeping the raw span addressable is what
+            // lets the mutation harness express the round-8 bug faithfully: "compare the literal
+            // bytes instead of the decoded name" is a one-line revert rather than a rewrite of the
+            // whole function, and a one-line revert cannot silently stop applying.
+            $nameStart = $this->i;
             $name = $this->parseString();
             $this->skipWhitespace();
             $this->expect(':');

@@ -134,7 +134,7 @@ $CASES = [
         'edits' => [
             [
                 'src/Semantics.php',
-                "        if (\$codeEvidence === self::EVIDENCE_SUCCESS || \$codeEvidence === self::EVIDENCE_NONE) {\n            return self::EVIDENCE_SUCCESS;\n        }\n\n        return self::EVIDENCE_CONFLICT;",
+                "        if (\$codeEvidence === self::EVIDENCE_SUCCESS || \$codeEvidence === self::EVIDENCE_NONE) {\n            return self::EVIDENCE_SUCCESS;\n        }",
                 "        return \$codeEvidence === self::EVIDENCE_NONE ? self::EVIDENCE_SUCCESS : \$codeEvidence;",
             ],
         ],
@@ -158,8 +158,14 @@ $CASES = [
         'edits' => [
             [
                 'src/PaymentOutcome.php',
-                '        if ($verdict === Semantics::VERDICT_INDETERMINATE) {',
-                '        if (false) {',
+                '            Semantics::VERDICT_INDETERMINATE => new self(
+                status: \'pending\',
+                message: self::INDETERMINATE,
+                retryable: false,',
+                '            Semantics::VERDICT_INDETERMINATE => new self(
+                status: \'failed\',
+                message: self::INDETERMINATE,
+                retryable: $detail[\'retryable\'] ?? true,',
             ],
         ],
     ],
@@ -206,6 +212,12 @@ $CASES = [
                 "        if (\$raw === '0') {",
                 "        if (\$raw !== '' && is_numeric(\$raw) && \$raw + 0 == 0) {",
             ],
+            [
+                'src/DarajaCatalog.php',
+                '        return preg_match(self::CANONICAL_INTEGER_RE, $raw) === 1
+            || preg_match(self::CANONICAL_DOTTED_RE, $raw) === 1;',
+                '        return $raw !== \'\';',
+            ],
         ],
     ],
     [
@@ -215,8 +227,8 @@ $CASES = [
         'edits' => [
             [
                 'src/DarajaCatalog.php',
-                '        if (preg_match(\'/^[1-9][0-9]*\\z/\', $raw) === 1) {',
-                "        if (\$raw !== '' && is_numeric(\$raw)) {",
+                "    private const CANONICAL_INTEGER_RE = '/^(?:0|[1-9][0-9]*)\\z/';",
+                "    private const CANONICAL_INTEGER_RE = '/^[0-9eE+.\\-]+\\z/';",
             ],
         ],
     ],
@@ -426,8 +438,8 @@ $CASES = [
         'edits' => [
             [
                 'src/DarajaCatalog.php',
-                '        return \'\';' . "\n" . '    }' . "\n" . "\n" . '    /**' . "\n" . '     * Classify a synchronous STK Query result.',
-                '        return $resultCode === null ? \'\' : trim((string) $resultCode);' . "\n" . '    }' . "\n" . "\n" . '    /**' . "\n" . '     * Classify a synchronous STK Query result.',
+                '        return \'\';' . "\n" . '    }' . "\n" . "\n" . '    /**' . "\n" . '     * THE EXACT overloaded Daraja business code.',
+                '        return $resultCode === null ? \'\' : trim((string) $resultCode);' . "\n" . '    }' . "\n" . "\n" . '    /**' . "\n" . '     * THE EXACT overloaded Daraja business code.',
             ],
         ],
     ],
@@ -438,8 +450,8 @@ $CASES = [
         'edits' => [
             [
                 'src/DarajaCatalog.php',
-                '        if (preg_match(\'/^[1-9][0-9]*\z/\', $raw) === 1) {',
-                '        if (preg_match(\'/^[1-9][0-9]*$/\', $raw) === 1) {',
+                "    private const CANONICAL_INTEGER_RE = '/^(?:0|[1-9][0-9]*)\\z/';",
+                "    private const CANONICAL_INTEGER_RE = '/^(?:0|[1-9][0-9]*)$/';",
             ],
         ],
     ],
@@ -594,8 +606,8 @@ $CASES = [
         'edits' => [
             [
                 'src/Paylod.php',
-                'function (#[\SensitiveParameter] array $parsed, int $status) use ($idempotencyKey): void {',
-                'function (array $parsed, int $status) use ($idempotencyKey): void {',
+                'function (#[\SensitiveParameter] array $parsed, int $status) use ($idempotencyKey, &$acknowledgedPaymentId): void {',
+                'function (array $parsed, int $status) use ($idempotencyKey, &$acknowledgedPaymentId): void {',
             ],
         ],
     ],
@@ -605,39 +617,7 @@ $CASES = [
         'what' => 'the raw result-code guard goes back to matching only the LITERAL bytes "resultCode"',
         'test' => 'testEveryEscapedSpellingOfResultCodeIsScanned',
         'edits' => [
-            ['src/Support/JsonLexeme.php', '    public static function nonCanonicalResultCodeToken(string $raw): ?string
-    {
-        $scan = new self($raw);
-
-        try {
-            $scan->parseDocument();
-        } catch (\\RuntimeException) {
-            if ($scan->bad !== null) {
-                return $scan->bad;
-            }
-
-            // DIVERGENCE CHECK. This scanner gave up. If PHP\'s parser would NOT have, then there is
-            // a document reaching `json_decode()` that was never examined - refuse it instead.
-            json_decode($raw, true, self::MAX_DEPTH, JSON_BIGINT_AS_STRING);
-
-            return json_last_error() === JSON_ERROR_NONE ? self::UNREADABLE : null;
-        }
-
-        return $scan->bad;
-    }', '    public static function nonCanonicalResultCodeToken(string $raw): ?string
-    {
-        $re = \'/"resultCode"\\s*:\\s*(-?(?:0|[1-9][0-9]*)(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)/\';
-        if (preg_match_all($re, $raw, $matches) === false) {
-            return null;
-        }
-        foreach ($matches[1] as $token) {
-            if (preg_match(self::CANONICAL_TOKEN_RE, $token) !== 1) {
-                return $token;
-            }
-        }
-
-        return null;
-    }'],
+            ['src/Support/JsonLexeme.php', '            $isTarget = $name === self::TARGET_KEY;', '            $isTarget = substr($this->raw, $nameStart, $this->i - $nameStart) === \'"\' . self::TARGET_KEY . \'"\';'],
         ],
     ],
     [
@@ -645,39 +625,7 @@ $CASES = [
         'what' => 'the STATUS path stops seeing an escaped-key impostor zero (same revert)',
         'test' => 'testTheStatusPathRefusesAnEscapedKeyImpostorZero',
         'edits' => [
-            ['src/Support/JsonLexeme.php', '    public static function nonCanonicalResultCodeToken(string $raw): ?string
-    {
-        $scan = new self($raw);
-
-        try {
-            $scan->parseDocument();
-        } catch (\\RuntimeException) {
-            if ($scan->bad !== null) {
-                return $scan->bad;
-            }
-
-            // DIVERGENCE CHECK. This scanner gave up. If PHP\'s parser would NOT have, then there is
-            // a document reaching `json_decode()` that was never examined - refuse it instead.
-            json_decode($raw, true, self::MAX_DEPTH, JSON_BIGINT_AS_STRING);
-
-            return json_last_error() === JSON_ERROR_NONE ? self::UNREADABLE : null;
-        }
-
-        return $scan->bad;
-    }', '    public static function nonCanonicalResultCodeToken(string $raw): ?string
-    {
-        $re = \'/"resultCode"\\s*:\\s*(-?(?:0|[1-9][0-9]*)(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)/\';
-        if (preg_match_all($re, $raw, $matches) === false) {
-            return null;
-        }
-        foreach ($matches[1] as $token) {
-            if (preg_match(self::CANONICAL_TOKEN_RE, $token) !== 1) {
-                return $token;
-            }
-        }
-
-        return null;
-    }'],
+            ['src/Support/JsonLexeme.php', '            $isTarget = $name === self::TARGET_KEY;', '            $isTarget = substr($this->raw, $nameStart, $this->i - $nameStart) === \'"\' . self::TARGET_KEY . \'"\';'],
         ],
     ],
     [
@@ -685,39 +633,7 @@ $CASES = [
         'what' => 'the SIGNED WEBHOOK path stops seeing an escaped-key impostor zero (same revert)',
         'test' => 'testTheSignedWebhookPathRefusesAnEscapedKeyImpostorZero',
         'edits' => [
-            ['src/Support/JsonLexeme.php', '    public static function nonCanonicalResultCodeToken(string $raw): ?string
-    {
-        $scan = new self($raw);
-
-        try {
-            $scan->parseDocument();
-        } catch (\\RuntimeException) {
-            if ($scan->bad !== null) {
-                return $scan->bad;
-            }
-
-            // DIVERGENCE CHECK. This scanner gave up. If PHP\'s parser would NOT have, then there is
-            // a document reaching `json_decode()` that was never examined - refuse it instead.
-            json_decode($raw, true, self::MAX_DEPTH, JSON_BIGINT_AS_STRING);
-
-            return json_last_error() === JSON_ERROR_NONE ? self::UNREADABLE : null;
-        }
-
-        return $scan->bad;
-    }', '    public static function nonCanonicalResultCodeToken(string $raw): ?string
-    {
-        $re = \'/"resultCode"\\s*:\\s*(-?(?:0|[1-9][0-9]*)(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)/\';
-        if (preg_match_all($re, $raw, $matches) === false) {
-            return null;
-        }
-        foreach ($matches[1] as $token) {
-            if (preg_match(self::CANONICAL_TOKEN_RE, $token) !== 1) {
-                return $token;
-            }
-        }
-
-        return null;
-    }'],
+            ['src/Support/JsonLexeme.php', '            $isTarget = $name === self::TARGET_KEY;', '            $isTarget = substr($this->raw, $nameStart, $this->i - $nameStart) === \'"\' . self::TARGET_KEY . \'"\';'],
         ],
     ],
     [
@@ -733,7 +649,7 @@ $CASES = [
         'what' => 'verified event `data` is forwarded verbatim instead of rebuilt from the allowlist',
         'test' => 'testNestedRetryabilityClaimsDoNotSurviveVerification',
         'edits' => [
-            ['src/Webhook.php', '        $out[\'data\'] = self::pick($data, self::PAYMENT_DATA_KEYS) + [', '        $out[\'data\'] = $data + ['],
+            ['src/Webhook.php', '        $out[\'data\'] = self::pickTyped($data, self::PAYMENT_DATA_KEYS, self::PAYMENT_DATA_TYPES, \'data\') + [', '        $out[\'data\'] = $data + ['],
         ],
     ],
     [
@@ -741,7 +657,7 @@ $CASES = [
         'what' => 'the verified event ROOT is forwarded verbatim instead of rebuilt from the allowlist',
         'test' => 'testArbitraryRootAndDataFieldsAreDropped',
         'edits' => [
-            ['src/Webhook.php', '        $out = self::pick($event, self::ROOT_KEYS);', '        $out = $event;'],
+            ['src/Webhook.php', '        $out = self::pickTyped($event, self::ROOT_KEYS, self::ROOT_TYPES, \'event\');', '        $out = $event;'],
         ],
     ],
     [
@@ -766,14 +682,6 @@ $CASES = [
         $problem = $redact === null ? $problem : (string) $redact($problem);', '        // reverted'],
             ['src/Support/Validate.php', '        // The same single scrub the acknowledgement path applies - see collectAck().
         $problem = $redact === null ? $problem : (string) $redact($problem);', '        // reverted'],
-        ],
-    ],
-    [
-        'id' => 'r8-webhook-secret-redaction',
-        'what' => 'the decoded event is scrubbed by SHAPE only, without the exact supplied secret',
-        'test' => 'testTheSuppliedWebhookSecretIsRedactedOutOfTheDecodedEvent',
-        'edits' => [
-            ['src/Webhook.php', '        $scrubbed = Redact::apply($event, [$secret]);', '        $scrubbed = Redact::apply($event, []);'],
         ],
     ],
     [
@@ -864,7 +772,7 @@ $CASES = [
             . 'so a handler reading the decoded block re-charges a customer holding a receipt',
         'test' => 'testEveryExposedRetryableFieldAgreesAcrossTheCrossProduct',
         'edits' => [
-            ['src/PaymentOutcome.php', '            return new self(
+            ['src/PaymentOutcome.php', '            Semantics::VERDICT_INDETERMINATE => new self(
                 status: \'pending\',
                 message: self::INDETERMINATE,
                 retryable: false,
@@ -872,7 +780,7 @@ $CASES = [
                 paymentId: $paymentId,
                 receipt: null,
                 code: $code,
-                detail: self::nonRetryableDetail($detail),', '            return new self(
+                detail: self::nonRetryableDetail($detail),', '            Semantics::VERDICT_INDETERMINATE => new self(
                 status: \'pending\',
                 message: self::INDETERMINATE,
                 retryable: false,
@@ -891,6 +799,143 @@ $CASES = [
         'edits' => [
             ['src/Http/CurlHttpClient.php', '            CURLOPT_RETURNTRANSFER => true,', '            CURLOPT_RETURNTRANSFER => true,
             CURLOPT_ENCODING => \'\','],
+        ],
+    ],
+    // == ROUND 9 - the composed money bug ======================================================
+    [
+        'id' => 'r9-receipt-grammar',
+        'what' => 'receipt evidence goes back to a non-emptiness test, so the redactor\'s own '
+            . '`[redacted]` output passes as proof of payment',
+        'test' => 'testTheReceiptGrammarAcceptsOnlyReceiptShapedValues',
+        'edits' => [
+            ["src/Semantics.php", "    public const RECEIPT_RE = '/^[A-Z0-9]{10}\\z/';", "    public const RECEIPT_RE = '/^.+\\z/';"],
+        ],
+    ],
+    [
+        'id' => 'r9-receipt-grammar-paid',
+        'what' => 'the SAME revert, proven on the PAID path: a redaction marker becomes proof of payment',
+        'test' => 'testARedactedCredentialIsNotProofOfPayment',
+        'edits' => [
+            ['src/Semantics.php', '        return is_string($receipt) && self::isReceipt($receipt);', '        return is_string($receipt) && trim($receipt) !== \'\';'],
+        ],
+    ],
+    [
+        'id' => 'r9-receipt-grammar-webhook',
+        'what' => 'the SAME revert, proven on the WEBHOOK path',
+        'test' => 'testARedactedCredentialIsNotProofOfPaymentOnTheWebhookPath',
+        'edits' => [
+            ['src/Semantics.php', '        return is_string($receipt) && self::isReceipt($receipt);', '        return is_string($receipt) && trim($receipt) !== \'\';'],
+        ],
+    ],
+    [
+        'id' => 'r9-marker-audit',
+        'what' => 'the redaction marker satisfies a correlation check again (the idempotency key)',
+        'test' => 'testTheRedactionMarkerSatisfiesNoEvidenceIdentifierOrCorrelationCheck',
+        'edits' => [
+            ['src/Support/Validate.php', '        if (Redact::containsPlaceholder($key)) {', '        if (false) {'],
+        ],
+    ],
+    [
+        'id' => 'r9-webhook-refuses-echoed-secret',
+        'what' => 'a signed body echoing the webhook secret is sanitised and delivered instead of refused',
+        'test' => 'testASignedBodyEchoingTheWebhookSecretIsRefusedNotSanitised',
+        'edits' => [
+            ['src/Webhook.php', '        if (Redact::contains($raw, [$secret])) {', '        if (false) {'],
+        ],
+    ],
+    [
+        'id' => 'r9-depth-invariant',
+        'what' => 'the redactor stops shallower than the parser again, so a secret nested past its '
+            . 'ceiling is parsed in and then walked past',
+        'test' => 'testTheRedactionDepthIsPinnedToTheParseDepth',
+        'edits' => [
+            ['src/Support/Redact.php', '    public const MAX_DEPTH = JsonLexeme::MAX_DEPTH;', '    public const MAX_DEPTH = 12;'],
+        ],
+    ],
+    [
+        'id' => 'r9-500-exact-code',
+        'what' => 'the terminal 500.* description branch matches a PREFIX again and runs BEFORE the '
+            . 'code\'s form is validated',
+        'test' => 'testAMalformed500CodeIsNotPromotedToTerminalByItsDescription',
+        'edits' => [
+            ['src/DarajaCatalog.php', '        if (!self::isCanonicalCode($raw)) {
+            return \'pending\';
+        }', '        if (str_starts_with($raw, \'500.\') && preg_match(self::TERMINAL_500_MESSAGE_RE, $desc) === 1) {
+            return \'failed\';
+        }
+        if (!self::isCanonicalCode($raw)) {
+            return \'pending\';
+        }'],
+        ],
+    ],
+    [
+        'id' => 'r9-unknown-code-indeterminate',
+        'what' => 'any canonically shaped positive integer is terminal failure again, catalogued or not',
+        'test' => 'testAnUncataloguedCanonicalCodeIsIndeterminateEverywhere',
+        'edits' => [
+            ['src/DarajaCatalog.php', '        if (isset(self::terminalStkCodes()[$raw])) {
+            return \'failed\';
+        }', '        if (preg_match(\'/^[1-9][0-9]*\z/\', $raw) === 1) {
+            return \'failed\';
+        }'],
+        ],
+    ],
+    [
+        'id' => 'r9-allowlist-types',
+        'what' => 'allowlisted webhook fields are copied without checking their value TYPES, so a '
+            . 'payload-supplied retry conclusion rides through inside an allowlisted name',
+        'test' => 'testAStructuredValueInAScalarAllowlistedFieldIsRefused',
+        'edits' => [
+            ['src/Webhook.php', '            if ($value !== null && !self::isOfType($value, $types[$key])) {', '            if (false) {'],
+        ],
+    ],
+    [
+        'id' => 'r9-collect-binds-payment-id',
+        'what' => 'a malformed 202 carrying a usable paymentId attaches only the idempotency key again',
+        'test' => 'testAMalformedAcknowledgementStillBindsAUsablePaymentId',
+        'edits' => [
+            ['src/Paylod.php', '                if ($acknowledgedPaymentId !== null) {
+                    $e->bindToAcknowledgedPayment($idempotencyKey, $acknowledgedPaymentId);
+                } else {
+                    $e->attachIdempotencyKey($idempotencyKey);
+                }', '                $e->attachIdempotencyKey($idempotencyKey);'],
+        ],
+    ],
+    [
+        'id' => 'r9-decode-error-redacts',
+        'what' => 'decodeError() stops applying the client redactor AND the catalog stops '
+            . 'shape-scrubbing its fallback description (BOTH layers reverted)',
+        'test' => 'testDecodeErrorRedactsTheClientsOwnCredentials',
+        'edits' => [
+            ['src/Paylod.php', '        $decoded = $this->redact(DarajaCatalog::decode($resultCode, $rawDesc));', '        $decoded = DarajaCatalog::decode($resultCode, $rawDesc);'],
+            ['src/DarajaCatalog.php', '        $desc = trim(Redact::text($rawDesc ?? \'\', []));', '        $desc = trim($rawDesc ?? \'\');'],
+        ],
+    ],
+    [
+        'id' => 'r9-scanner-divergence',
+        'what' => 'the scanner/parser divergence cross-check is removed, so a body the guard cannot '
+            . 'read but json_decode() CAN is waved through',
+        'test' => 'testABodyTheScannerCannotReadButPhpCanIsRefused',
+        'edits' => [
+            ['src/Support/JsonLexeme.php', '            return json_last_error() === JSON_ERROR_NONE ? self::UNREADABLE : null;', '            return null;'],
+        ],
+    ],
+    [
+        'id' => 'r9-adversarial-sweep-code-field',
+        'what' => 'the offline decoder copies an unrecognised raw ResultCode lexeme into its public '
+            . '`code` field again - ONE OF THE TWO LEAKS THE SWEEP ITSELF FOUND',
+        'test' => 'testNoPublicObjectOrExceptionEverCarriesACredential',
+        'edits' => [
+            ['src/DarajaCatalog.php', '        if ($code === \'\' || strlen($code) > 32 || !self::isCanonicalCode($code)) {', '        if (false) {'],
+        ],
+    ],
+    [
+        'id' => 'r9-adversarial-sweep-claimed',
+        'what' => 'Judgement::$claimed goes back to a verbatim copy of the server\'s status string - '
+            . 'THE SECOND LEAK THE SWEEP FOUND',
+        'test' => 'testNoPublicObjectOrExceptionEverCarriesACredential',
+        'edits' => [
+            ['src/Semantics.php', '        $claimed = is_string($rawClaim) ? Redact::text($rawClaim, []) : \'\';', '        $claimed = is_string($rawClaim) ? $rawClaim : \'\';'],
         ],
     ],
 ];

@@ -44,7 +44,7 @@ final class NinthRoundHardeningTest extends TestCase
      * `[redacted]`, and `[redacted]` used to pass as a receipt - so a `status: "success"` record
      * with NO result code came back `paid = true`.
      *
-     * nv:r9-receipt-grammar
+     * nv:r9-receipt-grammar-paid
      */
     public function testARedactedCredentialIsNotProofOfPayment(): void
     {
@@ -64,7 +64,7 @@ final class NinthRoundHardeningTest extends TestCase
     /**
      * The same body as a SIGNED `payment.success` webhook - the other surface the Critical reached.
      *
-     * nv:r9-receipt-grammar
+     * nv:r9-receipt-grammar-webhook
      */
     public function testARedactedCredentialIsNotProofOfPaymentOnTheWebhookPath(): void
     {
@@ -505,7 +505,8 @@ final class NinthRoundHardeningTest extends TestCase
      * per-field test would have looked in those places, because nobody knew to look there. It is
      * kept as a standing net rather than a one-off audit for that reason.
      *
-     * nv:r9-adversarial-sweep
+     * nv:r9-adversarial-sweep-code-field
+     * nv:r9-adversarial-sweep-claimed
      */
     public function testNoPublicObjectOrExceptionEverCarriesACredential(): void
     {

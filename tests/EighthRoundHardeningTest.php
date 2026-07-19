@@ -392,7 +392,11 @@ final class EighthRoundHardeningTest extends TestCase
     /**
      * A correctly-signed event that echoes the WEBHOOK SECRET back must not hand it to the handler.
      *
-     * nv:r8-webhook-secret-redaction
+     * SUPERSEDED BY ROUND 9, which is why this carries no `nv:` tag of its own any more: the
+     * round-8 property was "redact the secret out of the delivered event", and the round-9 rule is
+     * strictly stronger - REFUSE the event outright. The mutation case that proves the stronger rule
+     * load-bearing is `r9-webhook-refuses-echoed-secret`. Reverting the round-8 redaction line no
+     * longer changes this test's outcome, because the body never reaches it.
      */
     public function testTheSuppliedWebhookSecretIsRedactedOutOfTheDecodedEvent(): void
     {

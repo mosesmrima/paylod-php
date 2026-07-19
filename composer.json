@@ -63,6 +63,16 @@
     "minimum-stability": "stable",
     "prefer-stable": true,
     "scripts": {
-        "test": "phpunit"
+        "phpunit": "phpunit",
+        "non-vacuity": "php scripts/non-vacuity.php",
+        "test": [
+            "@phpunit",
+            "@non-vacuity"
+        ]
+    },
+    "scripts-descriptions": {
+        "phpunit": "The test suite on its own.",
+        "non-vacuity": "Revert each landed protection in isolation and require its test to FAIL. A test that passes with and without the fix it claims to cover proves nothing.",
+        "test": "PHPUnit followed by the non-vacuity mutation harness. The harness is part of `test` on purpose: while it was a separate command, ordinary CI reported success without ever exercising it."
     }
 }
