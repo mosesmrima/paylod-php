@@ -840,7 +840,7 @@ $CASES = [
         'what' => 'a signed body echoing the webhook secret is sanitised and delivered instead of refused',
         'test' => 'testASignedBodyEchoingTheWebhookSecretIsRefusedNotSanitised',
         'edits' => [
-            ['src/Webhook.php', '        if (Redact::contains($raw, [$secret])) {', '        if (false) {'],
+            ['src/Webhook.php', '        if (Redact::contains($raw, $credentials) || Redact::containsDeep($event, $credentials)) {', '        if (false) {'],
         ],
     ],
     [
@@ -1027,6 +1027,67 @@ $CASES = [
         'test' => 'testRetryableEntriesKeepTheirOwnCustomerMessage',
         'edits' => [
             ['src/DarajaCatalog.php', "        if (\$retryable) {\n            return \$message;\n        }", "        if (false) {\n            return \$message;\n        }"],
+        ],
+    ],
+
+    // == ROUND 10 - requirements 4.6 / 4.7 / 3.4: the webhook credential and identifier guards ====
+    [
+        'id' => 'r10-escaped-credential-refused',
+        'what' => 'the compromise scan goes back to reading the RAW BYTES only, so a credential '
+            . 'spelled with JSON \\uXXXX escapes is missed, redacted and DELIVERED',
+        'test' => 'testAnEscapedWebhookSecretInASignedBodyIsRefused',
+        'edits' => [
+            ['src/Webhook.php', '        if (Redact::contains($raw, $credentials) || Redact::containsDeep($event, $credentials)) {', '        if (Redact::contains($raw, $credentials)) {'],
+        ],
+    ],
+    [
+        'id' => 'r10-client-surfaces-know-both-credentials',
+        'what' => 'the webhook scan knows only the signing secret again, so a body echoing this '
+            . "client's API KEY is accepted on both public client surfaces",
+        'test' => 'testBothClientWebhookSurfacesRefuseTheConfiguredSecretUnderAnExplicitOne',
+        'edits' => [
+            ['src/Webhook.php', '        $credentials = array_merge([$secret], array_values($alsoRefuse));', '        $credentials = [$secret];'],
+        ],
+    ],
+    [
+        // The control: the refusal must not become an outage on clean bodies.
+        'id' => 'r10-clean-body-still-verifies',
+        'what' => 'the compromise scan refuses EVERY body (the guard becomes an outage)',
+        'test' => 'testACleanBodyStillVerifiesOnBothClientSurfaces',
+        'edits' => [
+            ['src/Webhook.php', '        if (Redact::contains($raw, $credentials) || Redact::containsDeep($event, $credentials)) {', '        if (true) {'],
+        ],
+    ],
+    [
+        'id' => 'r10-webhook-payment-id-grammar',
+        'what' => 'the webhook payment id goes back to a non-emptiness test, so `[redacted]`, a JSON '
+            . 'fragment and a 200-byte blob all satisfy correlation again',
+        'test' => 'testAWebhookPaymentIdMustMatchTheSharedIdentifierGrammar',
+        'edits' => [
+            ['src/Webhook.php', "        if (!Validate::identifierIsUsable(\n            'data.paymentId',\n            \$d['paymentId'],\n            static fn (mixed \$v): mixed => is_string(\$v) ? Redact::text(\$v, []) : \$v,\n        )) {", '        if (false) {'],
+        ],
+    ],
+
+    [
+        // The credential-shaped id is caught by the COMPROMISE scan, which fires before the
+        // identifier grammar is ever reached. Registered separately so that if the stronger guard
+        // stops firing, this fails even though the grammar would still refuse the value.
+        'id' => 'r10-credential-shaped-payment-id',
+        'what' => 'the compromise scan no longer sees credential SHAPES in a decoded event, so an '
+            . 'mp_live_ token echoed into data.paymentId is no longer refused as a compromise',
+        'test' => 'testACredentialShapedWebhookPaymentIdIsRefusedAsACompromise',
+        'edits' => [
+            ['src/Webhook.php', '        if (Redact::contains($raw, $credentials) || Redact::containsDeep($event, $credentials)) {', '        if (false) {'],
+        ],
+    ],
+    [
+        // The control for the identifier grammar: ordinary ids must still pass.
+        'id' => 'r10-webhook-payment-id-control',
+        'what' => 'the identifier grammar refuses EVERY webhook payment id, so ordinary events stop '
+            . 'being deliverable - the grammar becomes an outage',
+        'test' => 'testOrdinaryWebhookPaymentIdsAreStillAccepted',
+        'edits' => [
+            ['src/Webhook.php', "        if (!Validate::identifierIsUsable(\n            'data.paymentId',\n            \$d['paymentId'],\n            static fn (mixed \$v): mixed => is_string(\$v) ? Redact::text(\$v, []) : \$v,\n        )) {", '        if (true) {'],
         ],
     ],
 ];

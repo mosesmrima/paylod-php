@@ -127,6 +127,50 @@ final class Redact
     }
 
     /**
+     * REQUIREMENTS 4.3, 4.5 and 4.7 - THE CREDENTIAL SCAN OVER A DECODED STRUCTURE.
+     *
+     * -- Why scanning the RAW BYTES was not enough ------------------------------------------------
+     * The webhook money path called {@see contains()} on the raw signed body. JSON string values may
+     * be spelled with `\uXXXX` escapes, so a secret written as `whsec_...` is ABSENT from the
+     * raw bytes and PRESENT in the decoded event - it was missed by the refusal, decoded, rewritten
+     * to `[redacted]` by {@see apply()}, and delivered to the handler. This is the same class of
+     * defect as the escaped `resultCode` member name in {@see JsonLexeme}: a guard that reads bytes
+     * while the money logic reads a parsed structure is a guard on the wrong value.
+     *
+     * So this walks the DECODED value - every key and every string leaf, arrays and nested arrays
+     * alike (requirement 4.3: scalar-only redaction is non-conformant).
+     *
+     * -- Fail closed (requirement 4.5) ------------------------------------------------------------
+     * Past MAX_DEPTH the traversal returns TRUE - "a credential may be here" - rather than false.
+     * "I did not look" and "I looked and it is clean" must not produce the same answer. Because the
+     * depth is pinned to the parser's, this is unreachable for any body the parser accepted; it is
+     * written as the answer anyway, because the bound is the one thing that could drift.
+     *
+     * @param list<string|null> $secrets EVERY configured credential (requirement 4.7), not a subset
+     */
+    public static function containsDeep(mixed $value, array $secrets, int $depth = 0): bool
+    {
+        if (is_string($value)) {
+            return self::contains($value, $secrets);
+        }
+        if (is_array($value)) {
+            if ($depth >= self::MAX_DEPTH) {
+                return true;
+            }
+            foreach ($value as $k => $v) {
+                if (is_string($k) && self::contains($k, $secrets)) {
+                    return true;
+                }
+                if (self::containsDeep($v, $secrets, $depth + 1)) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /**
      * A masked, SAFE-to-print rendering of a secret: enough to tell two keys apart in a log, never
      * enough to use one. Used by __debugInfo(), which is what print_r()/var_dump() actually call.
      */

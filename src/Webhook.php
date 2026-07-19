@@ -107,8 +107,9 @@ final class Webhook
         #[\SensitiveParameter] string $secret,
         int|float $toleranceSec = self::DEFAULT_TOLERANCE_SEC,
         int|float|null $nowSec = null,
+        #[\SensitiveParameter] array $alsoRefuse = [],
     ): array {
-        $event = self::parseSignedEnvelope($payload, $signature, $secret, $toleranceSec, $nowSec);
+        $event = self::parseSignedEnvelope($payload, $signature, $secret, $toleranceSec, $nowSec, $alsoRefuse);
         self::assertEventIsCoherent($event);
 
         // THE DERIVED FIELDS ARE RE-DERIVED, NEVER FORWARDED.
@@ -433,6 +434,7 @@ final class Webhook
         #[\SensitiveParameter] string $secret,
         int|float $toleranceSec = self::DEFAULT_TOLERANCE_SEC,
         int|float|null $nowSec = null,
+        #[\SensitiveParameter] array $alsoRefuse = [],
     ): array {
         return [
             'signatureValid' => true,
@@ -443,6 +445,7 @@ final class Webhook
                 $secret,
                 $toleranceSec,
                 $nowSec,
+                $alsoRefuse,
             ),
         ];
     }
@@ -462,6 +465,7 @@ final class Webhook
         #[\SensitiveParameter] string $secret,
         int|float $toleranceSec = self::DEFAULT_TOLERANCE_SEC,
         int|float|null $nowSec = null,
+        #[\SensitiveParameter] array $alsoRefuse = [],
     ): array {
         // THE BYTES MUST ALREADY BE BOUNDED WHEN THEY GET HERE.
         //
@@ -648,19 +652,42 @@ final class Webhook
         //
         // So we refuse, loudly, with the type that is deliberately NOT retryable. The sibling Node,
         // Python and JVM SDKs made the same call in round 9.
-        if (Redact::contains($raw, [$secret])) {
+        // -- THE SCAN READS THE DECODED EVENT, NOT ONLY THE RAW BYTES (requirements 4.6, 4.7) ------
+        //
+        // This was `Redact::contains($raw, [$secret])` - the RAW BODY, and the signing secret alone.
+        // Two holes, and the round-10 High was both of them at once:
+        //
+        //   1. JSON string values may be spelled with `\uXXXX` escapes. A secret written as
+        //      "whsec_..." is ABSENT from the raw bytes and PRESENT in the decoded event, so it
+        //      slipped the refusal, was rewritten to `[redacted]` by the scrubber below, and was
+        //      DELIVERED to the handler. Exactly the same class of defect as the escaped
+        //      `resultCode` member name in {@see \Paylod\Support\JsonLexeme}: a guard that reads
+        //      bytes while the money logic reads a parsed structure is guarding the wrong value.
+        //   2. It knew ONE credential. Requirement 4.7: the refusal scan must know EVERY configured
+        //      credential, not a subset. `$alsoRefuse` carries the client's API key in, because
+        //      this is a static method and the client is the only object holding both.
+        //
+        // BOTH values are scanned - the raw bytes AND the decoded structure - because they catch
+        // different spellings, and the raw scan additionally covers the parts of the body that never
+        // become event fields. The decoded walk is recursive over keys and string leaves and FAILS
+        // CLOSED past the parse depth (requirements 4.3, 4.5).
+        //
+        // This runs BEFORE assertEventIsCoherent() and before the derived fields are rebuilt, so no
+        // semantic conclusion is ever drawn from a body we are about to refuse.
+        $credentials = array_merge([$secret], array_values($alsoRefuse));
+        if (Redact::contains($raw, $credentials) || Redact::containsDeep($event, $credentials)) {
             throw new PaylodCredentialCompromiseError(
-                'Webhook body is signed correctly but ECHOES YOUR WEBHOOK SIGNING SECRET back inside '
-                . 'the payload. A legitimate paylod event never contains the secret it was signed '
-                . 'with, so the sender is compromised or misconfigured - and a body from such a sender '
-                . 'cannot be trusted about whether money moved. This event is REFUSED rather than '
-                . 'sanitised and delivered. Rotate the webhook signing secret, then find what is '
-                . 'reflecting it into the payload.'
+                'Webhook body is signed correctly but ECHOES ONE OF YOUR PAYLOD CREDENTIALS back '
+                . 'inside the payload. A legitimate paylod event never contains the secret it was '
+                . 'signed with, nor your API key, so the sender is compromised or misconfigured - and '
+                . 'a body from such a sender cannot be trusted about whether money moved. This event '
+                . 'is REFUSED rather than sanitised and delivered. Rotate the credential, then find '
+                . 'what is reflecting it into the payload.'
             );
         }
 
         /** @var array<string,mixed> $scrubbed */
-        $scrubbed = Redact::apply($event, [$secret]);
+        $scrubbed = Redact::apply($event, $credentials);
 
         return $scrubbed;
     }
@@ -712,8 +739,32 @@ final class Webhook
         $d = $event['data'];
 
         // 1. SHAPE.
+        // REQUIREMENT 3.4 - THE PAYMENT ID GETS THE SHARED IDENTIFIER GRAMMAR, not a blank check.
+        //
+        // This was `trim($d['paymentId']) !== ''`. A non-emptiness test is not a validator: it
+        // accepted an echoed bearer token, a JSON fragment, a multi-kilobyte blob, and - because the
+        // decoded event passes through the redactor before a handler sees it - the literal
+        // `[redacted]`. The paymentId is the value a handler correlates the order by and the value
+        // applications log on every charge, so a placeholder in it means every redacted event
+        // correlates to the SAME order. Same rule, same grammar, same marker check as the
+        // acknowledgement and status-read paths. See Validate::identifierIsUsable().
         if (!isset($d['paymentId']) || !is_string($d['paymentId']) || trim($d['paymentId']) === '') {
             self::invalidPayload('data.paymentId is missing or empty.');
+        }
+        // The SHAPE-only redactor is passed in. This is a static method with no process secrets,
+        // so the exact-credential layer is not available here - but the shape layer is, and it is
+        // precisely the layer that catches a reflected `mp_live_` / `whsec_` token echoed into the
+        // id. The client's exact credentials are applied on top by the refusal scan above.
+        if (!Validate::identifierIsUsable(
+            'data.paymentId',
+            $d['paymentId'],
+            static fn (mixed $v): mixed => is_string($v) ? Redact::text($v, []) : $v,
+        )) {
+            self::invalidPayload(
+                'data.paymentId is not a well-formed identifier - a paylod payment id is a short '
+                . 'opaque token, and a value that is oversized, credential-shaped, or a redaction '
+                . 'marker cannot be used to correlate this event with anything.'
+            );
         }
         if (!isset($d['status']) || !is_string($d['status'])
             || !in_array($d['status'], Validate::PAYMENT_STATUSES, true)) {
@@ -784,9 +835,10 @@ final class Webhook
         #[\SensitiveParameter] string $secret,
         int|float $toleranceSec = self::DEFAULT_TOLERANCE_SEC,
         int|float|null $nowSec = null,
+        #[\SensitiveParameter] array $alsoRefuse = [],
     ): bool {
         try {
-            self::verify($payload, $signature, $secret, $toleranceSec, $nowSec);
+            self::verify($payload, $signature, $secret, $toleranceSec, $nowSec, $alsoRefuse);
             return true;
         } catch (PaylodSignatureVerificationError) {
             return false;
@@ -809,9 +861,10 @@ final class Webhook
         #[\SensitiveParameter] string $secret,
         int|float $toleranceSec = self::DEFAULT_TOLERANCE_SEC,
         int|float|null $nowSec = null,
+        #[\SensitiveParameter] array $alsoRefuse = [],
     ): bool {
         try {
-            self::parseSignedEnvelope($payload, $signature, $secret, $toleranceSec, $nowSec);
+            self::parseSignedEnvelope($payload, $signature, $secret, $toleranceSec, $nowSec, $alsoRefuse);
             return true;
         } catch (PaylodSignatureVerificationError) {
             return false;

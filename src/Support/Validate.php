@@ -471,6 +471,29 @@ final class Validate
         return self::identifierProblem($field, (string) $value, $redact) === null ? (string) $value : null;
     }
 
+    /**
+     * THE identifier grammar, as a public predicate.
+     *
+     * Made public for the WEBHOOK path (requirements 3.4 and 3.3's sibling rule for identifiers).
+     * `data.paymentId` on a signed event was checked with `trim($v) !== ''` and nothing else, so it
+     * accepted an echoed bearer token, a JSON fragment, a 4KB blob - and, because the redactor runs
+     * before the handler sees the event, it accepted the literal `[redacted]` as a correlation id
+     * too. That is the round-9 redaction-marker Critical in its identifier form: the marker means
+     * the value was DESTROYED, so nothing may be correlated through it.
+     *
+     * One grammar, called from the acknowledgement path, the status-read path and the webhook path,
+     * so the three cannot drift into disagreeing about what an identifier is.
+     *
+     * @param ?callable(mixed):mixed $redact
+     */
+    public static function identifierIsUsable(
+        string $field,
+        string $value,
+        #[\SensitiveParameter] ?callable $redact = null,
+    ): bool {
+        return self::identifierProblem($field, $value, $redact) === null;
+    }
+
     /** @param ?callable(mixed):mixed $redact */
     private static function identifierProblem(
         string $field,

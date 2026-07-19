@@ -682,7 +682,21 @@ final class Paylod
         #[\SensitiveParameter] ?string $secret = null,
         int|float $toleranceSec = Webhook::DEFAULT_TOLERANCE_SEC,
     ): bool {
-        return Webhook::isValid($rawBody, $signatureHeader, $secret ?? ($this->webhookSecret)() ?? '', $toleranceSec);
+        // REQUIREMENT 4.7 - THIS SURFACE KNOWS BOTH CREDENTIALS TOO.
+        //
+        // It used to know neither beyond the signing secret: an event echoing this client's API KEY
+        // returned a plain `true` here, and a caller who asked "is this webhook valid?" was told yes
+        // about a body from a sender that is reflecting a live money-moving key. parseWebhook() had
+        // a check and this one did not, which is the recurring shape of these defects - one surface
+        // holding the line is not the line being held.
+        return Webhook::isValid(
+            $rawBody,
+            $signatureHeader,
+            $secret ?? ($this->webhookSecret)() ?? '',
+            $toleranceSec,
+            null,
+            $this->configuredCredentials(),
+        );
     }
 
     /**
@@ -697,31 +711,27 @@ final class Paylod
         #[\SensitiveParameter] ?string $secret = null,
         int|float $toleranceSec = Webhook::DEFAULT_TOLERANCE_SEC,
     ): array {
-        $event = Webhook::verify($rawBody, $signatureHeader, $secret ?? ($this->webhookSecret)() ?? '', $toleranceSec);
-
-        // ON THE MONEY PATH WE REFUSE RATHER THAN REDACT. Webhook::verify() already applies this
-        // rule to the ONE secret it was handed; the client is the only object that also knows the
-        // API KEY, so the check is completed here. A correctly-signed body echoing a live
-        // money-moving key is not a body with one bad field - it is output from a sender that is
-        // compromised or misconfigured, and nothing in it can be trusted about whether money moved.
-        if (Redact::contains($rawBody, [($this->apiKey)()])) {
-            throw new \Paylod\Exceptions\PaylodCredentialCompromiseError(
-                'Webhook body is signed correctly but ECHOES THIS CLIENT\'S API KEY back inside the '
-                . 'payload. A legitimate paylod event never contains your API key, so the sender is '
-                . 'compromised or misconfigured. This event is REFUSED rather than sanitised and '
-                . 'delivered. Rotate the API key, then find what is reflecting it into the payload.'
-            );
-        }
-
-        // THE CLIENT'S OWN CREDENTIALS ARE RE-APPLIED TO THE VERIFIED EVENT.
+        // REQUIREMENT 4.7 - ONE COMPROMISE CHECK, GIVEN EVERY CONFIGURED CREDENTIAL, BEFORE
+        // WEBHOOK SEMANTICS.
         //
-        // Webhook::verify() is static. It knows the ONE secret it was handed and the credential
-        // SHAPES, and that is all it can know - so a body echoing THIS CLIENT'S API KEY (a different
-        // secret entirely, and one spelled in a way the shape rules may not catch) passed straight
-        // through it and was returned to the caller verbatim. The client is the only object that
-        // holds both credentials, so it is the only place this can be done. Cheap, total, and it
-        // cannot drift from what the SDK considers a secret elsewhere - it is the same redactor the
-        // error paths use.
+        // The API-key check used to live BELOW this call, and it scanned the RAW BYTES. So an API
+        // key spelled with JSON `\uXXXX` escapes was invisible to it, and - because the check ran
+        // after Webhook::verify() had returned - the event had already been through the coherence
+        // rules and had its derived fields rebuilt before anything asked whether the sender was
+        // compromised. Both credentials now go IN, and the refusal happens inside
+        // parseSignedEnvelope() against the decoded structure, before a single semantic conclusion
+        // is drawn. See Webhook::parseSignedEnvelope().
+        $event = Webhook::verify(
+            $rawBody,
+            $signatureHeader,
+            $secret ?? ($this->webhookSecret)() ?? '',
+            $toleranceSec,
+            null,
+            $this->configuredCredentials(),
+        );
+
+        // The client's own credentials are re-applied to the verified event as a second layer. The
+        // refusal above is the money-path rule; this is the diagnostic one, and it costs nothing.
         /** @var array<string,mixed> $redacted */
         $redacted = $this->redact($event);
 
@@ -775,7 +785,25 @@ final class Paylod
     /** The secrets this client holds, for scrubbing out of anything about to be thrown or logged. */
     private function redact(mixed $value): mixed
     {
-        return Redact::apply($value, [($this->apiKey)(), ($this->webhookSecret)()]);
+        return Redact::apply($value, $this->configuredCredentials());
+    }
+
+    /**
+     * REQUIREMENT 4.7 - EVERY CONFIGURED CREDENTIAL, ENUMERATED IN ONE PLACE.
+     *
+     * The refusal scan must know every credential this client holds, not a subset. It used to be
+     * spelled out at each call site, and predictably the sites drifted: `verifyWebhook()` knew
+     * neither, `parseWebhook()` knew the API key but scanned only raw bytes, and the redactor knew
+     * both. Adding a third credential to the client meant remembering three places.
+     *
+     * One method, so a new credential is added once and every scan gains it. Both accessors are
+     * closures, so nothing here holds a credential in a property a dump could reach.
+     *
+     * @return list<string|null>
+     */
+    private function configuredCredentials(): array
+    {
+        return [($this->apiKey)(), ($this->webhookSecret)()];
     }
 
     /** The same scrubbing, as a callable the validators can apply to an error body. */

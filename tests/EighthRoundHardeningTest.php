@@ -429,7 +429,7 @@ final class EighthRoundHardeningTest extends TestCase
             $this->fail('expected the echoed webhook secret to be REFUSED, not sanitised');
         } catch (PaylodCredentialCompromiseError $e) {
             $this->assertStringNotContainsString($secret, $e->getMessage());
-            $this->assertStringContainsString('ECHOES YOUR WEBHOOK SIGNING SECRET', $e->getMessage());
+            $this->assertStringContainsString('ECHOES ONE OF YOUR PAYLOD CREDENTIALS', $e->getMessage());
         }
     }
 
