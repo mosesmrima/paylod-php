@@ -6,6 +6,125 @@ All notable changes to `paylod/paylod` are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-07-20
+
+**Breaking.** The unit of work for this release is not a findings list, it is
+`docs/SDK-CONFORMANCE.md` - the specification all four paylod SDKs are now measured against. Ten
+review rounds produced 95 distinct findings across Node, PHP, Python and JVM, and the dominant
+failure was never that a bug was hard to fix: it was that a fix landing in one SDK never reached
+the other three. An SDK is conformant when it satisfies every requirement in that document and has
+a non-vacuous test proving each.
+
+Every protection below is verified NON-VACUOUS by `scripts/non-vacuity.php`: **101/101 mutations
+caught** (up from 81/81), across **457 tests / 2269 assertions** (up from 412 / 1864). The golden
+webhook vector still signs byte-for-byte identically.
+
+### Fixed - CRITICAL: terminal failure now requires proof that no debit occurred
+
+Requirement 3.7 / 1.5. `DarajaCatalog::terminalStkCodes()` was derived by SUBTRACTION - every
+`stk_result` entry that was not `pending` and not `0`. That swept in codes 17, 26, 1001, 1025 and
+9999, whose OWN entries in the catalog say a debit is not disproven:
+
+> "a busy-system rejection is not proof no charge was raised"
+> "the in-flight transaction may be your own earlier push, and charging again could double-charge"
+
+The SDK's own data contradicted the verdict it reached from that data. `classifyStkResult()`
+answered `failed`, `Semantics` saw `EVIDENCE_FAILURE`, and a `failed` claim resolved to
+`VERDICT_FAILED` - a settled failure. That admitted signed `payment.failed` webhooks as final and
+told merchants the payment was over, on payments that may have been charged. The customer-facing
+message then said "Please try again."
+
+Code 1001 carried the identical defect and was not in the review finding.
+
+- `NO_DEBIT_PROOF_STK_CODES` states the property explicitly, in code rather than in the JSON table
+  (a verbatim copy of the monorepo's canonical file, which must not be hand-edited here).
+- `terminalStkCodes()` is the table INTERSECTED with that set; `inconclusiveStkCodes()` is its exact
+  complement, so no code can fall between the two.
+- `Semantics` gains `EVIDENCE_INCONCLUSIVE` with its own five rows, all INDETERMINATE. The verdict
+  table is now 5 claims x 7 evidence kinds, still total and still with no default arm.
+- Requirement 3.7's message rule is enforced for EVERY decoded entry, not just the four reported
+  codes: 17 entries carried a retry invitation beside `retryable => false`, including the
+  uncatalogued-code fallback itself. Non-retryable messages now fail closed onto a no-retry text.
+
+The tests couple the partition to the catalog's own prose, so neither the set nor the table can be
+edited into disagreement, and carry controls in both directions - an over-corrected model that calls
+every failure indeterminate is equally non-conformant (requirements 3.5 and 8.5).
+
+### Fixed - HIGH: the webhook credential scan reads the DECODED event, and knows every credential
+
+Requirements 4.6 and 4.7. The scan was `Redact::contains($raw, [$secret])`: the raw body, and the
+signing secret alone.
+
+- JSON string values may be spelled with `\uXXXX` escapes, so a secret written as `whsec_...` is
+  absent from the raw bytes and present in the decoded event. It slipped the refusal, was rewritten
+  to `[redacted]`, and was DELIVERED to the handler.
+- `verifyWebhook()` checked for no credential at all and answered a plain `true`; `parseWebhook()`
+  checked the API key against raw bytes only, and did so after the coherence rules had already run.
+
+`Redact::containsDeep()` walks the decoded structure - keys and string leaves, recursively - and
+fails closed past the parse depth. Both client surfaces pass every configured credential through one
+`Paylod::configuredCredentials()`, and the refusal happens before any semantic conclusion is drawn.
+
+### Fixed - HIGH: webhook payment ids get the shared identifier grammar
+
+Requirement 3.4. `data.paymentId` was checked with `trim($v) !== ''` and nothing else, so it
+accepted an echoed bearer token, a JSON fragment, a 200-byte blob - and, because the decoded event
+passes through the redactor before a handler sees it, the literal `[redacted]`. Every redacted event
+would have correlated to the same order.
+
+### Fixed - HIGH: the recovery scope is established before dispatch
+
+Requirement 5.4. `collectAndWait()` called `collect()` OUTSIDE its recovery `try`, and
+`Simulator::pay()` had the identical ordering. Once `collect()` returns the STK prompt is on the
+customer's phone; a throwable landing before control entered the protected block escaped with no
+idempotency key and no payment id, which a caller reads as "nothing happened". The `try` is now
+entered first and the acknowledgement context is published through an out-parameter as soon as it
+exists. A failure BEFORE acknowledgement is deliberately not rebound, and there is a control for it.
+
+### Fixed - MEDIUM: the simulator captures its acknowledged payment id
+
+Requirements 5.4 and 6.7. `Simulator::collect()`'s validator ran `Validate::collectAck()` and
+nothing else, so a malformed 202 carrying a usable `paymentId` threw with the id discarded - telling
+the caller "a charge may be live, go and read it" while withholding the id needed to read it.
+`Paylod::collect()` also declared `$acknowledgedPaymentId` below the simulator branch, so a throw
+from that branch made the catch read an UNDEFINED variable - and under a warning-to-exception
+handler, that raised a second throwable from inside the catch, destroying the original exception and
+the idempotency key with it.
+
+### Fixed - MEDIUM: the adversarial sweep can now fail
+
+Requirement 8.6. The sweep caught `\Throwable` and treated any exception as adequate, discarded
+successful `parseWebhook()` results, and took no sink from the boolean surface - so it could not
+detect escaped-credential delivery, and "covers every public type" was a claim in a comment. It now
+asserts which branches ran, captures successful returns and the boolean verdict, sweeps both literal
+and JSON-escaped credentials plus a non-credential-shaped secret, and carries a self-check
+enumerating every public type. That self-check found an uncovered type immediately.
+
+### Fixed - LOW: one depth constant, every parser
+
+Requirement 4.4. `Redact::MAX_DEPTH` was pinned to `JsonLexeme::MAX_DEPTH` with a test asserting the
+two were equal, but every `json_decode()` still passed its own literal `512` - so the constant could
+change while the parsers silently kept the old bound. The invariant is now enforced against the code
+by a sweep over every `json_decode()` call.
+
+### Verified - requirements found open in sibling SDKs
+
+- **2.6** (Node, JVM): no replacement semantics on any money path. `json_decode()` rejects malformed
+  UTF-8 outright and no path passes `JSON_INVALID_UTF8_SUBSTITUTE`, verified across five invalid
+  byte sequences and a lone-surrogate escape. Pinned with a test regardless.
+- **6.3** (Python): already satisfied. `CURLOPT_ENCODING` is never set, so decompression is refused
+  outright and the byte cap applies to wire bytes; a permanent test greps the source for it.
+- **3.6**: every exposed `retryable` field agrees with the verdict at every nesting level, across an
+  extended cross-product that now includes the inconclusive codes and terminal controls.
+- **8.7**: PHP carries no NUL or other raw control bytes. A permanent guard now walks `src`, `tests`
+  and `scripts` so it stays that way.
+
+### Removed
+
+- The vestigial `$warnedMissingIdempotencyKey` field. The once-per-process gate it controlled was
+  removed in an earlier round but the field outlived it, which is an invitation to re-introduce the
+  gate requirement 5.3 forbids.
+
 ## [0.9.0] - 2026-07-19
 
 **Breaking.** A ninth independent review - the first complete one since round 8 - found ONE

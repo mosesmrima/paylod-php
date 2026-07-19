@@ -86,9 +86,6 @@ final class Paylod
     /** The sandbox simulator: drive a payment to any of the five outcomes with no phone. */
     public readonly Simulator $simulator;
 
-    /** Warn at most once per process - a double-charge is a money bug, so it earns a loud warning. */
-    private static bool $warnedMissingIdempotencyKey = false;
-
     /**
      * @param string|array<string,mixed>|null $apiKey Your mp_live_... / mp_test_... key. Omit it to
      *   read PAYLOD_API_KEY from the environment. Pass an options array to use the object form.
@@ -930,7 +927,10 @@ final class Paylod
             . 'Pay, and persist on that attempt. See https://paylod.dev/docs/sdk#idempotency',
             E_USER_WARNING
         );
-        self::$warnedMissingIdempotencyKey = true;
+        // NO once-per-process flag is set here, deliberately (requirement 5.3). One used to be, and
+        // the dead field outlived the gate it controlled - an invitation to re-introduce it. N calls
+        // MUST emit N warnings: a worker that handles a thousand unprotected charges must say so a
+        // thousand times, because each one can charge a different customer twice.
     }
 
     /**
