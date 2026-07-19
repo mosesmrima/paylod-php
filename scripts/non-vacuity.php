@@ -938,6 +938,97 @@ $CASES = [
             ['src/Semantics.php', '        $claimed = is_string($rawClaim) ? Redact::text($rawClaim, []) : \'\';', '        $claimed = is_string($rawClaim) ? $rawClaim : \'\';'],
         ],
     ],
+// == ROUND 10 - requirement 3.7 / 1.5: terminal failure requires PROOF no debit occurred =====
+    //
+    // The round-10 Critical. `terminalStkCodes()` was derived by SUBTRACTION - everything that was
+    // not pending and not 0 - so codes 17, 26, 1001, 1025 and 9999 were terminal failures despite
+    // their own catalog entries saying a debit is not disproven. Reverting to that subtraction is
+    // the mutation below, and it must be caught from every direction the repair is stated in.
+    [
+        'id' => 'r10-terminal-by-subtraction',
+        'what' => 'terminal failure goes back to "every non-pending STK code", so 17/26/1001/1025/9999 '
+            . 'become settled failures again - THE ROUND-10 CRITICAL',
+        'test' => 'testEveryInconclusiveCodeDisclaimsProofAndNoTerminalCodeDoes',
+        'edits' => [
+            ['src/DarajaCatalog.php', '                if (in_array((string) $code, self::NO_DEBIT_PROOF_STK_CODES, true)) {', '                if (true) {'],
+        ],
+    ],
+    [
+        'id' => 'r10-inconclusive-not-terminal',
+        'what' => 'the same revert, caught through the CLASSIFIER and the semantic verdict',
+        'test' => 'testACodeThatDoesNotProveNoDebitIsNeverATerminalFailure',
+        'edits' => [
+            ['src/DarajaCatalog.php', '                if (in_array((string) $code, self::NO_DEBIT_PROOF_STK_CODES, true)) {', '                if (true) {'],
+        ],
+    ],
+    [
+        'id' => 'r10-inconclusive-webhook',
+        'what' => 'the same revert, caught on the SIGNED WEBHOOK path - a payment.failed event on an '
+            . 'inconclusive code is delivered as a settled failure again',
+        'test' => 'testASignedFailedWebhookOnAnInconclusiveCodeIsRefused',
+        'edits' => [
+            ['src/DarajaCatalog.php', '                if (in_array((string) $code, self::NO_DEBIT_PROOF_STK_CODES, true)) {', '                if (true) {'],
+        ],
+    ],
+    [
+        // THE CONTROL, and it is the reason this one reverts in the OPPOSITE direction. An
+        // over-corrected classifier that calls every failure indeterminate satisfies all three
+        // cases above and is just as non-conformant (requirements 3.5 and 8.5).
+        'id' => 'r10-over-correction-control',
+        'what' => 'NO code proves no debit any more, so genuine terminal failures (1032, 2028, ...) '
+            . 'stop being terminal - the OVER-CORRECTION requirement 3.5 warns about',
+        'test' => 'testACodeThatProvesNoDebitIsStillATerminalFailure',
+        'edits' => [
+            ['src/DarajaCatalog.php', '                if (in_array((string) $code, self::NO_DEBIT_PROOF_STK_CODES, true)) {', '                if (false) {'],
+        ],
+    ],
+    [
+        'id' => 'r10-partition-total',
+        'what' => 'the inconclusive set stops being the complement, so a non-pending STK code lands '
+            . 'in NEITHER set and is classified by neither branch',
+        'test' => 'testTheTerminalAndInconclusiveSetsPartitionTheNonPendingStkCodes',
+        'edits' => [
+            ['src/DarajaCatalog.php', '                if (!in_array((string) $code, self::NO_DEBIT_PROOF_STK_CODES, true)) {', '                if (false) {'],
+        ],
+    ],
+    [
+        // Requirement 3.7's message rule. BOTH arms are reverted: the override map and the
+        // fail-closed generic replacement. Reverting one alone leaves the other holding the line,
+        // which would prove nothing about the guarantee.
+        'id' => 'r10-retry-invitation',
+        'what' => 'a non-retryable code may invite another attempt again ("Please try again" beside '
+            . 'retryable => false) - BOTH the override map and the fail-closed fallback reverted',
+        'test' => 'testNoNonRetryableDecodedEntryEverInvitesAnotherAttempt',
+        'edits' => [
+            ['src/DarajaCatalog.php', '        if (isset(self::SAFE_CUSTOMER_MESSAGES[$code])) {', '        if (false) {'],
+            ['src/DarajaCatalog.php', '        if (preg_match(self::RETRY_INVITATION_RE, $message) === 1) {', '        if (false) {'],
+        ],
+    ],
+
+    [
+        // The other half of the control pair: the refusal above must not be an outage. Emptying the
+        // no-debit-proof set makes 1032 inconclusive too, so a legitimate cancellation event stops
+        // being deliverable.
+        'id' => 'r10-conclusive-webhook-delivered',
+        'what' => 'no code proves no debit, so even a genuine 1032 cancellation event is refused - '
+            . 'the refusal becomes an outage',
+        'test' => 'testASignedFailedWebhookOnAConclusiveCodeIsStillDelivered',
+        'edits' => [
+            ['src/DarajaCatalog.php', '                if (in_array((string) $code, self::NO_DEBIT_PROOF_STK_CODES, true)) {', '                if (false) {'],
+        ],
+    ],
+    [
+        // And the message rule must not be satisfied by flattening EVERY message onto the generic
+        // no-retry text - a retryable code legitimately offers a retry, and blanking it is a
+        // different kind of wrong answer.
+        'id' => 'r10-retryable-message-preserved',
+        'what' => 'the retryable early-return is dropped, so a genuinely retryable code (1032, no '
+            . 'money moved) loses its own customer message',
+        'test' => 'testRetryableEntriesKeepTheirOwnCustomerMessage',
+        'edits' => [
+            ['src/DarajaCatalog.php', "        if (\$retryable) {\n            return \$message;\n        }", "        if (false) {\n            return \$message;\n        }"],
+        ],
+    ],
 ];
 
 /**

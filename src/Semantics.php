@@ -93,6 +93,21 @@ final class Semantics
      * evidence; it is the absence of evidence dressed as a number.
      */
     public const EVIDENCE_UNKNOWN = 'unknown';
+    /**
+     * REQUIREMENT 3.7 - A CATALOGUED CODE THAT DOES NOT PROVE NO DEBIT OCCURRED.
+     *
+     * Distinct from EVIDENCE_FAILURE (the catalog proves no money moved) and from EVIDENCE_UNKNOWN
+     * (the catalog has never seen the code at all). Codes 17, 26, 1001, 1025 and 9999 are in the
+     * table, and their own entries say a charge may still have been raised - "a busy-system
+     * rejection is not proof no charge was raised", "charging again could double-charge".
+     *
+     * Before round 10 these were EVIDENCE_FAILURE, so `failed|failure` fired and the verdict was
+     * TERMINAL: a signed `payment.failed` webhook was accepted as settled and the merchant was told
+     * the payment failed, on payments where money may have moved. Its five rows below are all
+     * INDETERMINATE - the same treatment as an uncatalogued code, for the same reason. We cannot
+     * prove it either way, so we say so.
+     */
+    public const EVIDENCE_INCONCLUSIVE = 'inconclusive';
 
     // -- Stage 2 vocabulary: the resolved state -----------------------------------------------
 
@@ -131,6 +146,7 @@ final class Semantics
         self::EVIDENCE_IN_FLIGHT,
         self::EVIDENCE_CONFLICT,
         self::EVIDENCE_UNKNOWN,
+        self::EVIDENCE_INCONCLUSIVE,
     ];
 
     /**
@@ -253,6 +269,8 @@ final class Semantics
                 'success' => self::EVIDENCE_SUCCESS,
                 'failed' => self::EVIDENCE_FAILURE,
                 'pending' => self::EVIDENCE_IN_FLIGHT,
+                // REQUIREMENT 3.7. Catalogued, but the entry disclaims proof that no debit occurred.
+                'inconclusive' => self::EVIDENCE_INCONCLUSIVE,
                 // A code the catalog has never seen. Its own kind, not folded into any of the
                 // others - folding it into `pending` would assert a live prompt we cannot see, and
                 // folding it into `failure` is the round-9 High this arm exists to close.
@@ -367,6 +385,7 @@ final class Semantics
             ),
             'success|conflict' => $conflict,
             'success|unknown' => $contradiction(self::uncatalogued()),
+            'success|inconclusive' => $contradiction(self::inconclusive()),
 
             // -- claim = pending -------------------------------------------------------------
             // THE named hole. ['status' => 'pending', 'resultCode' => 0] used to come back paid,
@@ -384,6 +403,7 @@ final class Semantics
             'pending|in_flight' => [self::VERDICT_IN_FLIGHT, 'the payment is still on the handset'],
             'pending|conflict' => $conflict,
             'pending|unknown' => $contradiction(self::uncatalogued()),
+            'pending|inconclusive' => $contradiction(self::inconclusive()),
 
             // -- claim = failed --------------------------------------------------------------
             // L4. Includes the receipt-on-a-failed-row case that used to be rendered as
@@ -419,6 +439,11 @@ final class Semantics
                 . 'can be trusted'
             ),
             'failed|conflict' => $conflict,
+            // REQUIREMENT 3.7, THE ROW THAT WAS THE ROUND-10 CRITICAL. This pair - a `failed` claim
+            // beside code 17 / 26 / 1001 / 1025 / 9999 - used to route through `failed|failure` and
+            // resolve to VERDICT_FAILED. It is now indeterminate: the claim and the code agree that
+            // something went wrong, and NEITHER establishes that no money moved.
+            'failed|inconclusive' => $contradiction(self::inconclusive()),
             'failed|unknown' => $contradiction(self::uncatalogued()),
 
             // -- claim = cancelled (a terminal failure claim by another name) ------------------
@@ -438,6 +463,7 @@ final class Semantics
                 . 'record contradicts itself, so neither reading can be trusted'
             ),
             'cancelled|conflict' => $conflict,
+            'cancelled|inconclusive' => $contradiction(self::inconclusive()),
             'cancelled|unknown' => $contradiction(self::uncatalogued()),
 
             // -- claim = unknown --------------------------------------------------------------
@@ -451,7 +477,26 @@ final class Semantics
             'unknown|in_flight' => $contradiction(self::unrecognised($evidence)),
             'unknown|conflict' => $contradiction(self::unrecognised($evidence)),
             'unknown|unknown' => $contradiction(self::unrecognised($evidence)),
+            'unknown|inconclusive' => $contradiction(self::unrecognised($evidence)),
         };
+    }
+
+    /**
+     * REQUIREMENT 3.7 - the reason text for a catalogued-but-inconclusive result code.
+     *
+     * Deliberately NOT the same string as {@see uncatalogued()}: the two states differ in what we
+     * know. An uncatalogued code is one we have never seen. An inconclusive one we know perfectly
+     * well - we know it means the attempt did not complete cleanly, and we know the catalog says it
+     * does not settle whether the customer was debited. Telling a merchant "not in the catalog"
+     * about code 26 would be false, and the distinction is the whole reason this is its own
+     * evidence kind rather than being folded into EVIDENCE_UNKNOWN.
+     */
+    private static function inconclusive(): string
+    {
+        return 'the result code is in the catalog but does not prove that no money moved - a system '
+            . 'error, a busy-system rejection or a failed prompt delivery can all occur after a debit '
+            . 'has been raised, so this payment is NOT a settled failure and must NOT be charged '
+            . 'again until its final state is confirmed';
     }
 
     /**

@@ -103,6 +103,7 @@ final class SemanticsTest extends TestCase
         'success|in_flight' => Semantics::VERDICT_INDETERMINATE,
         'success|conflict' => Semantics::VERDICT_INDETERMINATE,
         'success|unknown' => Semantics::VERDICT_INDETERMINATE,
+        'success|inconclusive' => Semantics::VERDICT_INDETERMINATE,
 
         // claim = pending
         'pending|success' => Semantics::VERDICT_INDETERMINATE,
@@ -111,6 +112,7 @@ final class SemanticsTest extends TestCase
         'pending|in_flight' => Semantics::VERDICT_IN_FLIGHT,
         'pending|conflict' => Semantics::VERDICT_INDETERMINATE,
         'pending|unknown' => Semantics::VERDICT_INDETERMINATE,
+        'pending|inconclusive' => Semantics::VERDICT_INDETERMINATE,
 
         // claim = failed. Note `failed|in_flight`: the claim is terminal, the code says the prompt
         // is live, and the SDK refuses to pick a winner. Never failed (that invites a retry against
@@ -125,6 +127,7 @@ final class SemanticsTest extends TestCase
         'failed|in_flight' => Semantics::VERDICT_INDETERMINATE,
         'failed|conflict' => Semantics::VERDICT_INDETERMINATE,
         'failed|unknown' => Semantics::VERDICT_INDETERMINATE,
+        'failed|inconclusive' => Semantics::VERDICT_INDETERMINATE,
 
         // claim = cancelled (enumerated explicitly, never a default)
         'cancelled|success' => Semantics::VERDICT_INDETERMINATE,
@@ -134,6 +137,7 @@ final class SemanticsTest extends TestCase
         'cancelled|in_flight' => Semantics::VERDICT_INDETERMINATE,
         'cancelled|conflict' => Semantics::VERDICT_INDETERMINATE,
         'cancelled|unknown' => Semantics::VERDICT_INDETERMINATE,
+        'cancelled|inconclusive' => Semantics::VERDICT_INDETERMINATE,
 
         // claim = unknown - a status outside the closed set. Five rows, not one default.
         'unknown|success' => Semantics::VERDICT_INDETERMINATE,
@@ -142,6 +146,7 @@ final class SemanticsTest extends TestCase
         'unknown|in_flight' => Semantics::VERDICT_INDETERMINATE,
         'unknown|conflict' => Semantics::VERDICT_INDETERMINATE,
         'unknown|unknown' => Semantics::VERDICT_INDETERMINATE,
+        'unknown|inconclusive' => Semantics::VERDICT_INDETERMINATE,
     ];
 
     /**
@@ -161,6 +166,13 @@ final class SemanticsTest extends TestCase
             // A canonically shaped code the catalog has never heard of. Round 9: this used to
             // classify as a TERMINAL FAILURE purely because it looks like a number.
             Semantics::EVIDENCE_UNKNOWN => ['resultCode' => 87654],
+            // REQUIREMENT 3.7. Code 26 IS in the catalog - "M-Pesa system busy" - and its own entry
+            // says a busy-system rejection is not proof no charge was raised. Before round 10 this
+            // witness produced EVIDENCE_FAILURE and `failed|failure` resolved it to a TERMINAL
+            // failure. It is deliberately NOT 87654: this row must discriminate a catalogued
+            // inconclusive code from an uncatalogued one, and a witness that is not in the catalog
+            // would prove nothing about the partition (requirement 8.5).
+            Semantics::EVIDENCE_INCONCLUSIVE => ['resultCode' => 26],
         };
     }
 
@@ -206,11 +218,11 @@ final class SemanticsTest extends TestCase
         self::assertSame(self::EXPECTED[$key], $judgement->verdict, "wrong verdict for {$key}");
     }
 
-    /** The cross-product is COMPLETE: 5 claims x 6 evidence kinds, no more and no fewer. */
+    /** The cross-product is COMPLETE: 5 claims x 7 evidence kinds, no more and no fewer. */
     public function testTheTableCoversEveryClaimTimesEveryEvidenceKind(): void
     {
         $expectedPairs = count(Semantics::CLAIMS) * count(Semantics::EVIDENCE_KINDS);
-        self::assertSame(30, $expectedPairs, 'the alphabets changed - the table must change with them');
+        self::assertSame(35, $expectedPairs, 'the alphabets changed - the table must change with them');
         self::assertCount($expectedPairs, self::EXPECTED);
         self::assertCount($expectedPairs, self::tableProvider());
         self::assertSame(array_keys(self::EXPECTED), array_keys(array_flip(array_map(

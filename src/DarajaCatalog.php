@@ -164,7 +164,12 @@ final class DarajaCatalog
      * {@see \Paylod\Semantics} maps to its own evidence kind with its own five table rows, all
      * INDETERMINATE. Terminal failure is reserved for codes the catalog actually knows.
      *
-     * @return "pending"|"success"|"failed"|"unknown"
+     * -- AND A CATALOGUED CODE THAT DISCLAIMS PROOF IS NOT TERMINAL EITHER (requirement 3.7) ------
+     * The round-10 Critical. Being IN the catalog was treated as sufficient for a terminal verdict,
+     * but five entries (17, 26, 1001, 1025, 9999) say in their own `fix` text that a debit is not
+     * disproven. They now answer `inconclusive`. See {@see NO_DEBIT_PROOF_STK_CODES}.
+     *
+     * @return "pending"|"success"|"failed"|"inconclusive"|"unknown"
      */
     public static function classifyStkResult(mixed $resultCode, ?string $resultDesc = null): string
     {
@@ -211,8 +216,15 @@ final class DarajaCatalog
         // settled, while decode() described the very same code as indeterminate. Terminal failure is
         // the verdict that tells a merchant it is safe to charge again; it is not something to infer
         // from a number's shape.
+        // REQUIREMENT 3.7 - and terminal requires the entry to PROVE no money moved, not merely to
+        // exist. See {@see NO_DEBIT_PROOF_STK_CODES}. A catalogued code that disclaims proof (17, 26,
+        // 1001, 1025, 9999) is `inconclusive`: not success, not terminal failure, not a live prompt.
         if (isset(self::terminalStkCodes()[$raw])) {
             return 'failed';
+        }
+
+        if (isset(self::inconclusiveStkCodes()[$raw])) {
+            return 'inconclusive';
         }
 
         // STEP 6 - canonically shaped, but the catalog has never seen it. This proves NOTHING: not
@@ -233,10 +245,59 @@ final class DarajaCatalog
     /** @var array<string,true>|null */
     private static ?array $terminalCodes = null;
 
+    /** @var array<string,true>|null */
+    private static ?array $inconclusiveCodes = null;
+
     /**
-     * The STK codes the catalog knows to be TERMINAL, derived FROM the table for the same reason
-     * {@see pendingResultCodes()} is: the classifier and the decoder must not be able to disagree
-     * about which codes exist.
+     * REQUIREMENT 3.7 / 1.5 - THE CODES THAT ACTUALLY PROVE NO DEBIT OCCURRED.
+     *
+     * PHP IS THE REFERENCE IMPLEMENTATION FOR THIS SET. Node, Python and JVM port it from here.
+     * Do NOT "simplify" this back into "every non-pending STK entry is terminal" - that was the
+     * round-10 Critical, and it is a money bug. Read the next four paragraphs before touching it.
+     *
+     * -- What went wrong -------------------------------------------------------------------------
+     * {@see terminalStkCodes()} used to be derived by SUBTRACTION: every stk_result entry that was
+     * not `pending` and not `0` was terminal. That silently swept in codes 17, 26, 1001, 1025 and
+     * 9999 - whose OWN entries in this very table say, in the `fix` prose, that a debit is NOT
+     * disproven ("a busy-system rejection is not proof no charge was raised", "the in-flight
+     * transaction may be your own earlier push, and charging again could double-charge").
+     *
+     * The consequences ran the whole length of the money path. classifyStkResult() answered
+     * `failed`, so Semantics saw EVIDENCE_FAILURE, so a `failed` claim resolved to VERDICT_FAILED -
+     * a TERMINAL failure. That let a signed `payment.failed` webhook through as a settled failure,
+     * and it put a "the payment failed" reading in front of a merchant, on a payment where money
+     * may well have moved. The SDK's own data contradicted the advice the SDK gave.
+     *
+     * -- Why the property lives here and not in the JSON ------------------------------------------
+     * `src/resources/daraja-error-codes.json` is a VERBATIM copy of the monorepo's canonical table
+     * (see the class docblock). Hand-editing it here would be silently undone by the next sync, so
+     * the property is asserted in code instead - and {@see \Paylod\Semantics} is not allowed to
+     * drift from it because `DarajaCatalogTest` cross-checks this set against the table's own prose:
+     * any entry whose text disclaims proof MUST NOT appear below. The test is the coupling.
+     *
+     * -- Membership rule --------------------------------------------------------------------------
+     * A code belongs here ONLY if the catalog affirmatively establishes that no money moved:
+     *   1     insufficient balance - M-Pesa declined for want of funds, nothing was debited.
+     *   1019  "Transaction expired ... Terminal: no money moved."
+     *   1032  "pressed Cancel instead of entering their M-Pesa PIN. No money moved."
+     *   1037  prompt unanswered - "Terminal: no money moved."
+     *   2001  wrong M-Pesa PIN - the debit is never authorised without a correct PIN.
+     *   2028  amount above the customer's M-Pesa limit - refused before any debit.
+     *   2029  till sent as a paybill (or the reverse) - Daraja refuses the request outright.
+     *
+     * Everything else that is not `pending` and not `0` is INCONCLUSIVE, which is its own answer
+     * with its own evidence kind and its own five INDETERMINATE rows in the semantic table. It is
+     * NOT terminal failure, and it is NOT "pending" either - claiming a live prompt would be just as
+     * much of a guess in the other direction.
+     */
+    private const NO_DEBIT_PROOF_STK_CODES = ['1', '1019', '1032', '1037', '2001', '2028', '2029'];
+
+    /**
+     * The STK codes the catalog knows to be TERMINAL, i.e. the catalog PROVES no money moved.
+     *
+     * Still derived FROM the table - a code that leaves the table leaves this set too, for the same
+     * reason {@see pendingResultCodes()} is derived - but INTERSECTED with the no-debit-proof set
+     * above, so membership requires the table AND an affirmative statement that nothing was debited.
      *
      * @return array<string,true>
      */
@@ -244,22 +305,71 @@ final class DarajaCatalog
     {
         if (self::$terminalCodes === null) {
             $set = [];
-            foreach (self::allEntries() as $e) {
-                if (($e['family'] ?? null) !== 'stk_result') {
-                    continue;
+            foreach (self::nonPendingStkCodes() as $code => $_) {
+                // (string) IS LOad-BEARING. PHP silently converts an array key that looks like a
+                // decimal integer into an int, so `"1032"` comes back out of the array as int 1032
+                // and a STRICT in_array() against a list of strings matches NOTHING. Written without
+                // the cast, this loop produced an EMPTY terminal set - every code inconclusive -
+                // which the tests caught immediately. A looser comparison would "work" and would
+                // also match `"1032 "`-shaped junk, so the cast is the right repair, not `false`.
+                if (in_array((string) $code, self::NO_DEBIT_PROOF_STK_CODES, true)) {
+                    $set[(string) $code] = true;
                 }
-                if (($e['category'] ?? null) === 'pending') {
-                    continue;
-                }
-                if ((string) $e['code'] === '0') {
-                    continue;
-                }
-                $set[(string) $e['code']] = true;
             }
             self::$terminalCodes = $set;
         }
 
         return self::$terminalCodes;
+    }
+
+    /**
+     * REQUIREMENT 3.7 - the non-pending STK codes that do NOT prove no debit occurred.
+     *
+     * The exact complement of {@see terminalStkCodes()} within the table, so no code can fall
+     * between the two sets and no code can be in both. Exported so the tests can walk it, and so the
+     * sibling SDKs can port the partition rather than re-deriving it and getting it wrong again.
+     *
+     * @return array<string,true>
+     */
+    public static function inconclusiveStkCodes(): array
+    {
+        if (self::$inconclusiveCodes === null) {
+            $set = [];
+            foreach (self::nonPendingStkCodes() as $code => $_) {
+                // (string) is load-bearing here for the same reason - see terminalStkCodes().
+                if (!in_array((string) $code, self::NO_DEBIT_PROOF_STK_CODES, true)) {
+                    $set[(string) $code] = true;
+                }
+            }
+            self::$inconclusiveCodes = $set;
+        }
+
+        return self::$inconclusiveCodes;
+    }
+
+    /**
+     * Every stk_result code that is neither `pending` nor `0`. The universe the terminal /
+     * inconclusive partition is taken over.
+     *
+     * @return array<string,true>
+     */
+    private static function nonPendingStkCodes(): array
+    {
+        $set = [];
+        foreach (self::allEntries() as $e) {
+            if (($e['family'] ?? null) !== 'stk_result') {
+                continue;
+            }
+            if (($e['category'] ?? null) === 'pending') {
+                continue;
+            }
+            if ((string) $e['code'] === '0') {
+                continue;
+            }
+            $set[(string) $e['code']] = true;
+        }
+
+        return $set;
     }
 
     /**
@@ -427,15 +537,119 @@ final class DarajaCatalog
      */
     private static function decodedFrom(string $code, array $entry): array
     {
+        $retryable = (bool) $entry['retryable'];
+
         return [
             'code' => $code,
             'title' => (string) $entry['title'],
             'cause' => (string) $entry['cause'],
             'fix' => (string) $entry['fix'],
             'category' => (string) $entry['category'],
-            'retryable' => (bool) $entry['retryable'],
-            'customerMessage' => (string) $entry['customerMessage'],
+            'retryable' => $retryable,
+            'customerMessage' => self::safeCustomerMessage(
+                $code,
+                (string) $entry['customerMessage'],
+                $retryable,
+            ),
         ];
+    }
+
+    /**
+     * REQUIREMENT 3.7 - A CUSTOMER MESSAGE MUST NOT INVITE ANOTHER ATTEMPT WHEN `retryable` IS FALSE.
+     *
+     * PHP IS THE REFERENCE IMPLEMENTATION FOR THIS CHECK. Do not delete it and do not narrow it to
+     * the five STK codes that motivated it - the point is that it is UNIVERSAL, applied at the one
+     * place every decoded entry is built, so a table re-sync that adds a new non-retryable entry
+     * with "please try again" in it cannot re-open the hole.
+     *
+     * -- Why the table cannot simply be corrected -------------------------------------------------
+     * `retryable` on this SDK means SAFE TO CHARGE AGAIN: we know no money moved and no charge is
+     * still in flight (see the class docblock). So `retryable === false` means precisely that we
+     * CANNOT establish that, and a message reading "Please try again" is then the SDK telling a
+     * customer to do the one thing its own data says it cannot vouch for. Seventeen entries were in
+     * that state, four of them the codes named in requirement 3.7. The table is a verbatim copy of
+     * the monorepo's canonical file and must not be hand-edited here, so the rule is enforced in
+     * code and the overrides live in code beside it.
+     *
+     * The override map is keyed by code. A non-retryable entry with no override, and no retry
+     * invitation in its own text, keeps its own message - most already do. A non-retryable entry
+     * that DOES invite a retry and has no override falls back to the generic no-retry message
+     * rather than being emitted as written: fail closed, never pass through.
+     */
+    private const RETRY_INVITATION_RE =
+        '/\b(?:try(?:ing)?\s+(?:again|it\s+again)|retry|re-try|again\s+(?:in|shortly|later|whenever))\b/i';
+
+    /**
+     * Safe replacements for the non-retryable entries whose catalog copy invites another attempt.
+     * Each preserves the actionable content and removes the imperative to pay again.
+     */
+    private const SAFE_CUSTOMER_MESSAGES = [
+        // No proof no debit occurred - these must steer to CONFIRMATION, never to a second attempt.
+        '17' => 'M-Pesa had a problem and we could not confirm this payment. Please check your M-Pesa '
+            . 'messages before paying again - we will confirm the outcome shortly.',
+        '26' => 'M-Pesa is busy and we could not confirm this payment. Please check your M-Pesa '
+            . 'messages before paying again - we will confirm the outcome shortly.',
+        '1025' => 'We could not reach M-Pesa and cannot confirm this payment. Please check your M-Pesa '
+            . 'messages before paying again - we will confirm the outcome shortly.',
+        '9999' => 'We could not reach M-Pesa and cannot confirm this payment. Please check your M-Pesa '
+            . 'messages before paying again - we will confirm the outcome shortly.',
+        '1001' => 'You have another M-Pesa request open. Please finish it, then check your M-Pesa '
+            . 'messages - this payment may already have gone through.',
+        '500.001.1001' => 'M-Pesa returned an error and we could not confirm this payment. Please check '
+            . 'your M-Pesa messages before paying again - we will confirm the outcome shortly.',
+        // Setup and configuration errors. The request was refused, so nothing was charged, but the
+        // customer cannot fix these and must not be sent round the loop again.
+        '2029' => 'We hit a setup error on our side, so this payment was not started. Our team is '
+            . 'looking into it - please contact support if you need this urgently.',
+        '400.002.02' => 'We hit a setup error on our side, so this payment was not started. Our team is '
+            . 'looking into it - please contact support if you need this urgently.',
+        '400.002.05' => 'We hit a setup error on our side, so this payment was not started. Our team is '
+            . 'looking into it - please contact support if you need this urgently.',
+        '404.001.04' => 'We hit an authentication error on our side, so this payment was not started. '
+            . 'Our team is looking into it - please contact support if you need this urgently.',
+        'Bad Request - Invalid Initiator Information' => 'We hit a setup error on our side, so this '
+            . 'payment was not started. Our team is looking into it - please contact support if you '
+            . 'need this urgently.',
+        'C2B00015' => 'We hit a setup error on our side, so this payment was not started. Our team is '
+            . 'looking into it - please contact support if you need this urgently.',
+        // Customer-correctable input. State what is wrong; do not command a fresh attempt.
+        '400.008.02' => 'That phone number is not valid, so this payment was not started. Please check '
+            . 'the number.',
+        'C2B00012' => 'That account or reference number was not found, so this payment was not started. '
+            . 'Please check it.',
+        'C2B00013' => 'That payment amount was not accepted, so this payment was not started. Please '
+            . 'check the amount.',
+        'C2B00016' => 'We could not accept this payment, so nothing was charged. Please check your '
+            . 'payment details.',
+        // 2001 on the B2C/C2B surface is an INITIATOR credential failure, not a customer PIN error.
+        // (The STK-family 2001 is a wrong customer PIN, is retryable, and never reaches this map.)
+        '2001' => 'We hit a setup error on our side, so this payment was not started. Our team is '
+            . 'looking into it - please contact support if you need this urgently.',
+    ];
+
+    /** The last-resort non-retryable message. Used when an entry invites a retry and has no override. */
+    private const GENERIC_NO_RETRY_MESSAGE =
+        'We could not confirm this payment. Please check your M-Pesa messages before paying again - '
+        . 'we will confirm the outcome shortly.';
+
+    private static function safeCustomerMessage(string $code, string $message, bool $retryable): string
+    {
+        // A retryable code is one we have PROVEN safe to charge again, so its message may say so.
+        if ($retryable) {
+            return $message;
+        }
+
+        if (isset(self::SAFE_CUSTOMER_MESSAGES[$code])) {
+            return self::SAFE_CUSTOMER_MESSAGES[$code];
+        }
+
+        // FAIL CLOSED. An uncovered non-retryable entry that invites a retry is replaced wholesale
+        // rather than emitted, so adding a row to the table can never add a retry invitation.
+        if (preg_match(self::RETRY_INVITATION_RE, $message) === 1) {
+            return self::GENERIC_NO_RETRY_MESSAGE;
+        }
+
+        return $message;
     }
 
     /**
@@ -535,7 +749,11 @@ final class DarajaCatalog
                 . 'in the catalog, so we cannot prove no money moved.',
             'category' => 'mpesa_system',
             'retryable' => false,
-            'customerMessage' => 'The payment didn\'t go through. Please try again.',
+            // REQUIREMENT 3.7. This said "The payment didn't go through. Please try again." beside
+            // `retryable => false` and a `fix` that states, in the same array, that we CANNOT prove
+            // no money moved. An uncatalogued code is the case where we know least, so it is the
+            // last place that may invite a second charge.
+            'customerMessage' => self::GENERIC_NO_RETRY_MESSAGE,
         ];
     }
 }

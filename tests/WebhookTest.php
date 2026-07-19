@@ -414,7 +414,9 @@ final class WebhookTest extends TestCase
         $failed['type'] = 'payment.failed';
         $failed['data']['status'] = 'failed';
         $failed['data']['mpesaReceipt'] = null;
-        $failed['data']['resultCode'] = 17; // an M-Pesa system error - NOT safe to charge again
+        // Requirement 3.7: 2028 is over-limit - terminal, PROVEN no debit, and NOT retryable. Code 17
+        // was used here and is now inconclusive, so it cannot carry a settled failure event.
+        $failed['data']['resultCode'] = 2028; // terminal, and NOT safe to charge again
         $failed['data']['resultDesc'] = 'Rule limited';
         $failed['data']['decoded'] = ['retryable' => true, 'category' => 'customer'];
         $failed['data']['retryable'] = true;

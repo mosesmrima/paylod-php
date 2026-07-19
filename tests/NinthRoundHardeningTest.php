@@ -353,7 +353,10 @@ final class NinthRoundHardeningTest extends TestCase
                 'data' => [
                     'paymentId' => 'pay_123',
                     'status' => 'failed',
-                    'resultCode' => 17,
+                    // Requirement 3.7: 2028 PROVES no debit (over-limit is refused before any
+                    // debit), so it is a real terminal failure. Code 17 used to be used here and is
+                    // now INCONCLUSIVE - it can no longer support a `payment.failed` event.
+                    'resultCode' => 2028,
                     $field => $smuggled,
                 ],
             ], JSON_THROW_ON_ERROR);
@@ -384,7 +387,8 @@ final class NinthRoundHardeningTest extends TestCase
                 'status' => 'failed',
                 'amount' => 100,
                 'phone' => '254712345678',
-                'resultCode' => 17,
+                // Requirement 3.7 - see above. A conclusive terminal code, not an inconclusive one.
+                'resultCode' => 2028,
             ],
         ], JSON_THROW_ON_ERROR);
 

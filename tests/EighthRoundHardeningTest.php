@@ -267,7 +267,10 @@ final class EighthRoundHardeningTest extends TestCase
             'paymentId' => 'pay_123',
             'status' => 'failed',
             'mpesaReceipt' => null,
-            'resultCode' => 17,
+            // Requirement 3.7: this test is about forged RETRYABILITY flags, so it needs a code that
+            // really is a terminal failure. 2028 proves no debit occurred; 17 does not, and is now
+            // refused outright as a failure event rather than delivered with its flags corrected.
+            'resultCode' => 2028,
             'resultDesc' => 'system error',
             // Every one of these was forwarded verbatim before the allowlist.
             'details' => ['retryable' => true],
@@ -739,10 +742,33 @@ final class EighthRoundHardeningTest extends TestCase
             'in flight, code 4999' => [$record('pending', null, 4999), 'pending', false],
             // TERMINAL FAILURE - the ONE place the nested flag may be true, and only in step.
             'terminal, retryable code' => [$record('failed', null, 1032), 'cancelled', true],
-            'terminal, non-retryable code 17' => [$record('failed', null, 17), 'failed', false],
-            'terminal, non-retryable code 26' => [$record('failed', null, 26), 'failed', false],
-            'terminal, non-retryable code 1025' => [$record('failed', null, 1025), 'failed', false],
-            'terminal, non-retryable code 9999' => [$record('failed', null, 9999), 'failed', false],
+            // REQUIREMENT 3.7 - THE ROUND-10 CRITICAL, PINNED AS FIXTURES.
+            //
+            // These four rows used to read ('failed', false): a TERMINAL verdict. Codes 17, 26,
+            // 1025 and 9999 are in the catalog, but their own entries say in so many words that a
+            // debit is NOT disproven ("a busy-system rejection is not proof no charge was raised").
+            // A terminal `failed` on such a code tells a merchant the payment is settled and lets a
+            // signed `payment.failed` webhook through as final - on a payment that may have been
+            // charged. They are INDETERMINATE, which renders as `pending`, so wait() keeps polling
+            // and the webhook settles it.
+            'inconclusive, code 17' => [$record('failed', null, 17), 'pending', false],
+            'inconclusive, code 26' => [$record('failed', null, 26), 'pending', false],
+            'inconclusive, code 1025' => [$record('failed', null, 1025), 'pending', false],
+            'inconclusive, code 9999' => [$record('failed', null, 9999), 'pending', false],
+            // 1001 is the SAME defect and was NOT in the round-10 finding. Its entry says the
+            // in-flight transaction "may be your own earlier push, and charging again could
+            // double-charge".
+            'inconclusive, code 1001' => [$record('failed', null, 1001), 'pending', false],
+            // THE CONTROLS (requirement 8.5). Without these the four rows above are satisfied by an
+            // over-corrected model that calls every failure indeterminate, which is the failure mode
+            // requirement 3.5 warns about. These codes ARE terminal - the catalog affirmatively
+            // establishes that no money moved - and they must still resolve to a settled failure.
+            // 2028 and 2029 are non-retryable AND terminal, so they also prove the two properties
+            // are independent rather than the model simply mirroring `retryable`.
+            'terminal control, over limit 2028' => [$record('failed', null, 2028), 'failed', false],
+            'terminal control, till/paybill 2029' => [$record('failed', null, 2029), 'failed', false],
+            'terminal control, expired 1019' => [$record('failed', null, 1019), 'failed', true],
+            'terminal control, wrong PIN 2001' => [$record('failed', null, 2001), 'failed', true],
         ];
     }
 
