@@ -1178,6 +1178,28 @@ $CASES = [
 ];
 
 /**
+ * Strip ANSI SGR escape sequences from captured child output.
+ *
+ * DO NOT REMOVE THIS, AND DO NOT REMOVE THE `--colors=never` BELOW. Either one alone looks
+ * redundant; together they are the point. Every verdict this harness reaches is derived by
+ * regex from PHPUnit's summary line, and under `--colors=always` PHPUnit paints that line as
+ * "\e[37;41mTests: 1\e[0m\e[37;41m, Assertions: 1\e[0m..." - the reset lands BETWEEN the digit
+ * and the comma, so `/Tests: (\d+),/` matches NOTHING and $passed silently stays 0.
+ *
+ * That bug was already present and was inert only BY ACCIDENT: PHPUnit has no CI colour
+ * heuristic and declines to colourise when stdout is a pipe, which is how exec() captures it.
+ * A future PHPUnit that adds a CI heuristic, or any wrapper/terminal multiplexer that forces
+ * colour, resurrects it instantly. It fails closed (a missed count reads as BROKEN-SELECTOR
+ * rather than a false pass), but a harness whose correctness rests on a child process's
+ * present-day default is not a harness anyone should trust. Belt and braces: tell the child
+ * not to colourise, AND strip colour before any parse in case it does anyway.
+ */
+function stripAnsi(string $text): string
+{
+    return (string) preg_replace('/\e\[[0-9;]*m/', '', $text);
+}
+
+/**
  * Run PHPUnit for one selector.
  *
  * @return array{code:int, passed:int, failed:int, executed:bool}
@@ -1188,9 +1210,10 @@ function runTests(string $selector): array
     // test is named `method with data set "..."`, so a `$` anchor matched none of them and
     // reported BROKEN-SELECTOR - this harness's own documented trap, sprung on itself.
     $cmd = 'vendor/bin/phpunit --filter ' . escapeshellarg('/::' . preg_quote($selector, '/') . '(?:$| with data set)/')
-        . ' --do-not-cache-result 2>&1';
+        . ' --do-not-cache-result --colors=never 2>&1';
     exec($cmd, $lines, $code);
-    $out = implode("\n", $lines);
+    // Stripped ONCE, here, before any parse below can see an escape sequence. See stripAnsi().
+    $out = stripAnsi(implode("\n", $lines));
 
     $passed = 0;
     // "OK (12 tests, 30 assertions)" on a clean run.
