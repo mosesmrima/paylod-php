@@ -78,6 +78,6 @@
         "sync-catalog": "Re-copy the canonical Daraja code table out of the paylod monorepo into src/resources/. The vendored copy is GENERATED - never hand-edit it.",
         "catalog-drift": "Fail if the vendored Daraja code table has drifted from its canonical source. Skips cleanly when the monorepo is not checked out, since a published-package consumer has nothing to compare against.",
         "non-vacuity": "Revert each landed protection in isolation and require its test to FAIL. A test that passes with and without the fix it claims to cover proves nothing.",
-        "test": "Catalog drift check, PHPUnit, then the non-vacuity mutation harness. The harness is part of `test` on purpose: while it was a separate command, ordinary CI reported success without ever exercising it."
+        "test": "Catalog drift check, PHPUnit, then the non-vacuity mutation harness. The harness is part of `test` on purpose: while it was a separate command, an ordinary test run reported success without ever exercising it. GitHub Actions runs this chain on every push and pull request."
     }
 }

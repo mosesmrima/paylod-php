@@ -6,6 +6,36 @@ All notable changes to `paylod/paylod` are documented here. The format follows
 
 ## [Unreleased]
 
+### Added - the test chain now runs in CI (`.github/workflows/ci.yml`)
+
+Until now this repository had no CI configuration of any kind, and `composer test` - including the
+non-vacuity mutation harness - had only ever been run by hand before a release. The mutation counts
+recorded in the entries below are real and were reproduced on demand, but they were certified by a
+maintainer at a terminal, not by an automated pipeline. No release before this one was CI-verified,
+and this entry does not claim otherwise.
+
+From now on GitHub Actions runs the full `composer test` chain - catalog drift, PHPUnit, then the
+102-case non-vacuity harness - on every push and every pull request, across PHP 8.2, 8.3 and 8.4.
+Composer relays a script's nonzero exit and aborts the chain, so a single escaped mutation fails the
+job. A final step asserts the harness left the working tree byte-identical, catching any failure of
+its restore guard rather than letting mutated source survive the run.
+
+### Fixed - the harness no longer depends on PHPUnit declining to colourise a pipe
+
+`runTests()` read PHPUnit's summary line with `/Tests: (\d+),/`. Under `--colors=always` PHPUnit
+paints that line as `\e[37;41mTests: 1\e[0m\e[37;41m, Assertions: 1\e[0m...`, placing the reset
+sequence between the digit and the comma, so the pattern matched nothing and the test count silently
+stayed 0.
+
+This was never observed, because PHPUnit has no CI colour heuristic and does not colourise when its
+stdout is a pipe - which is how `exec()` captures it. The harness was correct only by accident of a
+child process's present-day default, and it would have broken the moment a future PHPUnit added such
+a heuristic or a wrapper forced colour. It failed closed (a lost count reads as `BROKEN-SELECTOR`,
+never as a false pass), so no past result is in doubt.
+
+Fixed on both sides: the child is invoked with `--colors=never`, and the captured output is passed
+through `stripAnsi()` before any parse, so forced colour cannot resurrect the defect either.
+
 ## [0.10.1] - 2026-07-20
 
 Patch. No API change. Two fixes: an ordering defect in the customer-message layer that reported an
@@ -78,7 +108,7 @@ The copy is now GENERATED, mirroring the Node SDK's `sync-daraja-catalog.mjs`:
 The monorepo is located at `../mpesa` by default, overridable with `MPESA_REPO=/path`. In
 `--check` mode an absent monorepo warns and exits 0 - a published-package consumer has nothing to
 compare against - while write mode treats it as an error. `--check` is wired into `composer test`
-ahead of PHPUnit, so CI fails on drift rather than shipping it.
+ahead of PHPUnit, so a full test run fails on drift rather than shipping it.
 
 ### Added - drift and duplicate-code guards (`tests/DarajaCatalogDriftTest.php`)
 
@@ -295,8 +325,8 @@ money path sat in the gap.
   asserts the classifier, the semantic verdict, the rendered outcome and the webhook refusal.
 - The scanner/parser divergence test never reached the fail-closed branch. A test-only scanner depth
   seam makes the divergence reachable, and the branch is now mutation-tested.
-- **The non-vacuity harness is part of `composer test`.** While it was a separate command, ordinary
-  CI could report success without ever exercising it.
+- **The non-vacuity harness is part of `composer test`.** While it was a separate command, an
+  ordinary test run could report success without ever exercising it.
 
 ### Found by the new adversarial sweep
 

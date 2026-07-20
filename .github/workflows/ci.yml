@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: PHP ${{ matrix.php }}
+    runs-on: ubuntu-latest
+    # The non-vacuity harness runs one PHPUnit process per mutation case (102 of them), so this
+    # job is minutes, not seconds. Give it room rather than letting a slow runner read as a failure.
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # composer.json requires "php": "^8.2".
+        php: ['8.2', '8.3', '8.4']
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up PHP ${{ matrix.php }}
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          # Mirrors the ext-* entries in composer.json's "require".
+          extensions: curl, json, hash
+          coverage: none
+          ini-values: error_reporting=E_ALL
+
+      - name: Resolve the Composer cache directory
+        id: composer-cache
+        run: echo "dir=$(composer config cache-files-dir)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Composer downloads
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.composer-cache.outputs.dir }}
+          key: composer-${{ runner.os }}-php${{ matrix.php }}-${{ hashFiles('**/composer.lock', '**/composer.json') }}
+          restore-keys: |
+            composer-${{ runner.os }}-php${{ matrix.php }}-
+
+      - name: Install dependencies
+        run: composer install --prefer-dist --no-interaction --no-progress
+
+      # `composer test` chains catalog-drift, phpunit, then the non-vacuity mutation harness.
+      # Composer relays a script's nonzero exit status and aborts the rest of the chain, so a
+      # single escaped mutation fails this job. That propagation is the whole point of running
+      # the chain rather than PHPUnit alone: a suite whose tests pass with AND without the fixes
+      # they claim to cover is a suite that proves nothing, and until this workflow existed the
+      # harness had only ever been run by hand.
+      #
+      # catalog-drift needs the paylod monorepo at ../mpesa to compare against. It is absent on a
+      # runner, and --check warns and exits 0 in that case by design - a checkout of this package
+      # alone has nothing to diff. The drift guard is a maintainer-side check, not a CI gate.
+      - name: Run the full test chain (catalog drift, PHPUnit, non-vacuity)
+        run: composer test
+
+      # The harness rewrites files under src/ to plant each mutation and restores them through a
+      # register_shutdown_function guard, so it must leave the tree exactly as it found it. If a
+      # crash ever outruns that guard, this step catches the residue instead of letting a later
+      # job build from mutated source.
+      - name: Assert the harness left no residue in the working tree
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "Working tree is dirty after the test chain - the non-vacuity restore guard did not fully run:"
+            git status --porcelain
+            git diff
+            exit 1
+          fi
+          echo "Working tree is clean."
