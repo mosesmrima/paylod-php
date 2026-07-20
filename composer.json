@@ -76,7 +76,7 @@
     "scripts-descriptions": {
         "phpunit": "The test suite on its own.",
         "sync-catalog": "Re-copy the canonical Daraja code table out of the paylod monorepo into src/resources/. The vendored copy is GENERATED - never hand-edit it.",
-        "catalog-drift": "Fail if the vendored Daraja code table has drifted from its canonical source. Skips cleanly when the monorepo is not checked out, since a published-package consumer has nothing to compare against.",
+        "catalog-drift": "Fail if the vendored Daraja code table has drifted. NEVER skips: it verifies the copy against the committed digests in daraja-catalog.sha256, which needs no monorepo checkout, no network and no credential, and it fails closed if that file is missing, empty or malformed. When the private monorepo IS checked out beside this repo it additionally compares against the canonical file. It used to exit 0 when the monorepo was absent - which in CI is always, so it verified nothing.",
         "non-vacuity": "Revert each landed protection in isolation and require its test to FAIL. A test that passes with and without the fix it claims to cover proves nothing.",
         "test": "Catalog drift check, PHPUnit, then the non-vacuity mutation harness. The harness is part of `test` on purpose: while it was a separate command, an ordinary test run reported success without ever exercising it. GitHub Actions runs this chain on every push and pull request."
     }

@@ -1175,6 +1175,48 @@ $CASES = [
             ['src/Semantics.php', '        return preg_match(self::RECEIPT_RE, $receipt) === 1;', "        return preg_match('/^.{10}\\z/u', \$receipt) === 1;"],
         ],
     ],
+
+    // == ROUND 11 - the catalog drift guard must not be able to verify nothing ====================
+    //
+    // The guard's previous failure mode was not a wrong answer, it was NO answer: with the private
+    // monorepo absent (which in CI is always) it skipped and exited green. These three cases revert
+    // the three ways it could go back to being vacuous. Each mutates the shared verifier, so both
+    // the composer script and the PHPUnit guard are covered by one edit.
+    [
+        'id' => 'r11-pinned-check-actually-runs',
+        'what' => 'the pinned-digest verification stops iterating the pinned rows, so the guard '
+            . 'reports success having hashed nothing - the CI-vacuity bug, restored',
+        'test' => 'testVendoredCatalogMatchesItsPinnedDigest',
+        'edits' => [
+            [
+                'scripts/DarajaCatalogVerifier.php',
+                "        \$log = [];\n        foreach (\$this->pinnedRows() as \$row) {",
+                "        \$log = [];\n        foreach ([] as \$row) {",
+            ],
+        ],
+    ],
+    [
+        'id' => 'r11-zero-data-rows-is-not-a-pass',
+        'what' => 'a checksum file that pins NOTHING is accepted, so an empty or comments-only '
+            . 'daraja-catalog.sha256 makes the guard vacuous instead of red',
+        'test' => 'testGuardFailsClosedOnABrokenChecksumFile',
+        'edits' => [
+            ['scripts/DarajaCatalogVerifier.php', '        if ($rows === []) {', '        if (false) {'],
+        ],
+    ],
+    [
+        'id' => 'r11-missing-pinned-file-is-not-skipped',
+        'what' => 'a pinned row naming a file that is not on disk is quietly skipped rather than '
+            . 'failing, so deleting the vendored catalog would satisfy the guard',
+        'test' => 'testGuardFailsWhenAPinnedFileIsMissing',
+        'edits' => [
+            [
+                'scripts/DarajaCatalogVerifier.php',
+                "                throw new RuntimeException(\n                    \"vendored file listed in \" . self::CHECKSUM_FILE . \" is missing: {\$row['vendoredRel']}\"\n                );",
+                '                continue;',
+            ],
+        ],
+    ],
 ];
 
 /**
