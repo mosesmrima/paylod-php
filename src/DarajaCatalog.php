@@ -645,17 +645,37 @@ final class DarajaCatalog
             return $message;
         }
 
-        if (isset(self::SAFE_CUSTOMER_MESSAGES[$code])) {
-            return self::SAFE_CUSTOMER_MESSAGES[$code];
+        // ORDERING: THE TEST COMES BEFORE THE OVERRIDE. This block used to consult
+        // SAFE_CUSTOMER_MESSAGES first and only fall through to the regex when the code was absent
+        // from the map, which meant the override replaced the catalog's text whether or not that
+        // text needed replacing. Two things went wrong with that, and the second one costs money:
+        //
+        //   * The map is keyed by CODE ALONE while the catalog is keyed by (code, family), so a
+        //     single override reached every family a code appears in. `500.001.1001` exists twice:
+        //     `api_error` (terminal "M-Pesa returned an error") and `stk_result`, where its
+        //     category is PENDING and the canonical message is "Check your phone and enter your
+        //     M-Pesa PIN to complete this payment." The api_error override was applied to both, so
+        //     a customer with a live STK prompt on their handset was told the payment could not be
+        //     completed and to go read their M-Pesa messages. That is an IN-FLIGHT payment reported
+        //     as finished -- the same class of defect as the 4999 bug.
+        //   * Seventeen further (code, family) pairs had their runtime text diverge from Node,
+        //     Python and the JVM, and PHP disagreed with ITSELF: errorCatalog() returned the
+        //     canonical string while decode() returned the override.
+        //
+        // Testing first fixes both without weakening anything. The regex requires an explicit
+        // invitation -- "try again", "retry", "again in|shortly|later|whenever" -- and never
+        // matches a bare "again", so canonical text that does NOT invite a second attempt now
+        // passes through as written, which is what the other three SDKs emit.
+        if (preg_match(self::RETRY_INVITATION_RE, $message) !== 1) {
+            return $message;
         }
 
-        // FAIL CLOSED. An uncovered non-retryable entry that invites a retry is replaced wholesale
-        // rather than emitted, so adding a row to the table can never add a retry invitation.
-        if (preg_match(self::RETRY_INVITATION_RE, $message) === 1) {
-            return self::GENERIC_NO_RETRY_MESSAGE;
-        }
-
-        return $message;
+        // The message DOES invite another attempt on a code we cannot vouch for. It is never
+        // emitted as written. A curated override replaces it where one exists; otherwise the
+        // generic no-retry message does. FAIL CLOSED is therefore unchanged: every path out of
+        // here for an invitation-bearing non-retryable entry is a replacement, so adding a row to
+        // the table can still never add a retry invitation.
+        return self::SAFE_CUSTOMER_MESSAGES[$code] ?? self::GENERIC_NO_RETRY_MESSAGE;
     }
 
     /**

@@ -1000,8 +1000,32 @@ $CASES = [
             . 'retryable => false) - BOTH the override map and the fail-closed fallback reverted',
         'test' => 'testNoNonRetryableDecodedEntryEverInvitesAnotherAttempt',
         'edits' => [
-            ['src/DarajaCatalog.php', '        if (isset(self::SAFE_CUSTOMER_MESSAGES[$code])) {', '        if (false) {'],
-            ['src/DarajaCatalog.php', '        if (preg_match(self::RETRY_INVITATION_RE, $message) === 1) {', '        if (false) {'],
+            // One edit now reverts the whole control: the regex test is the gate, and both the
+            // curated override and the generic fallback sit behind it.
+            ['src/DarajaCatalog.php', '        if (preg_match(self::RETRY_INVITATION_RE, $message) !== 1) {', '        if (true) {'],
+        ],
+    ],
+
+    [
+        // THE ORDERING IS THE PROTECTION, not the final string. This mutation restores the old
+        // override-first ordering EXACTLY: the map is consulted before the retry test, so the
+        // api_error override for 500.001.1001 leaks onto the code's PENDING stk_result reading and
+        // a customer with a live prompt is told the payment could not be confirmed.
+        //
+        // Note what this mutation does NOT break: `testNoNonRetryableDecodedEntryEverInvitesAnother
+        // Attempt` stays GREEN under it, because an override-first ordering still emits no retry
+        // invitation. That is precisely why the ordering needed a test of its own.
+        'id' => 'r10-retry-invitation-ordering',
+        'what' => 'the override map is consulted BEFORE the retry test again, so the api_error '
+            . 'override for 500.001.1001 relabels the same code\'s PENDING stk_result reading as '
+            . 'unconfirmed - an in-flight payment reported as finished',
+        'test' => 'testTheOverrideMapIsConsultedOnlyAfterTheRetryTest',
+        'edits' => [
+            [
+                'src/DarajaCatalog.php',
+                "        if (preg_match(self::RETRY_INVITATION_RE, \$message) !== 1) {\n            return \$message;\n        }",
+                "        if (isset(self::SAFE_CUSTOMER_MESSAGES[\$code])) {\n            return self::SAFE_CUSTOMER_MESSAGES[\$code];\n        }\n        if (preg_match(self::RETRY_INVITATION_RE, \$message) !== 1) {\n            return \$message;\n        }",
+            ],
         ],
     ],
 

@@ -374,6 +374,86 @@ final class TenthRoundHardeningTest extends TestCase
         $this->assertGreaterThan(40, strlen(DarajaCatalog::decode(26)['customerMessage']));
     }
 
+    /**
+     * REQUIREMENT 3.7, THE ORDERING - THE OVERRIDE MAP IS CONSULTED ONLY AFTER THE TEST.
+     *
+     * {@see DarajaCatalog::safeCustomerMessage()} used to look the code up in SAFE_CUSTOMER_MESSAGES
+     * BEFORE testing whether the catalog's own text invited a retry, so the override replaced the
+     * canonical message whether or not it needed replacing. The override map is keyed by CODE ALONE
+     * while the catalog is keyed by (code, family), so one override reached every family a code
+     * appears in - and `500.001.1001` appears in two:
+     *
+     *   api_error  - terminal "M-Pesa returned an error", category `mpesa_system`
+     *   stk_result - category PENDING, canonical text "Check your phone and enter your M-Pesa PIN
+     *                to complete this payment."
+     *
+     * The api_error override was applied to BOTH, so a customer with a LIVE STK PROMPT ON THEIR
+     * HANDSET was told the payment could not be confirmed and to go read their M-Pesa messages. An
+     * in-flight payment reported as finished - the same class of defect as the 4999 bug.
+     *
+     * THIS TEST IS ORDERING-SENSITIVE BY CONSTRUCTION. `500.001.1001` is still IN the override map
+     * (it is the correct backstop for the api_error reading, whose canonical text does invite a
+     * retry), so restoring the old override-first ordering makes the stk_result assertion below
+     * fail while leaving the final-string sweep above green. A test that only asserted "no
+     * invitation" would pass under both orderings and would prove nothing about the ordering.
+     *
+     * nv:r10-retry-invitation-ordering
+     */
+    public function testTheOverrideMapIsConsultedOnlyAfterTheRetryTest(): void
+    {
+        // 1. THE PENDING READING KEEPS ITS CANONICAL TEXT. Its message does not invite a retry, so
+        //    it must never reach the override map at all.
+        $stk = DarajaCatalog::decode('500.001.1001', null, 'stk_result');
+        $this->assertSame('pending', $stk['category']);
+        $this->assertSame(
+            'Check your phone and enter your M-Pesa PIN to complete this payment.',
+            $stk['customerMessage'],
+            'a customer with a live STK prompt is being told the payment could not be completed - '
+            . 'the api_error override has leaked onto the pending reading of the same code'
+        );
+
+        // 2. THE TERMINAL READING STILL GETS ITS OVERRIDE. Its canonical text DOES invite a retry
+        //    ("Please try again in a moment"), so the backstop must still fire. Deleting the map
+        //    would break this half.
+        $api = DarajaCatalog::decode('500.001.1001', null, 'api_error');
+        $this->assertSame('mpesa_system', $api['category']);
+        $this->assertNotSame($stk['customerMessage'], $api['customerMessage']);
+        $this->assertStringContainsString('check', strtolower($api['customerMessage']));
+
+        // 3. PHP AGREES WITH ITSELF. `errorCatalog()` returns canonical text and `decode()` used to
+        //    return the override for the same entry, so the two public surfaces disagreed on what
+        //    a customer should be told. They agree now wherever the canonical text is already safe.
+        $catalog = DarajaCatalog::errorCatalog();
+        $divergent = [];
+        foreach (DarajaCatalog::allEntries() as $entry) {
+            $code = (string) $entry['code'];
+            $family = (string) ($entry['family'] ?? 'stk_result');
+            $canonical = (string) $entry['customerMessage'];
+            $invites = preg_match(
+                '/\b(?:try(?:ing)?\s+(?:again|it\s+again)|retry|re-try|again\s+(?:in|shortly|later|whenever))\b/i',
+                $canonical
+            ) === 1;
+            if ($invites) {
+                // Legitimately replaced - PHP enforces the stricter blanket rule requirement 3.7
+                // explicitly permits. Not a divergence.
+                continue;
+            }
+            $decoded = DarajaCatalog::decode($code, null, $family);
+            if ($decoded['customerMessage'] !== $canonical) {
+                $divergent[] = "{$code} ({$family})";
+            }
+        }
+        $this->assertSame(
+            [],
+            $divergent,
+            'decode() rewrote catalog text that never invited a retry - the override map is '
+            . 'running before the test again'
+        );
+
+        // Requirement 8.3: an empty sweep must not read as a pass.
+        $this->assertGreaterThan(10, count($catalog));
+    }
+
     // == 5. Requirements 4.6 / 4.7 - the credential refusal reads the DECODED structure ===========
 
     /** JSON `\uXXXX`-escape every character of $s, so it is absent from the raw bytes. */

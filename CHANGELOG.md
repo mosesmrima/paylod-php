@@ -8,8 +8,48 @@ All notable changes to `paylod/paylod` are documented here. The format follows
 
 ## [0.10.1] - 2026-07-20
 
-Patch. No API change. The vendored Daraja code table is re-synced from its canonical home, and the
-copy is now mechanically pinned to that home so it cannot drift again unnoticed.
+Patch. No API change. Two fixes: an ordering defect in the customer-message layer that reported an
+IN-FLIGHT payment as finished, and a re-sync of the vendored Daraja code table, which is now
+mechanically pinned to its canonical home so it cannot drift again unnoticed.
+
+### Fixed - a pending payment was described to the customer as one that had failed
+
+`DarajaCatalog::safeCustomerMessage()` consulted its `SAFE_CUSTOMER_MESSAGES` override map
+UNCONDITIONALLY, before testing whether the catalog's own text actually invited a retry. The map is
+keyed by CODE ALONE, while the catalog is keyed by `(code, family)`. So a single override reached
+every family a code appears in - and `500.001.1001` appears in two:
+
+| family | category | canonical customer message |
+|---|---|---|
+| `api_error` | `mpesa_system` | M-Pesa returned an error and we cannot confirm the outcome. Do not pay again yet. |
+| `stk_result` | **`pending`** | Check your phone and enter your M-Pesa PIN to complete this payment. |
+
+The `api_error` override was applied to both. A customer with a LIVE M-PESA PROMPT ON THEIR HANDSET
+was therefore told the payment could not be confirmed and to go and read their M-Pesa messages -
+an in-flight payment reported as finished. That is the same class of defect as the 4999 bug, and it
+is a wrong statement rather than merely a terse one.
+
+Two further consequences, both now closed:
+
+* PHP's runtime text diverged from the Node, Python and JVM SDKs on 17 of the 32 `(code, family)`
+  pairs. The other three agreed with each other throughout.
+* PHP disagreed with ITSELF. `errorCatalog()` returned the canonical string while `decode()`
+  returned the override for the same entry, so the two public surfaces gave different answers to
+  "what should this customer be told".
+
+**The fix is a reorder, not a logic change.** `RETRY_INVITATION_RE` is now tested FIRST, and the
+override map is consulted only when the catalog text genuinely invites another attempt. Nothing is
+weakened: the regex requires an explicit invitation (`try again`, `retry`, `again in|shortly|later`)
+and never matches a bare `again`, and every path out of the function for an invitation-bearing
+non-retryable entry is still a replacement - a curated override where one exists, the generic
+no-retry message otherwise. So a table re-sync still cannot introduce a retry invitation. No
+`retryable` value changed, no override was deleted, and the regex is untouched.
+
+Eleven `(code, family)` pairs still read differently in PHP than in the other three SDKs. Those are
+pre-dispatch validation and configuration errors - an invalid MSISDN, a till used as a paybill, an
+unknown C2B account reference - where the canonical text does invite a retry and PHP suppresses it.
+Conformance requirement 3.7 permits this explicitly ("an SDK MAY enforce the stricter blanket
+rule ... that is conformant, merely terser than necessary"), so it is left as it is.
 
 ### Fixed - the vendored Daraja catalog matched the canonical table again
 
